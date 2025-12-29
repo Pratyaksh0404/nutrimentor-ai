@@ -1,3 +1,4 @@
+from app.routes import item as item_routes
 from fastapi import FastAPI
 from app.config import PROJECT_NAME, VERSION
 from app.database import Base, engine
@@ -13,6 +14,8 @@ def create_app() -> FastAPI:
 
     Base.metadata.create_all(bind=engine)
 
+    app.include_router(item_routes.router)
+
     @app.get("/health", tags=["Health"])
     def health_check():
         return {
@@ -21,7 +24,6 @@ def create_app() -> FastAPI:
         }
 
     return app
-
 
 
 app = create_app()
