@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from app.config import PROJECT_NAME, VERSION
+from app.database import Base, engine
+from app.models import item
 
 
 def create_app() -> FastAPI:
@@ -9,6 +11,8 @@ def create_app() -> FastAPI:
         description="Explainable Nutrition & Diet Planning Platform"
     )
 
+    Base.metadata.create_all(bind=engine)
+
     @app.get("/health", tags=["Health"])
     def health_check():
         return {
@@ -17,6 +21,7 @@ def create_app() -> FastAPI:
         }
 
     return app
+
 
 
 app = create_app()
