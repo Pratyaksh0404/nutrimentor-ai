@@ -7,6 +7,7 @@ from app.models import nutrient
 from app.routes import nutrient as nutrient_routes
 from app.models import rda
 from app.routes import rda as rda_routes
+from app.routes import diet as diet_routes
 
 
 def create_app() -> FastAPI:
@@ -21,6 +22,7 @@ def create_app() -> FastAPI:
     app.include_router(item_routes.router)
     app.include_router(nutrient_routes.router)
     app.include_router(rda_routes.router)
+    app.include_router(diet_routes.router)
 
     @app.get("/health", tags=["Health"])
     def health_check():
