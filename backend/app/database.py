@@ -2,6 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.orm import Session
 from fastapi import Depends
+import os
 
 def get_db():
     db = SessionLocal()
@@ -9,8 +10,11 @@ def get_db():
         yield db
     finally:
         db.close()
-        
-DATABASE_URL = "sqlite:///./nutrimentor.db"
+
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'nutrimentor.db')}"
+
 
 engine = create_engine(
     DATABASE_URL,

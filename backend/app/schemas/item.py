@@ -5,6 +5,8 @@ class ItemBase(BaseModel):
     name: str
     category: str
     calories_per_100g: float
+    season: str
+
 
 
 class ItemCreate(ItemBase):

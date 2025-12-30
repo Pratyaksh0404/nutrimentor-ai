@@ -13,8 +13,10 @@ def create_item(item: ItemCreate, db: Session = Depends(get_db)):
     db_item = Item(
         name=item.name,
         category=item.category,
-        calories_per_100g=item.calories_per_100g
+        calories_per_100g=item.calories_per_100g,
+        season=item.season
     )
+
     db.add(db_item)
     db.commit()
     db.refresh(db_item)

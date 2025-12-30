@@ -10,6 +10,7 @@ class Item(Base):
     name = Column(String, index=True, nullable=False)
     category = Column(String, nullable=False)
     calories_per_100g = Column(Float, nullable=False)
+    season = Column(String, nullable=False)
 
     nutrients = relationship(
         "Nutrient",
