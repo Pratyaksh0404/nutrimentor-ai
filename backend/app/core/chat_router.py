@@ -1,29 +1,29 @@
 def detect_intent(message: str):
-    message_lower = message.lower().strip()
+    message = message.lower().strip()
 
     # 1️ Diet analysis (highest priority)
-    if "analyze my diet" in message_lower or "check my diet" in message_lower:
+    if "analyze my diet" in message or "check my diet" in message:
         return "diet_analysis"
 
     # 2️ Food suggestions (specific)
     if (
-        "what foods should i eat" in message_lower
-        or "what should i eat" in message_lower
-        or "food suggestions" in message_lower
-        or "suggest foods" in message_lower
+        "what foods should i eat" in message
+        or "what should i eat" in message
+        or "food suggestions" in message
+        or "suggest foods" in message
     ):
         return "food_suggestion"
 
     # 3️ Seasonal suggestions
-    if "seasonal" in message_lower or "season" in message_lower:
+    if "seasonal" in message or "season" in message:
         return "seasonal_suggestion"
 
     # 4️ Explanations
-    if "why" in message_lower:
+    if "why" in message:
         return "explanation"
 
     # 5️ Deficiency questions
-    if "deficiency" in message_lower or "lacking" in message_lower:
+    if "deficiency" in message or "lacking" in message:
         return "deficiency"
 
     # 6️ Fallback
