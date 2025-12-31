@@ -1,18 +1,34 @@
 def detect_intent(message: str):
-    message = message.lower()
+    message_lower = message.lower().strip()
 
-    if "deficiency" in message or "lacking" in message:
-        return "deficiency"
-    if "eat" in message:
-        return "suggestion"
-    if "why" in message:
-        return "explanation"
-    if "analyze my diet" in message or "check" in message:
+    # 1️ Diet analysis (highest priority)
+    if "analyze my diet" in message_lower or "check my diet" in message_lower:
         return "diet_analysis"
-    if "season" in message:
-        return "season"
 
+    # 2️ Food suggestions (specific)
+    if (
+        "what foods should i eat" in message_lower
+        or "what should i eat" in message_lower
+        or "food suggestions" in message_lower
+        or "suggest foods" in message_lower
+    ):
+        return "food_suggestion"
+
+    # 3️ Seasonal suggestions
+    if "seasonal" in message_lower or "season" in message_lower:
+        return "seasonal_suggestion"
+
+    # 4️ Explanations
+    if "why" in message_lower:
+        return "explanation"
+
+    # 5️ Deficiency questions
+    if "deficiency" in message_lower or "lacking" in message_lower:
+        return "deficiency"
+
+    # 6️ Fallback
     return "general"
+
 
 def extract_nutrient(message: str):
     message = message.lower()
