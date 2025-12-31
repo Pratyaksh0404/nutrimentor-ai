@@ -7,6 +7,8 @@ def detect_intent(message: str):
         return "suggestion"
     if "why" in message:
         return "explanation"
+    if "analyze my diet" in message or "check" in message:
+        return "diet_analysis"
     if "season" in message:
         return "season"
 
