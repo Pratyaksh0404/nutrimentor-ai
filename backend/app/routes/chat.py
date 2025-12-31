@@ -32,7 +32,8 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
 
         return {
             "intent": intent,
-            "response": summary,
+            "response": summary["text"],
+            "next_actions": summary["next_actions"],
             "details": result
         }
 

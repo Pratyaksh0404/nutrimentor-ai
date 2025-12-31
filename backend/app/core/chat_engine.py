@@ -21,16 +21,25 @@ def summarize_diet(result):
     deficiencies = result["deficiencies"]
 
     if not deficiencies:
-        return "Your diet looks balanced. Great job! ✅"
+        return {
+            "text": "Your diet looks balanced. Great job! ✅",
+            "next_actions": []
+        }
 
-    response = "Based on your diet, you are deficient in:\n"
+    text = "Based on your diet, you are deficient in:\n"
     for d in deficiencies:
-        response += (
+        text += (
             f"- {d['nutrient']} "
             f"({d['deficit']} {d['unit']} short)\n"
         )
 
-    response += "\nI can also suggest foods to improve this."
+    next_actions = [
+        "What foods should I eat?",
+        "Why is this nutrient important?",
+        "Show seasonal food options"
+    ]
 
-    return response
-
+    return {
+        "text": text,
+        "next_actions": next_actions
+    }
