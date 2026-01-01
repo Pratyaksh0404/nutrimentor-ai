@@ -26,6 +26,12 @@ def detect_intent(message: str):
     if "deficiency" in message or "lacking" in message:
         return "deficiency"
 
+    if " vs " in message or "compare" in message:
+        return "food_comparison"
+    if "how often" in message or "how many times" in message:
+        if context and "suggestions" in context.get("details", {}):
+            return "food_suggestion"
+
     # 6️ Fallback
     return "general"
 
@@ -39,3 +45,14 @@ def extract_nutrient(message: str):
     if "calcium" in message:
         return "Calcium"
     return None
+
+
+def extract_foods(message: str):
+    message = message.lower()
+
+    if "apple" in message and "orange" in message:
+        return "Apple", "Orange"
+    if "banana" in message and "apple" in message:
+        return "Banana", "Apple"
+
+    return None, None

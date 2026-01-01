@@ -65,13 +65,35 @@ def chat(request: ChatRequest, db: Session = Depends(get_db)):
             "response": response
         }
 
+    # Food comparison
+    if intent == "food_comparison":
+        from app.core.chat_router import extract_foods
+
+        food1, food2 = extract_foods(request.message)
+
+        if not food1 or not food2:
+            return {
+                "intent": intent,
+                "response": "Please specify two foods to compare, like 'Apple vs Orange'."
+            }
+
+        from app.core.chat_engine import compare_foods
+        response = compare_foods(food1, food2, db)
+
+        return {
+            "intent": intent,
+            "response": response
+        }
+
     # Explanation intent
     nutrient = extract_nutrient(request.message)
     context = {}
     if nutrient:
         context["nutrient"] = nutrient
 
-    response = generate_response(intent, context)
+    response = generate_response(intent, {
+        "details": request.context.get("details", {})
+    })
 
     return {
         "intent": intent,
