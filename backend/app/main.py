@@ -7,6 +7,7 @@ from app.routes import item as item_routes
 from app.routes import rda as rda_routes
 from app.routes import diet as diet_routes
 from app.routes import chat as chat_routes
+from fastapi.middleware.cors import CORSMiddleware
 
 
 def create_app() -> FastAPI:
@@ -14,6 +15,14 @@ def create_app() -> FastAPI:
         title=PROJECT_NAME,
         version=VERSION,
         description="Explainable Nutrition & Diet Planning Platform"
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # dev only
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     Base.metadata.create_all(bind=engine)
