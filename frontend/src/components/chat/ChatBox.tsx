@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { sendChatMessage } from "../../api/chat";
 
 type ChatRole = "user" | "assistant";
 
@@ -11,24 +12,95 @@ interface ChatMessage {
 export default function ChatBox() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [context, setContext] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
 
-  function sendMessage() {
-    if (!input.trim()) return;
+  async function sendMessage() {
+    if (!input.trim() || loading) return;
+
+    const userText = input.trim();
 
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
       role: "user",
-      content: input,
+      content: userText,
     };
 
-    const assistantMessage: ChatMessage = {
-      id: (Date.now() + 1).toString(),
-      role: "assistant",
-      content: "I’m here to help you with nutrition 😊",
-    };
-
-    setMessages((prev) => [...prev, userMessage, assistantMessage]);
+    setMessages((prev) => [...prev, userMessage]);
+    setLoading(true);
     setInput("");
+
+    let outgoingContext = context ?? {};
+
+    // 1️⃣ Diet analysis fallback (demo-safe)
+    if (
+      userText.toLowerCase().includes("analyze") &&
+      !outgoingContext.consumed_items &&
+      !outgoingContext.details
+    ) {
+      outgoingContext = {
+        consumed_items: [{ item_id: 1, quantity_in_grams: 150 }],
+      };
+    }
+
+    // 2️⃣ Explanation fallback (robust)
+if (
+  userText.toLowerCase().includes("why") &&
+  userText.toLowerCase().includes("important")
+) {
+  let nutrientFromText = null;
+
+  // Try extracting from message
+  if (userText.toLowerCase().includes("vitamin c")) {
+    nutrientFromText = "Vitamin C";
+  }
+
+  // Fallback to last deficiency
+  if (!nutrientFromText && outgoingContext.details?.deficiencies?.length) {
+    nutrientFromText = outgoingContext.details.deficiencies[0].nutrient;
+  }
+
+  if (nutrientFromText) {
+    outgoingContext = {
+      ...outgoingContext,
+      nutrient: nutrientFromText,
+    };
+  }
+}
+
+
+    try {
+      const response = await sendChatMessage({
+        message: userText,
+        context: outgoingContext,
+      });
+
+      const assistantMessage: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        role: "assistant",
+        content: response.response,
+      };
+
+      setMessages((prev) => [...prev, assistantMessage]);
+
+      // ✅ Persist context for follow-ups
+      if (response.details) {
+        setContext({ details: response.details });
+      } else {
+        setContext(outgoingContext);
+      }
+    } catch (error) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          role: "assistant",
+          content: "Sorry, I couldn’t process that. Please try again.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -52,6 +124,12 @@ export default function ChatBox() {
             </div>
           </div>
         ))}
+
+        {loading && (
+          <div className="text-sm text-gray-500">
+            NutriMentor is thinking…
+          </div>
+        )}
       </div>
 
       <div className="border-t p-3 flex gap-2">
@@ -64,7 +142,8 @@ export default function ChatBox() {
         />
         <button
           onClick={sendMessage}
-          className="bg-blue-600 text-white px-4 rounded"
+          className="bg-blue-600 text-white px-4 rounded disabled:opacity-50"
+          disabled={loading}
         >
           Send
         </button>
