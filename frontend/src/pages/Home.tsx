@@ -1,9 +1,9 @@
 import { useState } from "react";
 import ChatBox from "../components/chat/ChatBox";
 import SeasonSelector from "../components/season/SeasonSelector";
+import FoodGrid from "../components/food/FoodGrid";
 import { useBackendHealth } from "../hooks/useBackendHealth";
 import { useItems } from "../hooks/useItems";
-import FoodGrid from "../components/food/FoodGrid";
 
 export default function Home() {
   const backendStatus = useBackendHealth();
@@ -12,8 +12,7 @@ export default function Home() {
     "all" | "winter" | "summer" | "monsoon"
   >("all");
 
-  // ✅ FETCH ITEMS BASED ON SEASON
-  const { items, loading } = useItems(season);
+  const { items, loading, error } = useItems(season);
 
   if (backendStatus === "loading") {
     return (
@@ -36,7 +35,7 @@ export default function Home() {
       <div className="max-w-7xl mx-auto">
         <div className="grid grid-cols-12 gap-6">
 
-          {/* LEFT: Food exploration */}
+          {/* LEFT */}
           <div className="col-span-8 space-y-6">
             <h1 className="text-2xl font-bold">Explore Seasonal Foods</h1>
 
@@ -49,13 +48,14 @@ export default function Home() {
               Selected season: <strong>{season}</strong>
             </p>
 
-            {/* ✅ FOOD GRID (Step 12.2) */}
-            <div className="border rounded-xl p-6 bg-white h-[60vh] overflow-y-auto">
-              <FoodGrid items={items} loading={loading} />
+            <div className="bg-white rounded-xl p-4 min-h-[60vh]">
+              {loading && <p>Loading foods…</p>}
+              {error && <p className="text-red-500">{error}</p>}
+              {!loading && !error && <FoodGrid items={items} />}
             </div>
           </div>
 
-          {/* RIGHT: Chatbot */}
+          {/* RIGHT */}
           <div className="col-span-4 bg-white rounded-xl shadow p-4 h-[80vh] flex flex-col">
             <ChatBox />
           </div>
