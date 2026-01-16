@@ -11,9 +11,7 @@ import logo from "../components/layout/logo.png"; // adjust path if needed
 export default function Home() {
   const backendStatus = useBackendHealth();
 
-  const [season, setSeason] = useState<
-    "all" | "winter" | "summer" | "monsoon"
-  >("all");
+  const [season, setSeason] = useState<string>("all");
 
   const { items, loading, error } = useItems(season);
 
