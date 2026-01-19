@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { sendChatMessage } from "../../api/chat";
 
 type ChatRole = "user" | "assistant";
@@ -15,6 +15,12 @@ export default function ChatBox() {
   const [context, setContext] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
   async function sendMessage() {
     if (!input.trim() || loading) return;
 
@@ -27,12 +33,11 @@ export default function ChatBox() {
     };
 
     setMessages((prev) => [...prev, userMessage]);
-    setLoading(true);
     setInput("");
+    setLoading(true);
 
     let outgoingContext = context ?? {};
 
-    // 1️⃣ Diet analysis fallback (demo-safe)
     if (
       userText.toLowerCase().includes("analyze") &&
       !outgoingContext.consumed_items &&
@@ -42,32 +47,6 @@ export default function ChatBox() {
         consumed_items: [{ item_id: 1, quantity_in_grams: 150 }],
       };
     }
-
-    // 2️⃣ Explanation fallback (robust)
-if (
-  userText.toLowerCase().includes("why") &&
-  userText.toLowerCase().includes("important")
-) {
-  let nutrientFromText = null;
-
-  // Try extracting from message
-  if (userText.toLowerCase().includes("vitamin c")) {
-    nutrientFromText = "Vitamin C";
-  }
-
-  // Fallback to last deficiency
-  if (!nutrientFromText && outgoingContext.details?.deficiencies?.length) {
-    nutrientFromText = outgoingContext.details.deficiencies[0].nutrient;
-  }
-
-  if (nutrientFromText) {
-    outgoingContext = {
-      ...outgoingContext,
-      nutrient: nutrientFromText,
-    };
-  }
-}
-
 
     try {
       const response = await sendChatMessage({
@@ -83,13 +62,12 @@ if (
 
       setMessages((prev) => [...prev, assistantMessage]);
 
-      // ✅ Persist context for follow-ups
       if (response.details) {
         setContext({ details: response.details });
       } else {
         setContext(outgoingContext);
       }
-    } catch (error) {
+    } catch {
       setMessages((prev) => [
         ...prev,
         {
@@ -104,8 +82,9 @@ if (
   }
 
   return (
-    <div className="w-full max-w-xl border rounded-lg flex flex-col h-[500px] bg-white">
-      <div className="flex-1 p-4 space-y-3 overflow-y-auto">
+    <div className="flex flex-col h-full border rounded-lg overflow-hidden">
+      {/* MESSAGES */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {messages.map((msg) => (
           <div
             key={msg.id}
@@ -130,8 +109,11 @@ if (
             NutriMentor is thinking…
           </div>
         )}
+
+        <div ref={bottomRef} />
       </div>
 
+      {/* INPUT */}
       <div className="border-t p-3 flex gap-2">
         <input
           className="flex-1 border rounded px-3 py-2 text-sm"
@@ -142,8 +124,8 @@ if (
         />
         <button
           onClick={sendMessage}
-          className="bg-blue-600 text-white px-4 rounded disabled:opacity-50"
           disabled={loading}
+          className="bg-blue-600 text-white px-4 rounded disabled:opacity-50"
         >
           Send
         </button>

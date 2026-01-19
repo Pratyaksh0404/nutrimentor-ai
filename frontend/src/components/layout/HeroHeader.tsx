@@ -2,7 +2,7 @@ export default function HeroHeader() {
   return (
     <div className="text-center mb-10">
       <h1
-        className="text-4xl md:text-5xl font-extrabold tracking-wide"
+        className="text-4xl md:text-5xl font-extrabold tracking-wide whitespace-nowrap"
         style={{ fontFamily: "Georgia, serif" }}
       >
         NUTRIMENTOR AI

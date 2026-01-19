@@ -4,4 +4,5 @@ export interface Item {
   category: string;
   calories_per_100g: number;
   season: string;
+  image_url?: string;
 }

@@ -22,7 +22,7 @@ export default function FoodCard({ item }: FoodCardProps) {
         border: "1px solid #e2e8f0",
         boxShadow: "0 4px 12px rgba(0,0,0,0.06)",
         transition: "all 0.3s ease",
-        minHeight: "180px",          // ✅ makes card slightly taller
+        minHeight: "210px",
         display: "flex",
         flexDirection: "column",
       }}

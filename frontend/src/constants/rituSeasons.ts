@@ -5,6 +5,6 @@ export const RITU_SEASONS = [
   { label: "Grishma Ritu (Summer)", value: "summer" },
   { label: "Varsha Ritu (Monsoon)", value: "monsoon" },
   { label: "Sharad Ritu (Autumn)", value: "autumn" },
-  { label: "Hemant Ritu (Pre-winter)", value: "pre-winter" },
+  { label: "Hemant Ritu (Pre-winter)", value: "prewinter" },
   { label: "Shishira Ritu (Winter)", value: "winter" },
 ];
