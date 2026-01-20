@@ -11,7 +11,6 @@ import { RITU_INFO } from "../constants/ritu";
 
 export default function Home() {
   const backendStatus = useBackendHealth();
-
   const [season, setSeason] = useState<string>("all");
 
   const rituKeyMap = {
@@ -91,13 +90,12 @@ export default function Home() {
           </div>
 
           {/* RIGHT COLUMN */}
-          <div className="bg-white rounded-xl shadow-lg p-4 h-[80vh] flex flex-col">
+          <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] max-h-[600px] flex flex-col">
             <p className="text-lg italic font-semibold text-center mb-2">
               Need more info?
             </p>
             <ChatBox />
           </div>
-
         </div>
       </div>
     </div>

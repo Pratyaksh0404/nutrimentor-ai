@@ -82,7 +82,7 @@ export default function ChatBox() {
   }
 
   return (
-    <div className="flex flex-col h-full border rounded-lg overflow-hidden">
+    <div className="flex flex-col h-full min-h-0 border rounded-lg overflow-hidden">
       {/* MESSAGES */}
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {messages.map((msg) => (
