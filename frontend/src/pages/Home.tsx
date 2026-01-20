@@ -8,6 +8,7 @@ import HeroHeader from "../components/layout/HeroHeader";
 import LogoCenter from "../components/layout/LogoCenter";
 import logo from "../components/layout/logo.png";
 import { RITU_INFO } from "../constants/ritu";
+import Footer from "../components/footer/Footer";
 
 export default function Home() {
   const backendStatus = useBackendHealth();
@@ -98,6 +99,8 @@ export default function Home() {
           </div>
         </div>
       </div>
+      <Footer />
+
     </div>
   );
 }

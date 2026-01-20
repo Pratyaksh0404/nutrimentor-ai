@@ -15,11 +15,14 @@ export default function ChatBox() {
   const [context, setContext] = useState<any>(null);
   const [loading, setLoading] = useState(false);
 
-  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+      const el = messagesRef.current;
+      if (!el) return;
+
+      el.scrollTop = el.scrollHeight;
+    }, [messages]);
 
   async function sendMessage() {
     if (!input.trim() || loading) return;
@@ -84,7 +87,7 @@ export default function ChatBox() {
   return (
     <div className="flex flex-col h-full min-h-0 border rounded-lg overflow-hidden">
       {/* MESSAGES */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div ref={messagesRef} className="flex-1 overflow-y-auto p-4 space-y-3">
         {messages.map((msg) => (
           <div
             key={msg.id}
@@ -110,7 +113,6 @@ export default function ChatBox() {
           </div>
         )}
 
-        <div ref={bottomRef} />
       </div>
 
       {/* INPUT */}
