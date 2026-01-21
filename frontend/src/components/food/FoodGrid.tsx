@@ -8,10 +8,9 @@ interface FoodGridProps {
 export default function FoodGrid({ items }: FoodGridProps) {
   return (
     <div
+      className="grid gap-6"
       style={{
-        display: "grid",
-        gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
-        gap: "24px",
+        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
       }}
     >
       {items.map((item) => (

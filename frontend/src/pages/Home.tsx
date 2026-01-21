@@ -46,8 +46,9 @@ export default function Home() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="max-w-[1400px] mx-auto px-6 py-8">
+    <div className="min-h-screen bg-gray-50 flex flex-col">
+      <div className="flex-1">
+        <div className="max-w-[1400px] mx-auto px-6 py-8">
 
         {/* MAIN 3-COLUMN LAYOUT */}
         <div className="grid grid-cols-[1.4fr_1fr_1.2fr] gap-10 items-start">
@@ -98,6 +99,7 @@ export default function Home() {
             <ChatBox />
           </div>
         </div>
+      </div>
       </div>
       <Footer />
 
