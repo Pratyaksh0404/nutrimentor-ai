@@ -9,6 +9,7 @@ import LogoCenter from "../components/layout/LogoCenter";
 import logo from "../components/layout/logo.png";
 import { RITU_INFO } from "../constants/ritu";
 import Footer from "../components/footer/Footer";
+import Container from "../components/layout/Container";
 
 export default function Home() {
   const backendStatus = useBackendHealth();
@@ -30,79 +31,69 @@ export default function Home() {
   const { items, loading, error } = useItems(season);
 
   if (backendStatus === "loading") {
-    return (
-      <div className="min-h-screen flex items-center justify-center">
-        Connecting to NutriMentor AI…
-      </div>
-    );
+    return <div className="min-h-screen flex items-center justify-center">
+      Connecting to NutriMentor AI…
+    </div>;
   }
 
   if (backendStatus === "error") {
-    return (
-      <div className="min-h-screen flex items-center justify-center text-red-600">
-        Backend not reachable. Please start the server.
-      </div>
-    );
+    return <div className="min-h-screen flex items-center justify-center text-red-600">
+      Backend not reachable. Please start the server.
+    </div>;
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col">
-      <div className="flex-1">
-        <div className="max-w-[1400px] mx-auto px-6 py-8">
+    <Container>
+      {/* MAIN CONTENT (flex-1 pushes footer down) */}
+      <main className="flex-1">
+        <div className="max-w-[1400px] mx-auto px-6 py-8 overflow-x-auto">
+            <div className="min-w-[1200px] grid grid-cols-[420px_1fr_380px] gap-10 items-start">
+            {/* LEFT */}
+            <div className="flex flex-col gap-6">
+              <h2 className="text-xl font-semibold">
+                Explore seasonal fruits & veggies
+              </h2>
 
-        {/* MAIN 3-COLUMN LAYOUT */}
-        <div className="grid grid-cols-[1.4fr_1fr_1.2fr] gap-10 items-start">
+              <SeasonSelector selectedSeason={season} onChange={setSeason} />
 
-          {/* LEFT COLUMN */}
-          <div className="flex flex-col gap-6">
-            <h2 className="text-xl font-semibold">
-              Explore seasonal fruits & veggies
-            </h2>
-
-            <SeasonSelector
-              selectedSeason={season}
-              onChange={setSeason}
-            />
-
-            {ritu && (
-              <div className="rounded-xl border border-gray-200 bg-white px-4 py-3 shadow-sm">
-                <div className="text-sm font-medium text-gray-800">
-                  {ritu.label}{" "}
-                  <span className="text-gray-500 font-normal">
-                    ({ritu.english})
-                  </span>
+              {ritu && (
+                <div className="rounded-xl border bg-white px-4 py-3 shadow-sm">
+                  <div className="text-sm font-medium">
+                    {ritu.label} ({ritu.english})
+                  </div>
+                  <p className="mt-1 text-xs text-gray-600">
+                    {ritu.description}
+                  </p>
                 </div>
-                <p className="mt-1 text-xs text-gray-600 leading-relaxed">
-                  {ritu.description}
-                </p>
-              </div>
-            )}
+              )}
 
-            <div>
-              {loading && <p>Loading foods…</p>}
-              {error && <p className="text-red-500">{error}</p>}
               {!loading && !error && <FoodGrid items={items} />}
             </div>
-          </div>
 
-          {/* CENTER COLUMN */}
-          <div className="flex flex-col items-center gap-4">
-            <HeroHeader />
-            <LogoCenter logoSrc={logo} />
-          </div>
+            {/* CENTER */}
+            <div className="flex flex-col items-center gap-4">
+              <HeroHeader />
+              <LogoCenter logoSrc={logo} />
+            </div>
 
-          {/* RIGHT COLUMN */}
-          <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] max-h-[600px] flex flex-col">
-            <p className="text-lg italic font-semibold text-center mb-2">
-              Need more info?
-            </p>
-            <ChatBox />
+            {/* RIGHT COLUMN */}
+            <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] flex flex-col">
+              <p className="text-lg italic font-semibold text-center mb-2 shrink-0">
+                Need more info?
+              </p>
+
+              {/* Chat container */}
+              <div className="flex-1 overflow-hidden">
+                <ChatBox />
+              </div>
+            </div>
+
           </div>
         </div>
-      </div>
-      </div>
-      <Footer />
+      </main>
 
-    </div>
+      {/* FOOTER ALWAYS AT BOTTOM */}
+      <Footer />
+    </Container>
   );
 }
