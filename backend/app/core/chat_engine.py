@@ -1,10 +1,35 @@
 from app.core.nutrient_info import NUTRIENT_INFO
 from app.models.item import Item
 
+def extract_nutrient_from_message(message: str):
+    message = message.lower()
+
+    known_nutrients = [
+        "vitamin a",
+        "vitamin b",
+        "vitamin b12",
+        "vitamin c",
+        "vitamin d",
+        "vitamin e",
+        "iron",
+        "calcium",
+        "magnesium",
+        "zinc"
+    ]
+
+    for nutrient in known_nutrients:
+        if nutrient in message:
+            return nutrient.title()
+
+    return None
+
 
 def generate_response(intent, data):
+    context = data.get("context", {})
+    message = data.get("message", "")
+
     if intent == "deficiency":
-        deficiencies = data.get("details", {}).get("deficiencies", [])
+        deficiencies = context.get("details", {}).get("deficiencies", [])
 
         if not deficiencies:
             return "Your diet does not show any major nutrient deficiencies."
@@ -12,8 +37,8 @@ def generate_response(intent, data):
         nutrient = deficiencies[0].get("nutrient", "this nutrient")
 
         response = (
-                f"Based on your diet, you may be low in {nutrient}. "
-                + deficiency_reassurance(nutrient)
+            f"Based on your diet, you may be low in {nutrient}. "
+            + deficiency_reassurance(nutrient)
         )
 
         return response + safety_note()
@@ -22,10 +47,18 @@ def generate_response(intent, data):
         return "Here are some foods you can include to improve your nutrition."
 
     if intent == "explanation":
-        nutrient = data.get("nutrient")
-        info = NUTRIENT_INFO.get(nutrient)
-        if info:
-            return info["benefits"]
+        nutrient = context.get("nutrient")
+
+        if not nutrient:
+            nutrient = extract_nutrient_from_message(message)
+
+        if nutrient:
+            info = NUTRIENT_INFO.get(nutrient)
+            if info:
+                return info["benefits"]
+
+            return f"{nutrient} plays an important role in maintaining good health."
+
         return "This nutrient plays an important role in your health."
 
     return "I can help you analyze your diet and suggest improvements."
