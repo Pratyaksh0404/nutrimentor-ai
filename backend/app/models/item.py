@@ -7,10 +7,12 @@ class Item(Base):
     __tablename__ = "items"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True, nullable=False)
-    category = Column(String, nullable=False)
-    calories_per_100g = Column(Float, nullable=False)
-    season = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    scientific_name = Column(String)
+    category = Column(String)
+    calories_per_100g = Column(Float)
+    season = Column(String)
+    image_url = Column(String)
 
     nutrients = relationship(
         "Nutrient",
