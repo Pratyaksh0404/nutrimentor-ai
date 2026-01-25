@@ -15,7 +15,7 @@ class Item(Base):
     image_url = Column(String)
 
     nutrients = relationship(
-        "Nutrient",
+        "ItemNutrient",
         back_populates="item",
         cascade="all, delete-orphan"
     )
