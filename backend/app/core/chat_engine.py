@@ -170,16 +170,16 @@ def compare_foods(food1, food2, db, nutrient_name=None):
     if not item1 or not item2:
         return "I couldn’t find enough data to compare these foods."
 
-    def get_nutrient(item, nutrient):
-        for n in item.nutrients:
-            if n.name == nutrient:
-                return n.amount_per_100g
+    def get_nutrient_amount(item, nutrient):
+        for item_nutrient in item.nutrients:
+            if item_nutrient.nutrient.name.lower() == nutrient.lower():
+                return item_nutrient.amount_per_100g
         return 0
 
     nutrient = nutrient_name or "Vitamin C"
 
-    v1 = get_nutrient(item1, nutrient)
-    v2 = get_nutrient(item2, nutrient)
+    v1 = get_nutrient_amount(item1, nutrient)
+    v2 = get_nutrient_amount(item2, nutrient)
 
     if v1 == 0 and v2 == 0:
         return f"I don’t have {nutrient} data for these foods yet."

@@ -1,20 +1,29 @@
 from collections import defaultdict
+from app.models.item import Item
 
 
 def compute_consumed_nutrients(consumed_items, db):
     """
     Returns total nutrients consumed from given items.
+    consumed_items: [{ "item_id": int, "quantity_in_grams": float }]
     """
     total_nutrients = defaultdict(float)
 
     for entry in consumed_items:
-        item = db.query(type(entry["item"])).get(entry["item_id"])
-        for nutrient in item.nutrients:
-            # Scale nutrient by quantity eaten
+        item = db.query(Item).filter(Item.id == entry["item_id"]).first()
+        if not item:
+            continue
+
+        for item_nutrient in item.nutrients:
+            nutrient_name = item_nutrient.nutrient.name
+
             scaled_amount = (
-                nutrient.amount_per_100g * entry["quantity_in_grams"] / 100
+                item_nutrient.amount_per_100g
+                * entry["quantity_in_grams"]
+                / 100
             )
-            total_nutrients[nutrient.name] += scaled_amount
+
+            total_nutrients[nutrient_name] += scaled_amount
 
     return total_nutrients
 
