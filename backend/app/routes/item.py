@@ -25,4 +25,8 @@ def create_item(item: ItemCreate, db: Session = Depends(get_db)):
 
 @router.get("/", response_model=list[ItemResponse])
 def get_items(db: Session = Depends(get_db)):
-    return db.query(Item).all()
+    return (
+        db.query(Item)
+        .all()
+    )
+
