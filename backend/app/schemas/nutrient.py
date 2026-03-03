@@ -15,3 +15,12 @@ class NutrientResponse(NutrientBase):
 
     class Config:
         from_attributes = True
+
+
+class ItemNutrientResponse(BaseModel):
+    name: str
+    amount_per_100g: float
+    unit: str
+
+    class Config:
+        from_attributes = True
