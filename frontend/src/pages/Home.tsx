@@ -2,6 +2,7 @@ import { useState } from "react";
 import ChatBox from "../components/chat/ChatBox";
 import SeasonSelector from "../components/season/SeasonSelector";
 import FoodGrid from "../components/food/FoodGrid";
+import FoodDetailPanel from "../components/food/FoodDetailPanel";
 import { useBackendHealth } from "../hooks/useBackendHealth";
 import { useItems } from "../hooks/useItems";
 import HeroHeader from "../components/layout/HeroHeader";
@@ -10,10 +11,12 @@ import logo from "../components/layout/logo.png";
 import { RITU_INFO } from "../constants/ritu";
 import Footer from "../components/footer/Footer";
 import Container from "../components/layout/Container";
+import type { Item } from "../types/item";
 
 export default function Home() {
   const backendStatus = useBackendHealth();
-  const [season, setSeason] = useState<string>("all");
+  const [season, setSeason] = useState("all");
+  const [hoveredItem, setHoveredItem] = useState<Item | null>(null);
 
   const rituKeyMap = {
     spring: "vasanta",
@@ -25,8 +28,9 @@ export default function Home() {
     all: null,
   } as const;
 
-  const rituKey = rituKeyMap[season];
-  const ritu = rituKey ? RITU_INFO[rituKey] : null;
+  const ritu = rituKeyMap[season]
+    ? RITU_INFO[rituKeyMap[season]!]
+    : null;
 
   const { items, loading, error } = useItems(season);
 
@@ -44,10 +48,10 @@ export default function Home() {
 
   return (
     <Container>
-      {/* MAIN CONTENT (flex-1 pushes footer down) */}
       <main className="flex-1">
-        <div className="max-w-[1400px] mx-auto px-6 py-8 overflow-x-auto">
-            <div className="min-w-[1200px] grid grid-cols-[420px_1fr_380px] gap-10 items-start">
+        {/* ⬅️ horizontal scroll allowed here */}
+        <div className="w-full px-4 py-8 overflow-x-auto">
+            <div className="min-w-[1200px] mx-auto grid grid-cols-[420px_1fr_380px] gap-8">
             {/* LEFT */}
             <div className="flex flex-col gap-6">
               <h2 className="text-xl font-semibold">
@@ -67,22 +71,32 @@ export default function Home() {
                 </div>
               )}
 
-              {!loading && !error && <FoodGrid items={items} />}
+              {!loading && !error && (
+                <FoodGrid
+                  items={items}
+                  onHoverItem={setHoveredItem}
+                />
+              )}
             </div>
 
             {/* CENTER */}
             <div className="flex flex-col items-center gap-4">
               <HeroHeader />
               <LogoCenter logoSrc={logo} />
+
+              {/* 🔥 Spotlight panel */}
+              {hoveredItem && (
+                <div className="w-full max-w-md mt-4 rounded-xl border bg-white p-4 shadow-md">
+                  <FoodDetailPanel item={hoveredItem} />
+                </div>
+              )}
             </div>
 
-            {/* RIGHT COLUMN */}
+            {/* RIGHT */}
             <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] flex flex-col">
-              <p className="text-lg italic font-semibold text-center mb-2 shrink-0">
+              <p className="text-lg italic font-semibold text-center mb-2">
                 Need more info?
               </p>
-
-              {/* Chat container */}
               <div className="flex-1 overflow-hidden">
                 <ChatBox />
               </div>
@@ -92,7 +106,6 @@ export default function Home() {
         </div>
       </main>
 
-      {/* FOOTER ALWAYS AT BOTTOM */}
       <Footer />
     </Container>
   );

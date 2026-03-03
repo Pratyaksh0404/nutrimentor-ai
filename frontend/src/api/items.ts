@@ -6,3 +6,8 @@ export async function getItems(season: string): Promise<Item[]> {
   const response = await apiClient.get("/items/", { params });
   return response.data;
 }
+
+export async function getItemNutrients(itemId: number) {
+  const response = await apiClient.get(`/items/${itemId}/nutrients`);
+  return response.data;
+}

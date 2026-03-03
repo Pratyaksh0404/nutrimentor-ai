@@ -1,71 +1,57 @@
-import { useState } from "react";
 import type { Item } from "../../types/item";
-import FoodDetailPanel from "./FoodDetailPanel";
 
 interface FoodCardProps {
   item: Item;
+  active: boolean;
+  dimmed: boolean;
+  onHover: () => void;
+  onLeave: () => void;
 }
 
-export default function FoodCard({ item }: FoodCardProps) {
-  const [expanded, setExpanded] = useState(false);
-
-  const imageSrc = `/images/${item.name.toLowerCase()}.png`;
-
+export default function FoodCard({
+  item,
+  active,
+  dimmed,
+  onHover,
+  onLeave,
+}: FoodCardProps) {
   return (
     <div
-      onMouseEnter={() => setExpanded(true)}
-      onMouseLeave={() => setExpanded(false)}
+      onMouseEnter={onHover}
+      onMouseLeave={onLeave}
+      className={`
+        bg-white
+        border
+        rounded-xl
+        cursor-pointer
+        transition-all
+        duration-300
+        flex
+        flex-col
+        items-center
+        justify-center
+        ${
+          active
+            ? "scale-[1.06] shadow-xl"
+            : dimmed
+            ? "opacity-60"
+            : "opacity-100 shadow-sm"
+        }
+      `}
       style={{
-        borderRadius: "16px",
-        padding: "16px",
-        background: "#f8fafc",
-        border: "1px solid #e2e8f0",
-        boxShadow: "0 4px 12px rgba(0,0,0,0.06)",
-        transition: "all 0.3s ease",
-        minHeight: "210px",
-        display: "flex",
-        flexDirection: "column",
+        width: "180px",
+        height: "190px",
       }}
     >
-      {/* NAME — ALWAYS VISIBLE */}
-      <h3 className="text-lg font-semibold text-center mb-3">
+      <img
+        src={item.image_url || "/images/placeholder.png"}
+        alt={item.name}
+        className="h-24 object-contain"
+      />
+
+      <p className="mt-3 font-medium text-sm text-center">
         {item.name}
-      </h3>
-
-      {/* FIXED CONTENT SLOT */}
-      <div className="relative flex-1 flex items-center justify-center">
-        {/* IMAGE */}
-        <img
-          src={imageSrc}
-          alt={item.name}
-          onError={(e) => {
-            (e.currentTarget as HTMLImageElement).src =
-              "/images/placeholder.png";
-          }}
-          className={`
-            absolute
-            max-h-28
-            max-w-full
-            object-contain
-            transition-opacity
-            duration-300
-            ${expanded ? "opacity-0" : "opacity-100"}
-          `}
-        />
-
-        {/* DETAILS */}
-        <div
-          className={`
-            absolute
-            w-full
-            transition-opacity
-            duration-300
-            ${expanded ? "opacity-100" : "opacity-0"}
-          `}
-        >
-          <FoodDetailPanel item={item} />
-        </div>
-      </div>
+      </p>
     </div>
   );
 }
