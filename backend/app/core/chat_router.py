@@ -1,39 +1,20 @@
+from app.ml.intent_classifier import predict_intent
+
+
+CONFIDENCE_THRESHOLD = 0.65
+
+
 def detect_intent(message: str):
-    message = message.lower().strip()
+    result = predict_intent(message)
 
-    # 1️ Diet analysis (highest priority)
-    if "analyze my diet" in message or "check my diet" in message:
-        return "diet_analysis"
+    intent = result["intent"]
+    confidence = result["confidence"]
 
-    # 2️ Food suggestions (specific)
-    if (
-        "what foods should i eat" in message
-        or "what should i eat" in message
-        or "food suggestions" in message
-        or "suggest foods" in message
-    ):
-        return "food_suggestion"
+    # Fallback safety
+    if confidence < CONFIDENCE_THRESHOLD:
+        intent = "general"
 
-    # 3️ Seasonal suggestions
-    if "seasonal" in message or "season" in message:
-        return "seasonal_suggestion"
-
-    # 4️ Explanations
-    if "why" in message:
-        return "explanation"
-
-    # 5️ Deficiency questions
-    if "deficiency" in message or "lacking" in message:
-        return "deficiency"
-
-    if " vs " in message or "compare" in message:
-        return "food_comparison"
-    if "how often" in message or "how many times" in message:
-        if context and "suggestions" in context.get("details", {}):
-            return "food_suggestion"
-
-    # 6️ Fallback
-    return "general"
+    return intent
 
 
 def extract_nutrient(message: str):

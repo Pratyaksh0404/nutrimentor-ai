@@ -98,7 +98,7 @@ export default function Home() {
                 Need more info?
               </p>
               <div className="flex-1 overflow-hidden">
-                <ChatBox />
+                <ChatBox selectedItem={hoveredItem} season={season} />
               </div>
             </div>
 

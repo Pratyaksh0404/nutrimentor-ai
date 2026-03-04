@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { sendChatMessage } from "../../api/chat";
+import type { Item } from "../../types/item";
 
 type ChatRole = "user" | "assistant";
 
@@ -9,7 +10,12 @@ interface ChatMessage {
   content: string;
 }
 
-export default function ChatBox() {
+interface ChatBoxProps {
+  selectedItem: Item | null;
+  season: string;
+}
+
+export default function ChatBox({ selectedItem, season }: ChatBoxProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [context, setContext] = useState<any>(null);
@@ -39,16 +45,41 @@ export default function ChatBox() {
     setInput("");
     setLoading(true);
 
-    let outgoingContext = context ?? {};
+    let outgoingContext = {
+      ...(context ?? {}),
+    };
+
+    if (selectedItem) {
+      outgoingContext.current_item = {
+        id: selectedItem.id,
+        name: selectedItem.name,
+        season: selectedItem.season,
+      };
+    }
+
+    if (season) {
+      outgoingContext.current_season = season;
+    }
 
     if (
       userText.toLowerCase().includes("analyze") &&
-      !outgoingContext.consumed_items &&
-      !outgoingContext.details
+      !outgoingContext.consumed_items
     ) {
-      outgoingContext = {
-        consumed_items: [{ item_id: 1, quantity_in_grams: 150 }],
-      };
+      if (selectedItem) {
+        outgoingContext.consumed_items = [
+          {
+            item_id: selectedItem.id,
+            quantity_in_grams: 150,
+          },
+        ];
+      } else {
+        outgoingContext.consumed_items = [
+          {
+            item_id: 1,
+            quantity_in_grams: 150,
+          },
+        ];
+      }
     }
 
     try {

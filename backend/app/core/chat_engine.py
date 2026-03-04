@@ -28,40 +28,129 @@ def generate_response(intent, data):
     context = data.get("context", {})
     message = data.get("message", "")
 
+    if intent == "diet_analysis":
+        if not context.get("consumed_items"):
+            return "Please provide what you have eaten so I can analyze your diet."
+
+        return "Analyzing your diet..."
+
+
+    if intent == "food_suggestion":
+        details = context.get("details", {})
+        if details.get("suggestions"):
+            return respond_food_suggestions(details)
+
+        return (
+            "You can include fruits like orange, banana, apple, or leafy vegetables "
+            "to improve overall nutrition."
+            + safety_note()
+        )
+
+
+    if intent == "seasonal_suggestion":
+        details = context.get("details", {})
+        if details.get("suggestions"):
+            return respond_seasonal_suggestions(details)
+
+        return (
+            "Seasonal fruits like mango (summer), orange (winter), "
+            "and watermelon (summer) are good options."
+            + safety_note()
+        )
+
+
+    if intent == "food_comparison":
+        from app.core.chat_router import extract_foods
+
+        food1, food2 = extract_foods(message)
+        if food1 and food2:
+            db = data.get("db")
+            return compare_foods(food1, food2, db)
+
+        return "Please mention two foods you would like me to compare."
+
+
     if intent == "deficiency":
         deficiencies = context.get("details", {}).get("deficiencies", [])
 
-        if not deficiencies:
-            return "Your diet does not show any major nutrient deficiencies."
+        if deficiencies:
+            nutrient = deficiencies[0].get("nutrient", "this nutrient")
+            return (
+                f"You may be low in {nutrient}. "
+                + deficiency_reassurance(nutrient)
+                + safety_note()
+            )
 
-        nutrient = deficiencies[0].get("nutrient", "this nutrient")
+        nutrient = extract_nutrient_from_message(message)
+        if nutrient:
+            return (
+                f"If you suspect low {nutrient}, including nutrient-rich foods "
+                f"can help gradually improve levels."
+                + safety_note()
+            )
 
-        response = (
-            f"Based on your diet, you may be low in {nutrient}. "
-            + deficiency_reassurance(nutrient)
+        return "Deficiencies can often be improved with a balanced diet."
+
+
+    if intent == "medical_concern":
+        return (
+            "If you're feeling unwell, light and easy-to-digest foods like banana, "
+            "rice, toast, and soups may help. Stay hydrated and consult a doctor "
+            "if symptoms persist."
+            + safety_note()
         )
 
-        return response + safety_note()
 
-    if intent == "suggestion":
-        return "Here are some foods you can include to improve your nutrition."
+    if intent == "goal_based_advice":
+        return (
+            "For your health goal, include balanced meals with fruits, vegetables, "
+            "protein sources, and adequate hydration."
+            + safety_note()
+        )
+
 
     if intent == "explanation":
-        nutrient = context.get("nutrient")
-
-        if not nutrient:
-            nutrient = extract_nutrient_from_message(message)
-
+        nutrient = extract_nutrient_from_message(message)
         if nutrient:
             info = NUTRIENT_INFO.get(nutrient)
             if info:
                 return info["benefits"]
 
-            return f"{nutrient} plays an important role in maintaining good health."
-
         return "This nutrient plays an important role in your health."
 
-    return "I can help you analyze your diet and suggest improvements."
+    current_item = context.get("current_item")
+
+    if current_item:
+        lower_msg = message.lower()
+
+        if any(word in lower_msg for word in ["this", "it", "this one", "this fruit"]):
+            nutrient = extract_nutrient_from_message(message)
+
+            if nutrient:
+                return (
+                    f"{current_item['name']} contains {nutrient}, which supports important body functions."
+                    + safety_note()
+                )
+
+            if "immunity" in lower_msg:
+                return (
+                    f"{current_item['name']} can support immunity, especially if it contains Vitamin C or antioxidants."
+                    + safety_note()
+                )
+
+            if "nutrient" in lower_msg:
+                return (
+                    f"{current_item['name']} provides essential vitamins and minerals beneficial for health."
+                    + safety_note()
+                )
+
+            return (
+                f"{current_item['name']} is a nutritious choice. "
+                "Tell me your health goal and I can guide you better."
+                + safety_note()
+            )
+
+    return "Hello! I can help with diet analysis, food comparisons, seasonal suggestions, and health guidance."
 
 
 def summarize_diet(result):

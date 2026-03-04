@@ -8,7 +8,7 @@ export default function LogoCenter({ logoSrc }: LogoCenterProps) {
       <img
       src={logoSrc}
       alt="NutriMentor AI"
-      className="w-40 h-40"
+      className="w-60 h-60 object-contain drop-shadow-xl"
     />
     </div>
 
