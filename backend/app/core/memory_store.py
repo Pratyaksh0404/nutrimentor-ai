@@ -1,18 +1,35 @@
-user_memory = {}
+conversation_memory = {
+    "history": [],
+    "max_history": 10
+}
 
-def get_memory(user_id="default"):
-    return user_memory.setdefault(user_id, {
-        "history": [],
-        "goals": [],
-        "deficiencies": []
+
+def add_to_history(user_message: str, bot_response: str):
+    """
+    Store the latest conversation turn.
+    """
+
+    conversation_memory["history"].append({
+        "user": user_message,
+        "assistant": bot_response
     })
 
-def add_to_history(user_id, user_msg, assistant_msg):
-    mem = get_memory(user_id)
-    mem["history"].append({
-        "user": user_msg,
-        "assistant": assistant_msg
-    })
+    # limit history size
+    if len(conversation_memory["history"]) > conversation_memory["max_history"]:
+        conversation_memory["history"].pop(0)
 
-    if len(mem["history"]) > 4:
-        mem["history"] = mem["history"][-6:]
+
+def get_recent_history():
+    """
+    Return recent conversation history.
+    """
+
+    return conversation_memory["history"]
+
+
+def clear_memory():
+    """
+    Clear conversation memory.
+    """
+
+    conversation_memory["history"] = []
