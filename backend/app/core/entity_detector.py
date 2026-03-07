@@ -1,32 +1,44 @@
 from sqlalchemy.orm import Session
-from app.models.item import Item
 from rapidfuzz import process, fuzz
+from app.core.food_index import get_food_index, get_food_by_name
 
 
-def detect_food_entities(message: str, db: Session):
-    """
-    Detect food items mentioned in the message using fuzzy matching.
-    Returns a list of matched Item objects.
-    """
+def generate_phrases(words, max_len=3):
 
-    message_words = message.lower().split()
+    phrases = []
 
-    foods = db.query(Item).all()
-    food_names = [food.name.lower() for food in foods]
+    for i in range(len(words)):
+        for j in range(i + 1, min(i + max_len + 1, len(words) + 1)):
+            phrase = " ".join(words[i:j])
+            phrases.append(phrase)
+
+    return phrases
+
+
+def detect_food_entities(message: str, db: Session = None):
+
+    words = message.lower().split()
+    phrases = generate_phrases(words)
+
+    # load food names from in-memory index
+    food_names = get_food_index()
 
     detected_items = []
 
-    for word in message_words:
+    for phrase in phrases:
 
-        # find the best fuzzy match
-        match, score, index = process.extractOne(word,food_names,scorer=fuzz.ratio)
+        match = process.extractOne(phrase,food_names,scorer=fuzz.token_sort_ratio)
 
-        # only accept strong matches
+        if match is None:
+            continue
+
+        match_name, score, _ = match
+
         if score >= 85:
-            matched_food = foods[index]
 
-            # avoid duplicates
-            if matched_food not in detected_items:
+            matched_food = get_food_by_name(match_name)
+
+            if matched_food and matched_food not in detected_items:
                 detected_items.append(matched_food)
 
     return detected_items

@@ -1,0 +1,138 @@
+[
+  {
+    "name": "Spinach",
+    "category": "vegetable",
+    "calories_per_100g": 23,
+    "season": "winter",
+    "scientific_name": "Spinacia oleracea",
+    "image_url": "/images/spinach.png",
+    "nutrients": {
+      "Iron": 2.7,
+      "Magnesium": 79,
+      "Vitamin A": 469,
+      "Fiber": 2.2,
+      "Protein": 2.9,
+      "Potassium": 558
+    }
+  },
+  {
+    "name": "Broccoli",
+    "category": "vegetable",
+    "calories_per_100g": 34,
+    "season": "winter",
+    "scientific_name": "Brassica oleracea",
+    "image_url": "/images/broccoli.png",
+    "nutrients": {
+      "Vitamin C": 89,
+      "Fiber": 2.6,
+      "Potassium": 316,
+      "Protein": 2.8,
+      "Magnesium": 21
+    }
+  },
+  {
+    "name": "Carrot",
+    "category": "vegetable",
+    "calories_per_100g": 41,
+    "season": "winter",
+    "scientific_name": "Daucus carota",
+    "image_url": "/images/carrot.png",
+    "nutrients": {
+      "Vitamin A": 835,
+      "Fiber": 2.8,
+      "Potassium": 320,
+      "Vitamin C": 6
+    }
+  },
+  {
+    "name": "Tomato",
+    "category": "vegetable",
+    "calories_per_100g": 18,
+    "season": "summer",
+    "scientific_name": "Solanum lycopersicum",
+    "image_url": "/images/tomato.png",
+    "nutrients": {
+      "Vitamin C": 14,
+      "Potassium": 237,
+      "Fiber": 1.2
+    }
+  },
+  {
+    "name": "Cucumber",
+    "category": "vegetable",
+    "calories_per_100g": 15,
+    "season": "summer",
+    "scientific_name": "Cucumis sativus",
+    "image_url": "/images/cucumber.png",
+    "nutrients": {
+      "Potassium": 147,
+      "Magnesium": 13,
+      "Fiber": 0.5
+    }
+  },
+  {
+    "name": "Cabbage",
+    "category": "vegetable",
+    "calories_per_100g": 25,
+    "season": "winter",
+    "scientific_name": "Brassica oleracea var. capitata",
+    "image_url": "/images/cabbage.png",
+    "nutrients": {
+      "Vitamin C": 36,
+      "Fiber": 2.5,
+      "Potassium": 170
+    }
+  },
+  {
+    "name": "Cauliflower",
+    "category": "vegetable",
+    "calories_per_100g": 25,
+    "season": "winter",
+    "scientific_name": "Brassica oleracea var. botrytis",
+    "image_url": "/images/cauliflower.png",
+    "nutrients": {
+      "Vitamin C": 48,
+      "Fiber": 2,
+      "Potassium": 299
+    }
+  },
+  {
+    "name": "Beetroot",
+    "category": "vegetable",
+    "calories_per_100g": 43,
+    "season": "winter",
+    "scientific_name": "Beta vulgaris",
+    "image_url": "/images/beetroot.png",
+    "nutrients": {
+      "Folate": 109,
+      "Fiber": 2.8,
+      "Potassium": 325
+    }
+  },
+  {
+    "name": "Bell Pepper",
+    "category": "vegetable",
+    "calories_per_100g": 31,
+    "season": "summer",
+    "scientific_name": "Capsicum annuum",
+    "image_url": "/images/bell_pepper.png",
+    "nutrients": {
+      "Vitamin C": 127,
+      "Fiber": 2.1,
+      "Potassium": 211
+    }
+  },
+  {
+    "name": "Onion",
+    "category": "vegetable",
+    "calories_per_100g": 40,
+    "season": "all",
+    "scientific_name": "Allium cepa",
+    "image_url": "/images/onion.png",
+    "nutrients": {
+      "Vitamin C": 7,
+      "Fiber": 1.7,
+      "Potassium": 146
+    }
+  }
+]

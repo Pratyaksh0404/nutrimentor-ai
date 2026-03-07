@@ -8,57 +8,63 @@ from app.core.tools import get_nutrients_for_item
 from app.models.item import Item
 
 
-def route_message(message: str, db):
+def route_message(message, db):
 
-    # -----------------------------
-    # Step 1: Preprocess input
-    # -----------------------------
+    # Support frontend context food
+    context_food = None
+
+    if isinstance(message, dict):
+        context_food = message.get("context_food")
+        message = message.get("message", "")
+
     cleaned_message = clean_text(message)
 
-    if is_garbage(cleaned_message):
+    # Garbage / empty guard
+    if not cleaned_message or is_garbage(cleaned_message):
         return "I couldn't understand that. Could you ask a nutrition-related question?"
 
-    # -----------------------------
-    # Step 2: Greeting detection
-    # -----------------------------
-    greetings = ["hi", "hello", "hey", "yo"]
+    # Basic conversation shortcuts
+    greetings = {"hi", "hello", "hey", "yo", "namaste"}
 
     if cleaned_message in greetings:
         return "Hello! I am NutriMentor AI. How can I help you with your nutrition today?"
-    # Common conversational replies
-    if cleaned_message in ["thanks", "thank you", "thx"]:
+
+    if cleaned_message in {"thanks", "thank you", "thx", "dhanyawad"}:
         return "You're welcome! Let me know if you need any nutrition advice."
 
-    if cleaned_message in ["bye", "bye bye", "goodbye", "see you"]:
+    if cleaned_message in {"bye", "bye bye", "goodbye", "see you"}:
         return "Goodbye! Stay healthy."
 
-    if cleaned_message in ["help", "what can you do"]:
+    if cleaned_message in {"help", "what can you do"}:
         return "I can help with nutrition advice, food comparisons, diet analysis, and nutrient information."
-    # -----------------------------
-    # Step 3: Identity questions
-    # -----------------------------
+
+    # Identity
     if "who are you" in cleaned_message:
         return "I am NutriMentor AI, your AI-powered nutrition mentor."
 
-    # -----------------------------
-    # Step 4: Detect foods
-    # -----------------------------
+    # Detect foods from message
     foods = detect_food_entities(cleaned_message, db)
 
-    # -----------------------------
-    # Step 5: Food comparison
-    # -----------------------------
+    # Inject context food from UI
+    if context_food and len(foods) == 0:
+        item = db.query(Item).filter(
+            Item.name.ilike(context_food)
+        ).first()
+
+        if item:
+            foods.append(item)
+
+    # Food comparison
     if len(foods) == 2:
         return compare_foods(foods[0].name, foods[1].name, db)
 
-    # -----------------------------
-    # Step 6: Nutrient lookup
-    # -----------------------------
+    # Food nutrient lookup
     if len(foods) == 1:
 
         nutrients = get_nutrients_for_item(foods[0].id, db)
 
         if nutrients:
+
             response = f"{foods[0].name} nutrients per 100g:\n"
             response += f"Calories: {foods[0].calories_per_100g}\n"
 
@@ -67,16 +73,25 @@ def route_message(message: str, db):
 
             return response.strip()
 
-    # -----------------------------
-    # Step 7: Intent classification
-    # -----------------------------
-    prediction = predict_intent(cleaned_message)
+    # Prevent LLM for vague prompts
+    vague_inputs = {
+        "this",
+        "that",
+        "tell me about this",
+        "tell me about that",
+        "hmm",
+        "ok",
+        "okay"
+    }
 
+    if cleaned_message in vague_inputs:
+        return "Could you mention a specific food or nutrition question?"
+
+    # Intent classification
+    prediction = predict_intent(cleaned_message)
     intent = prediction["intent"]
 
-    # -----------------------------
-    # Step 8: Advice queries
-    # -----------------------------
+    # LLM Advice
     if intent in [
         "food_suggestion",
         "goal_based_advice",
@@ -94,7 +109,5 @@ def route_message(message: str, db):
 
         return response
 
-    # -----------------------------
-    # Step 9: Fallback
-    # -----------------------------
+    # Final fallback
     return "I can help with nutrition and food-related questions."
