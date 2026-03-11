@@ -9,7 +9,7 @@ from app.models.item import Item
 from app.models.nutrient import Nutrient
 from app.models.item_nutrient import ItemNutrient
 
-DATA_PATH = Path("backend/data/foods.json")
+DATA_PATH = Path(__file__).resolve().parents[1] / "data" / "foods.json"
 
 
 def seed_foods():

@@ -20,5 +20,8 @@ dist/
 
 # Env
 .env
+
 backend/app/ml/intent_model/
 backend/app/ml/models/
+backend/nutrimentor.db
+backend/nutrimentor_backup.db
