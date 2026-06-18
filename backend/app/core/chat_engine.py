@@ -14,7 +14,10 @@ def extract_nutrient_from_message(message: str):
         "iron",
         "calcium",
         "magnesium",
-        "zinc"
+        "zinc",
+        "protein",
+        "fiber",
+        "potassium",
     ]
 
     for nutrient in known_nutrients:
@@ -27,13 +30,12 @@ def extract_nutrient_from_message(message: str):
 def generate_response(intent, data):
     context = data.get("context", {})
     message = data.get("message", "")
+    db = data.get("db")
 
     if intent == "diet_analysis":
         if not context.get("consumed_items"):
             return "Please provide what you have eaten so I can analyze your diet."
-
         return "Analyzing your diet..."
-
 
     if intent == "food_suggestion":
         details = context.get("details", {})
@@ -46,29 +48,30 @@ def generate_response(intent, data):
             + safety_note()
         )
 
-
     if intent == "seasonal_suggestion":
         details = context.get("details", {})
         if details.get("suggestions"):
             return respond_seasonal_suggestions(details)
 
         return (
-            "Seasonal fruits like mango (summer), orange (winter), "
-            "and watermelon (summer) are good options."
+            "Seasonal fruits like mango in summer, orange in winter, "
+            "and watermelon in summer are good options."
             + safety_note()
         )
 
-
     if intent == "food_comparison":
-        from app.core.chat_router import extract_foods
+        words = message.lower().split()
+        foods = []
 
-        food1, food2 = extract_foods(message)
-        if food1 and food2:
-            db = data.get("db")
-            return compare_foods(food1, food2, db)
+        for word in words:
+            item = db.query(Item).filter(Item.name.ilike(f"%{word}%")).first()
+            if item:
+                foods.append(item.name)
+
+        if len(foods) >= 2:
+            return compare_foods(foods[0], foods[1], db)
 
         return "Please mention two foods you would like me to compare."
-
 
     if intent == "deficiency":
         deficiencies = context.get("details", {}).get("deficiencies", [])
@@ -91,15 +94,12 @@ def generate_response(intent, data):
 
         return "Deficiencies can often be improved with a balanced diet."
 
-
     if intent == "medical_concern":
         return (
-            "If you're feeling unwell, light and easy-to-digest foods like banana, "
-            "rice, toast, and soups may help. Stay hydrated and consult a doctor "
-            "if symptoms persist."
+            "If you're feeling unwell, choose light and easy-to-digest foods like banana, "
+            "rice, toast, curd, or soups. Stay hydrated and consult a doctor if symptoms persist."
             + safety_note()
         )
-
 
     if intent == "goal_based_advice":
         return (
@@ -108,104 +108,51 @@ def generate_response(intent, data):
             + safety_note()
         )
 
-
     if intent == "explanation":
         nutrient = extract_nutrient_from_message(message)
         if nutrient:
             info = NUTRIENT_INFO.get(nutrient)
             if info:
                 return info["benefits"]
-
-        return "This nutrient plays an important role in your health."
+        return "This nutrient plays an important role in maintaining good health."
 
     current_item = context.get("current_item")
-
     if current_item:
         lower_msg = message.lower()
+        nutrient = extract_nutrient_from_message(message)
 
-        if any(word in lower_msg for word in ["this", "it", "this one", "this fruit"]):
-            nutrient = extract_nutrient_from_message(message)
-
-            if nutrient:
-                return (
-                    f"{current_item['name']} contains {nutrient}, which supports important body functions."
-                    + safety_note()
-                )
-
-            if "immunity" in lower_msg:
-                return (
-                    f"{current_item['name']} can support immunity, especially if it contains Vitamin C or antioxidants."
-                    + safety_note()
-                )
-
-            if "nutrient" in lower_msg:
-                return (
-                    f"{current_item['name']} provides essential vitamins and minerals beneficial for health."
-                    + safety_note()
-                )
-
+        if nutrient:
             return (
-                f"{current_item['name']} is a nutritious choice. "
-                "Tell me your health goal and I can guide you better."
+                f"{current_item['name']} contains {nutrient}, which supports important body functions."
                 + safety_note()
             )
 
-    return "Hello! I can help with diet analysis, food comparisons, seasonal suggestions, and health guidance."
+        if "immunity" in lower_msg:
+            return (
+                f"{current_item['name']} can support immunity, especially if it contains Vitamin C or antioxidants."
+                + safety_note()
+            )
 
+        return f"{current_item['name']} is a nutritious choice." + safety_note()
 
-def summarize_diet(result):
-    deficiencies = result["deficiencies"]
-
-    if not deficiencies:
-        return {
-            "text": "Great news! Your diet looks well-balanced. Keep up the good work",
-            "next_actions": []
-        }
-
-    text = "I’ve looked at your diet, and here’s what I found 👇\n\n"
-    text += "You may be low on the following nutrients:\n"
-
-    for d in deficiencies:
-        text += (
-            f"- {d['nutrient']} "
-            f"(about {d['deficit']} {d['unit']} below the recommended level)\n"
-        )
-
-    text += "\nDon’t worry — this is quite common and can be improved with the right food choices"
-
-    next_actions = [
-        "What foods should I eat?",
-        "Why is this nutrient important?",
-        "Show seasonal food options"
-    ]
-
-    return {
-        "text": text + safety_note(),
-        "next_actions": next_actions
-    }
+    return (
+        "I can help with food nutrition, diet planning, seasonal foods, "
+        "and health guidance. What would you like to know?"
+    )
 
 
 def respond_food_suggestions(details):
     suggestions = details.get("suggestions", {})
 
     if not suggestions:
-        return "I don’t have enough information yet to suggest foods. Try analyzing your diet first."
+        return "I don't have enough information yet to suggest foods."
 
-    response = "Here are some foods you can include to help improve your nutrient intake 🥗:\n"
+    response = "Here are some foods that may help improve your nutrient intake:\n"
 
     for nutrient, foods in suggestions.items():
         response += f"\nFor {nutrient}:\n"
-        for f in foods:
-            response += (
-                f"- {f['food']} "
-                f"(around {f['nutrient_per_100g']} per 100g)\n"
-            )
-
-    response += "\nIncluding one or more of these regularly can help reduce the gap"
-
-    nutrients = list(suggestions.keys())
-    if nutrients:
-        response += habit_hint(nutrients[0])
+        for food in foods:
+            response += f"- {food['food']} ({food['nutrient_per_100g']} per 100g)\n"
 
     return response + safety_note()
 
@@ -214,41 +161,29 @@ def respond_seasonal_suggestions(details):
     suggestions = details.get("suggestions", {})
 
     if not suggestions:
-        return "I don’t have seasonal suggestions right now. Try analyzing your diet first."
+        return "I don't have seasonal suggestions right now."
 
-    response = "Seasonal foods are often fresher and easier to include. Here are some good options:\n"
+    response = "Here are some seasonal foods you can consider:\n"
 
     for nutrient, foods in suggestions.items():
         response += f"\nFor {nutrient}:\n"
-        for f in foods:
-            response += f"- {f['food']} (best during {f['season']})\n"
-
-    nutrients = list(suggestions.keys())
-    if nutrients:
-        response += habit_hint(nutrients[0])
+        for food in foods:
+            response += f"- {food['food']} (best during {food['season']})\n"
 
     return response + safety_note()
 
 
 def deficiency_reassurance(nutrient):
     return (
-        f"Mild {nutrient} deficiencies are quite common and usually improve "
-        "gradually with consistent dietary choices."
+        f"Mild {nutrient} deficiencies are common and can often be improved "
+        "with balanced dietary choices."
     )
 
 
 def safety_note():
     return (
-        "\n\nℹ️ This guidance is based on general nutrition recommendations "
-        "and is not a medical diagnosis. For specific health concerns, "
-        "consider consulting a qualified healthcare professional."
-    )
-
-
-def habit_hint(nutrient):
-    return (
-        f"\n\n💡 Tip: Including at least one serving of foods rich in {nutrient} "
-        "a few times a week can gradually help improve your intake."
+        "\n\nNote: This guidance is based on general nutrition information "
+        "and should not replace professional medical advice."
     )
 
 
@@ -257,29 +192,34 @@ def compare_foods(food1, food2, db, nutrient_name=None):
     item2 = db.query(Item).filter(Item.name.ilike(f"%{food2}%")).first()
 
     if not item1 or not item2:
-        return "I couldn’t find enough data to compare these foods."
+        return "I couldn't find enough data to compare these foods."
 
-    def get_nutrient_amount(item, nutrient):
-        for item_nutrient in item.nutrients:
-            if item_nutrient.nutrient.name.lower() == nutrient.lower():
-                return item_nutrient.amount_per_100g
-        return 0
+    def get_nutrient(item, nutrient):
+        for nutrient_row in item.nutrients:
+            if nutrient_row.nutrient.name.lower() == nutrient.lower():
+                return nutrient_row.amount_per_100g
+        return None
 
-    nutrient = nutrient_name or "Vitamin C"
+    key_nutrients = [
+        "Protein",
+        "Fiber",
+        "Iron",
+        "Magnesium",
+    ]
 
-    v1 = get_nutrient_amount(item1, nutrient)
-    v2 = get_nutrient_amount(item2, nutrient)
+    response = f"{item1.name} vs {item2.name} (per 100g)\n\n"
 
-    if v1 == 0 and v2 == 0:
-        return f"I don’t have {nutrient} data for these foods yet."
+    for nutrient in key_nutrients:
+        value_1 = get_nutrient(item1, nutrient)
+        value_2 = get_nutrient(item2, nutrient)
 
-    better = food1 if v1 > v2 else food2
+        if value_1 is None and value_2 is None:
+            continue
 
-    response = (
-        f"When comparing {food1} and {food2} for {nutrient}:\n"
-        f"- {food1}: {v1} per 100g\n"
-        f"- {food2}: {v2} per 100g\n\n"
-        f"{better} provides more {nutrient} per 100g."
-    )
+        response += (
+            f"{nutrient}:\n"
+            f"- {item1.name}: {value_1 if value_1 else 0}\n"
+            f"- {item2.name}: {value_2 if value_2 else 0}\n\n"
+        )
 
-    return response + safety_note()
+    return response.strip() + safety_note()

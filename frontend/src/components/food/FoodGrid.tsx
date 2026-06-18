@@ -4,10 +4,17 @@ import FoodCard from "./FoodCard";
 
 interface FoodGridProps {
   items: Item[];
+  selectedItem: Item | null;
   onHoverItem: (item: Item | null) => void;
+  onSelectItem: (item: Item | null) => void;
 }
 
-export default function FoodGrid({ items, onHoverItem }: FoodGridProps) {
+export default function FoodGrid({
+  items,
+  selectedItem,
+  onHoverItem,
+  onSelectItem,
+}: FoodGridProps) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
 
   return (
@@ -29,6 +36,7 @@ export default function FoodGrid({ items, onHoverItem }: FoodGridProps) {
           item={item}
           active={hoveredIndex === index}
           dimmed={hoveredIndex !== null && hoveredIndex !== index}
+          selected={selectedItem?.id === item.id}
           onHover={() => {
             setHoveredIndex(index);
             onHoverItem(item);
@@ -37,6 +45,7 @@ export default function FoodGrid({ items, onHoverItem }: FoodGridProps) {
             setHoveredIndex(null);
             onHoverItem(null);
           }}
+          onSelect={() => onSelectItem(selectedItem?.id === item.id ? null : item)}
         />
       ))}
     </div>

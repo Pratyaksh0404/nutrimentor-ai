@@ -4,21 +4,34 @@ interface FoodCardProps {
   item: Item;
   active: boolean;
   dimmed: boolean;
+  selected: boolean;
   onHover: () => void;
   onLeave: () => void;
+  onSelect: () => void;
 }
 
 export default function FoodCard({
   item,
   active,
   dimmed,
+  selected,
   onHover,
   onLeave,
+  onSelect,
 }: FoodCardProps) {
   return (
     <div
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
+      onClick={onSelect}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect();
+        }
+      }}
       className={`
         bg-white
         border
@@ -37,6 +50,7 @@ export default function FoodCard({
             ? "opacity-60"
             : "opacity-100 shadow-sm"
         }
+        ${selected ? "ring-2 ring-blue-600 border-blue-600" : ""}
       `}
       style={{
         width: "180px",

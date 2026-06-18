@@ -51,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(rda_routes.router)
     app.include_router(diet_routes.router)
     app.include_router(chat_routes.router)
+    app.include_router(chat_routes.legacy_router)
 
     @app.get("/health", tags=["Health"])
     def health_check():

@@ -13,10 +13,20 @@ import Footer from "../components/footer/Footer";
 import Container from "../components/layout/Container";
 import type { Item } from "../types/item";
 
+type SeasonKey =
+  | "all"
+  | "spring"
+  | "summer"
+  | "monsoon"
+  | "autumn"
+  | "prewinter"
+  | "winter";
+
 export default function Home() {
   const backendStatus = useBackendHealth();
-  const [season, setSeason] = useState("all");
+  const [season, setSeason] = useState<SeasonKey>("all");
   const [hoveredItem, setHoveredItem] = useState<Item | null>(null);
+  const [selectedItem, setSelectedItem] = useState<Item | null>(null);
 
   const rituKeyMap = {
     spring: "vasanta",
@@ -28,11 +38,13 @@ export default function Home() {
     all: null,
   } as const;
 
-  const ritu = rituKeyMap[season]
-    ? RITU_INFO[rituKeyMap[season]!]
+  const rituKey = rituKeyMap[season];
+  const ritu = rituKey
+    ? RITU_INFO[rituKey]
     : null;
 
   const { items, loading, error } = useItems(season);
+  const displayItem = hoveredItem ?? selectedItem;
 
   if (backendStatus === "loading") {
     return <div className="min-h-screen flex items-center justify-center">
@@ -74,7 +86,9 @@ export default function Home() {
               {!loading && !error && (
                 <FoodGrid
                   items={items}
+                  selectedItem={selectedItem}
                   onHoverItem={setHoveredItem}
+                  onSelectItem={setSelectedItem}
                 />
               )}
             </div>
@@ -85,9 +99,23 @@ export default function Home() {
               <LogoCenter logoSrc={logo} />
 
               {/* 🔥 Spotlight panel */}
-              {hoveredItem && (
+              {displayItem && (
                 <div className="w-full max-w-md mt-4 rounded-xl border bg-white p-4 shadow-md">
-                  <FoodDetailPanel item={hoveredItem} />
+                  {selectedItem && displayItem.id === selectedItem.id && (
+                    <div className="mb-3 flex items-center justify-between gap-3 border-b pb-2">
+                      <span className="text-xs font-medium text-gray-600">
+                        Selected for agent context
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedItem(null)}
+                        className="rounded border px-2 py-1 text-xs text-gray-700 hover:bg-gray-50"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                  <FoodDetailPanel item={displayItem} />
                 </div>
               )}
             </div>
@@ -95,10 +123,14 @@ export default function Home() {
             {/* RIGHT */}
             <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] flex flex-col">
               <p className="text-lg italic font-semibold text-center mb-2">
-                Need more info?
+                Nutrition Agent
               </p>
               <div className="flex-1 overflow-hidden">
-                <ChatBox selectedItem={hoveredItem} season={season} />
+                <ChatBox
+                  selectedItem={selectedItem}
+                  season={season}
+                  onClearSelectedItem={() => setSelectedItem(null)}
+                />
               </div>
             </div>
 

@@ -1,167 +1,372 @@
-import { useEffect, useRef, useState } from "react";
-import { sendChatMessage } from "../../api/chat";
-import type { Item } from "../../types/item";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronUp, History, Send, Sparkles, UserRound, X, Zap } from "lucide-react";
+import { useChat } from "../../hooks/useChat";
+import type { AgentPanelProps, AgentProfile } from "../../types/chat";
 
-type ChatRole = "user" | "assistant";
+const defaultProfile: AgentProfile = { allergies: [], health_cautions: [] };
+const PROFILE_KEY = "nutrimentor-agent-profile";
 
-interface ChatMessage {
-  id: string;
-  role: ChatRole;
-  content: string;
+function computeBmi(p: AgentProfile): string | null {
+  if (!p.height_cm || !p.weight_kg) return null;
+  return (p.weight_kg / ((p.height_cm / 100) ** 2)).toFixed(1);
 }
 
-interface ChatBoxProps {
-  selectedItem: Item | null;
-  season: string;
+function loadProfile(): AgentProfile {
+  try {
+    const raw = window.localStorage.getItem(PROFILE_KEY);
+    return raw ? { ...defaultProfile, ...JSON.parse(raw) } : defaultProfile;
+  } catch {
+    return defaultProfile;
+  }
 }
 
-export default function ChatBox({ selectedItem, season }: ChatBoxProps) {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
-  const [context, setContext] = useState<any>(null);
-  const [loading, setLoading] = useState(false);
+function agentStateLabel(state: string) {
+  switch (state) {
+    case "retrieving":      return "Retrieving data…";
+    case "calculating":     return "Calculating…";
+    case "generating-plan": return "Building plan…";
+    case "thinking":        return "Thinking…";
+    default:                return "Ready";
+  }
+}
 
+export default function ChatBox({ selectedItem, season, onClearSelectedItem }: AgentPanelProps) {
+  const [input, setInput]             = useState("");
+  const [profile, setProfile]         = useState<AgentProfile>(loadProfile);
+  const [showProfile, setShowProfile] = useState(false);
+  const [showSessions, setShowSessions] = useState(false);
+  const [showTasks, setShowTasks]     = useState(false);
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
+  const { messages, loading, agentState, sessionId, sessions, starterPrompts,
+          sendMessage, continueSession, clearContext } = useChat({ selectedItem, season, profile });
+
   useEffect(() => {
-      const el = messagesRef.current;
-      if (!el) return;
+    window.localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  }, [profile]);
 
-      el.scrollTop = el.scrollHeight;
-    }, [messages]);
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, loading]);
 
-  async function sendMessage() {
-    if (!input.trim() || loading) return;
+  const bmi = useMemo(() => computeBmi(profile), [profile]);
 
-    const userText = input.trim();
-
-    const userMessage: ChatMessage = {
-      id: Date.now().toString(),
-      role: "user",
-      content: userText,
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
+  async function handleSend() {
+    const text = input.trim();
+    if (!text) return;
     setInput("");
-    setLoading(true);
+    await sendMessage(text);
+  }
 
-    let outgoingContext = {
-      ...(context ?? {}),
-    };
+  async function handleClear() {
+    await clearContext();
+    onClearSelectedItem();
+  }
 
-    if (selectedItem) {
-      outgoingContext.current_item = {
-        id: selectedItem.id,
-        name: selectedItem.name,
-        season: selectedItem.season,
-      };
-    }
-
-    if (season) {
-      outgoingContext.current_season = season;
-    }
-
-    if (
-      userText.toLowerCase().includes("analyze") &&
-      !outgoingContext.consumed_items
-    ) {
-      if (selectedItem) {
-        outgoingContext.consumed_items = [
-          {
-            item_id: selectedItem.id,
-            quantity_in_grams: 150,
-          },
-        ];
-      } else {
-        outgoingContext.consumed_items = [
-          {
-            item_id: 1,
-            quantity_in_grams: 150,
-          },
-        ];
-      }
-    }
-
-    try {
-      const response = await sendChatMessage({
-        message: userText,
-        context: outgoingContext,
-      });
-
-      const assistantMessage: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: response.response,
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-
-      if (response.details) {
-        setContext({ details: response.details });
-      } else {
-        setContext(outgoingContext);
-      }
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "assistant",
-          content: "Sorry, I couldn’t process that. Please try again.",
-        },
-      ]);
-    } finally {
-      setLoading(false);
-    }
+  function updateProfile(patch: Partial<AgentProfile>) {
+    setProfile((prev) => ({ ...prev, ...patch }));
   }
 
   return (
-    <div className="flex flex-col h-full min-h-0 border rounded-lg overflow-hidden">
-      {/* MESSAGES */}
-      <div ref={messagesRef} className="flex-1 overflow-y-auto p-4 space-y-3">
+    <div className="flex h-full min-h-0 flex-col rounded-xl border border-slate-200 bg-white overflow-hidden">
+
+      {/* ── TOP BAR: title + status + context chips ───────────────────── */}
+      <div className="shrink-0 border-b border-slate-100 px-4 pt-3 pb-2">
+        <div className="flex items-center justify-between gap-2">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-slate-900 leading-tight">NutriMentor AI Agent</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              {loading ? agentStateLabel(agentState) : "Ready"}
+            </p>
+          </div>
+          {/* Profile toggle */}
+          <button
+            type="button"
+            onClick={() => setShowProfile((p) => !p)}
+            title="Profile"
+            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-slate-500 transition-colors ${
+              showProfile ? "border-blue-200 bg-blue-50 text-blue-600" : "border-slate-200 hover:bg-slate-50"
+            }`}
+          >
+            <UserRound className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Context chips row */}
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          {selectedItem ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200 pl-2 pr-1 py-0.5 text-[11px] font-medium text-emerald-700">
+              <Sparkles className="h-3 w-3" />
+              {selectedItem.name}
+              <button
+                type="button"
+                onClick={handleClear}
+                className="flex h-4 w-4 items-center justify-center rounded-full hover:bg-emerald-200 transition-colors"
+              >
+                <X className="h-2.5 w-2.5" />
+              </button>
+            </span>
+          ) : (
+            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] text-slate-500">
+              No food selected
+            </span>
+          )}
+          {sessionId && (
+            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] text-slate-500">
+              Session active
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* ── PROFILE DRAWER (collapses) ────────────────────────────────── */}
+      {showProfile && (
+        <div className="shrink-0 border-b border-slate-100 bg-slate-50 px-4 py-3">
+          <div className="mb-2 flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-slate-800">Profile memory</p>
+              <p className="text-[11px] text-slate-400">Used for BMI and plan guidance.</p>
+            </div>
+            {bmi && (
+              <div className="text-right">
+                <p className="text-[10px] text-slate-400 uppercase tracking-wide">BMI</p>
+                <p className="text-sm font-semibold text-slate-800">{bmi}</p>
+              </div>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-1.5">
+            <input
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
+              placeholder="Age"
+              type="number"
+              value={profile.age ?? ""}
+              onChange={(e) => updateProfile({ age: e.target.value ? +e.target.value : undefined })}
+            />
+            <select
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+              value={profile.sex ?? ""}
+              onChange={(e) => updateProfile({ sex: e.target.value || undefined })}
+            >
+              <option value="">Sex</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="other">Other</option>
+            </select>
+            <input
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
+              placeholder="Height (cm)"
+              type="number"
+              value={profile.height_cm ?? ""}
+              onChange={(e) => updateProfile({ height_cm: e.target.value ? +e.target.value : undefined })}
+            />
+            <input
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
+              placeholder="Weight (kg)"
+              type="number"
+              value={profile.weight_kg ?? ""}
+              onChange={(e) => updateProfile({ weight_kg: e.target.value ? +e.target.value : undefined })}
+            />
+            <select
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+              value={profile.goal ?? ""}
+              onChange={(e) => updateProfile({ goal: e.target.value || undefined })}
+            >
+              <option value="">Goal</option>
+              <option value="maintain weight">Maintain</option>
+              <option value="lose weight">Lose weight</option>
+              <option value="gain weight">Gain weight</option>
+              <option value="better energy">Better energy</option>
+            </select>
+            <select
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+              value={profile.activity_level ?? ""}
+              onChange={(e) => updateProfile({ activity_level: e.target.value || undefined })}
+            >
+              <option value="">Activity</option>
+              <option value="sedentary">Sedentary</option>
+              <option value="light">Light</option>
+              <option value="moderate">Moderate</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      {/* ── COLLAPSIBLE: SESSION HISTORY ─────────────────────────────── */}
+      <div className="shrink-0 border-b border-slate-100">
+        <button
+          type="button"
+          onClick={() => setShowSessions((p) => !p)}
+          className="flex w-full items-center justify-between px-4 py-2 text-left hover:bg-slate-50 transition-colors"
+        >
+          <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            <History className="h-3 w-3" />
+            Sessions
+            {sessions.length > 0 && (
+              <span className="rounded-full bg-slate-200 px-1.5 text-[10px] font-medium text-slate-600">
+                {sessions.length}
+              </span>
+            )}
+          </span>
+          {showSessions ? <ChevronUp className="h-3 w-3 text-slate-400" /> : <ChevronDown className="h-3 w-3 text-slate-400" />}
+        </button>
+
+        {showSessions && (
+          <div className="px-3 pb-2 flex flex-col gap-1">
+            {sessions.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-slate-200 px-3 py-2 text-[11px] text-slate-400 text-center">
+                No sessions yet
+              </p>
+            ) : (
+              sessions.slice(0, 3).map((s) => (
+                <button
+                  key={s.session_id}
+                  type="button"
+                  onClick={() => continueSession(s.session_id)}
+                  className="rounded-lg border border-slate-200 px-3 py-2 text-left hover:bg-slate-50 transition-colors"
+                >
+                  <p className="text-[11px] font-medium text-slate-800 truncate">{s.title}</p>
+                  <p className="text-[10px] text-slate-400 truncate mt-0.5">{s.preview}</p>
+                </button>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* ── COLLAPSIBLE: QUICK TASKS ──────────────────────────────────── */}
+      <div className="shrink-0 border-b border-slate-100">
+        <button
+          type="button"
+          onClick={() => setShowTasks((p) => !p)}
+          className="flex w-full items-center justify-between px-4 py-2 text-left hover:bg-slate-50 transition-colors"
+        >
+          <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+            <Zap className="h-3 w-3" />
+            Quick tasks
+          </span>
+          {showTasks ? <ChevronUp className="h-3 w-3 text-slate-400" /> : <ChevronDown className="h-3 w-3 text-slate-400" />}
+        </button>
+
+        {showTasks && (
+          <div className="px-3 pb-2.5 flex flex-wrap gap-1.5">
+            {starterPrompts.map((prompt) => (
+              <button
+                key={prompt}
+                type="button"
+                onClick={() => { sendMessage(prompt); setShowTasks(false); }}
+                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] text-slate-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
+              >
+                {prompt}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── MESSAGES (fills remaining height) ────────────────────────── */}
+      <div ref={messagesRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3">
+        {messages.length === 0 && (
+          <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-6 py-8">
+            <div className="text-2xl">🥦</div>
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Select a food from the grid, or ask a nutrition question, request a diet plan, or compare two foods.
+            </p>
+            <div className="flex flex-wrap justify-center gap-1.5 mt-1">
+              {starterPrompts.slice(0, 3).map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => sendMessage(p)}
+                  className="rounded-full border border-slate-200 px-3 py-1 text-[11px] text-slate-600 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-colors"
+                >
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {messages.map((msg) => (
           <div
             key={msg.id}
-            className={`flex ${
-              msg.role === "user" ? "justify-end" : "justify-start"
-            }`}
+            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
           >
-            <div
-              className={`max-w-[70%] px-4 py-2 rounded-lg text-sm ${
-                msg.role === "user"
-                  ? "bg-blue-600 text-white"
-                  : "bg-gray-100 text-gray-800"
-              }`}
-            >
-              {msg.content}
+            <div className={`max-w-[88%] flex flex-col gap-2 ${msg.role === "user" ? "items-end" : "items-start"}`}>
+              {/* Bubble */}
+              <div
+                className={`rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                  msg.role === "user"
+                    ? "bg-blue-600 text-white rounded-br-sm"
+                    : "bg-slate-100 text-slate-800 rounded-bl-sm"
+                }`}
+              >
+                <div className="whitespace-pre-wrap">{msg.content}</div>
+              </div>
+
+              {/* Cards */}
+              {msg.cards?.map((card) => (
+                <div
+                  key={`${msg.id}-${card.title}`}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 shadow-sm"
+                >
+                  <p className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">{card.title}</p>
+                  <p className="mt-1 text-xs text-slate-600">{card.body}</p>
+                </div>
+              ))}
+
+              {/* Next action chips */}
+              {msg.nextActions?.length ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {msg.nextActions.map((action) => (
+                    <button
+                      key={`${msg.id}-${action}`}
+                      type="button"
+                      onClick={() => sendMessage(action)}
+                      className="rounded-full border border-slate-200 bg-white px-2.5 py-0.5 text-[11px] text-slate-600 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-colors"
+                    >
+                      {action}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </div>
         ))}
 
         {loading && (
-          <div className="text-sm text-gray-500">
-            NutriMentor is thinking…
+          <div className="flex justify-start">
+            <div className="rounded-2xl rounded-bl-sm bg-slate-100 px-4 py-2.5">
+              <div className="flex items-center gap-1.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
           </div>
         )}
-
       </div>
 
-      {/* INPUT */}
-      <div className="border-t p-3 flex gap-2">
-        <input
-          className="flex-1 border rounded px-3 py-2 text-sm"
-          placeholder="Ask NutriMentor AI…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-        />
-        <button
-          onClick={sendMessage}
-          disabled={loading}
-          className="bg-blue-600 text-white px-4 rounded disabled:opacity-50"
-        >
-          Send
-        </button>
+      {/* ── INPUT BAR ─────────────────────────────────────────────────── */}
+      <div className="shrink-0 border-t border-slate-100 px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <input
+            className="flex-1 min-w-0 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:bg-white focus:outline-none transition-colors"
+            placeholder="Ask about food, nutrients, season, plan…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") handleSend(); }}
+          />
+          <button
+            type="button"
+            onClick={handleSend}
+            disabled={loading || !input.trim()}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white disabled:opacity-40 hover:bg-blue-700 active:scale-95 transition-all"
+          >
+            <Send className="h-3.5 w-3.5" />
+          </button>
+        </div>
       </div>
     </div>
   );

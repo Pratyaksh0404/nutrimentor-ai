@@ -1,35 +1,104 @@
-conversation_memory = {
-    "history": [],
-    "max_history": 10
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime
+from typing import Any
+from uuid import uuid4
+
+
+agent_memory: dict[str, Any] = {
+    "sessions": {},
+    "order": [],
 }
 
 
-def add_to_history(user_message: str, bot_response: str):
-    """
-    Store the latest conversation turn.
-    """
-
-    conversation_memory["history"].append({
-        "user": user_message,
-        "assistant": bot_response
-    })
-
-    # limit history size
-    if len(conversation_memory["history"]) > conversation_memory["max_history"]:
-        conversation_memory["history"].pop(0)
+def _utc_now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def get_recent_history():
-    """
-    Return recent conversation history.
-    """
+def create_session() -> dict[str, Any]:
+    session_id = uuid4().hex
+    session = {
+        "session_id": session_id,
+        "title": "New nutrition session",
+        "messages": [],
+        "current_item": None,
+        "profile": None,
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+    }
+    agent_memory["sessions"][session_id] = session
+    agent_memory["order"].insert(0, session_id)
+    return deepcopy(session)
 
-    return conversation_memory["history"]
+
+def ensure_session(session_id: str | None = None) -> dict[str, Any]:
+    if session_id and session_id in agent_memory["sessions"]:
+        return agent_memory["sessions"][session_id]
+    return agent_memory["sessions"][create_session()["session_id"]]
 
 
-def clear_memory():
-    """
-    Clear conversation memory.
-    """
+def get_session(session_id: str | None) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    session = agent_memory["sessions"].get(session_id)
+    return deepcopy(session) if session else None
 
-    conversation_memory["history"] = []
+
+def list_sessions() -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for session_id in agent_memory["order"]:
+        session = agent_memory["sessions"][session_id]
+        last_message = next(
+            (message for message in reversed(session["messages"]) if message["role"] == "user"),
+            None,
+        )
+        summaries.append(
+            {
+                "session_id": session_id,
+                "title": session["title"],
+                "updated_at": session["updated_at"],
+                "message_count": len(session["messages"]),
+                "preview": last_message["content"] if last_message else "No messages yet",
+            }
+        )
+    return summaries
+
+
+def save_profile(session_id: str, profile: dict[str, Any] | None) -> dict[str, Any]:
+    session = ensure_session(session_id)
+    session["profile"] = deepcopy(profile) if profile else None
+    session["updated_at"] = _utc_now()
+    return deepcopy(session)
+
+
+def set_current_item(session_id: str, current_item: dict[str, Any] | None) -> dict[str, Any]:
+    session = ensure_session(session_id)
+    session["current_item"] = deepcopy(current_item) if current_item else None
+    session["updated_at"] = _utc_now()
+    return deepcopy(session)
+
+
+def clear_current_item(session_id: str) -> dict[str, Any]:
+    return set_current_item(session_id, None)
+
+
+def add_message(
+    session_id: str,
+    role: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    session = ensure_session(session_id)
+    session["messages"].append(
+        {
+            "role": role,
+            "content": content,
+            "metadata": deepcopy(metadata) if metadata else {},
+            "created_at": _utc_now(),
+        }
+    )
+    if role == "user" and content:
+        session["title"] = content[:48]
+    session["updated_at"] = _utc_now()
+    return deepcopy(session)

@@ -240,7 +240,7 @@ Important observations:
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/Pratyaksh0404/nutrimentor-ai.git
+git clone <your-repo-url>
 cd Nutrimentor-Ai
 ```
 
