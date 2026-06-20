@@ -1,0 +1,1 @@
+export type SeasonKey = "all" | "spring" | "summer" | "monsoon" | "autumn" | "prewinter" | "winter";

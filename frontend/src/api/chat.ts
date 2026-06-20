@@ -1,19 +1,23 @@
 import { apiClient } from "./client";
 import type {
-  AgentContext,
   AgentContextItem,
+  AgentProfile,
   AgentResponse,
   AgentSessionDetail,
   AgentSessionSummary,
 } from "../types/chat";
 
-interface AgentPayload {
+interface AgentMessagePayload {
   message: string;
-  session_id?: string | null;
-  context?: AgentContext;
+  context: {
+    session_id: string | null;
+    current_item?: AgentContextItem | null;
+    current_season?: string;
+    profile?: AgentProfile;
+  };
 }
 
-export async function sendAgentMessage(payload: AgentPayload): Promise<AgentResponse> {
+export async function sendAgentMessage(payload: AgentMessagePayload): Promise<AgentResponse> {
   const response = await apiClient.post("/agent/message", payload);
   return response.data;
 }

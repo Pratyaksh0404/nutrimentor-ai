@@ -14,48 +14,14 @@ import type {
 } from "../types/chat";
 import type { Item } from "../types/item";
 
-const SESSION_STORAGE_KEY = "nutrimentor-agent-session";
+const SESSION_KEY = "nutrimentor-session-id";
 
 function inferPendingState(message: string): AgentState {
-  const lowered = message.toLowerCase();
-  if (lowered.includes("bmi") || lowered.includes("compare")) {
-    return "calculating";
-  }
-  if (lowered.includes("diet plan") || lowered.includes("meal plan")) {
-    return "generating-plan";
-  }
-  if (
-    lowered.includes("nutrient") ||
-    lowered.includes("season") ||
-    lowered.includes("vitamin") ||
-    lowered.includes("calorie")
-  ) {
-    return "retrieving";
-  }
+  const m = message.toLowerCase();
+  if (m.includes("bmi") || m.includes("compare")) return "calculating";
+  if (m.includes("diet plan") || m.includes("meal plan") || m.includes("day plan")) return "generating-plan";
+  if (m.includes("nutrient") || m.includes("vitamin") || m.includes("season") || m.includes("calorie")) return "retrieving";
   return "thinking";
-}
-
-function toUiMessages(
-  messages: Array<{
-    role: "user" | "assistant";
-    content: string;
-    metadata?: {
-      mode?: "tool" | "retrieval" | "llm-assisted";
-      task_type?: string;
-      citations?: string[];
-    };
-  }>,
-): AgentMessageType[] {
-  return messages.map((message, index) => ({
-    id: `${message.role}-${index}-${message.content.slice(0, 16)}`,
-    role: message.role,
-    content: message.content,
-    metadata: {
-      mode: message.metadata?.mode,
-      taskType: message.metadata?.task_type,
-      citations: message.metadata?.citations,
-    },
-  }));
 }
 
 interface UseChatOptions {
@@ -65,182 +31,179 @@ interface UseChatOptions {
 }
 
 export function useChat({ selectedItem, season, profile }: UseChatOptions) {
-  const [messages, setMessages] = useState<AgentMessageType[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [messages, setMessages]   = useState<AgentMessageType[]>([]);
+  const [loading, setLoading]     = useState(false);
   const [agentState, setAgentState] = useState<AgentState>("idle");
-  const [sessionId, setSessionId] = useState<string | null>(() =>
-    window.localStorage.getItem(SESSION_STORAGE_KEY),
-  );
-  const [sessions, setSessions] = useState<AgentSessionSummary[]>([]);
-  const previousSelectedItemId = useRef<number | null>(selectedItem?.id ?? null);
+  const [sessions, setSessions]   = useState<AgentSessionSummary[]>([]);
 
+  // sessionId lives in a ref AND state — ref avoids stale closure issues
+  const [sessionId, setSessionIdState] = useState<string | null>(
+    () => window.localStorage.getItem(SESSION_KEY)
+  );
+  const sessionIdRef = useRef<string | null>(sessionId);
+
+  function setSessionId(id: string | null) {
+    sessionIdRef.current = id;
+    setSessionIdState(id);
+    if (id) window.localStorage.setItem(SESSION_KEY, id);
+    else window.localStorage.removeItem(SESSION_KEY);
+  }
+
+  // Track last loaded session to avoid re-fetching on every render
+  const loadedSessionRef = useRef<string | null>(null);
+  const prevSelectedItemId = useRef<number | null>(selectedItem?.id ?? null);
+
+  // Refresh sessions sidebar
   const refreshSessions = useCallback(async () => {
     try {
-      const nextSessions = await getAgentSessions();
-      setSessions(nextSessions);
-    } catch {
-      // Ignore session sidebar refresh failures.
-    }
+      setSessions(await getAgentSessions());
+    } catch { /* ignore */ }
   }, []);
 
+  useEffect(() => { refreshSessions(); }, [refreshSessions]);
+
+  // Load message history when session first loads — but NOT after each send
   useEffect(() => {
-    refreshSessions();
-  }, [refreshSessions]);
+    const sid = sessionId;
+    if (!sid || loadedSessionRef.current === sid) return;
+    loadedSessionRef.current = sid;
 
-  useEffect(() => {
-    if (!sessionId) {
-      return;
-    }
-
-    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
-
-    getAgentSession(sessionId)
+    getAgentSession(sid)
       .then((session) => {
-        setMessages(toUiMessages(session.messages));
+        if (session.messages?.length) {
+          setMessages(session.messages.map((m: any, i: number) => ({
+            id: `hist-${i}-${m.role}`,
+            role: m.role,
+            content: m.content,
+          })));
+        }
       })
       .catch(() => {
-        window.localStorage.removeItem(SESSION_STORAGE_KEY);
+        // Session not found on server (e.g. after restart) — clear it
+        window.localStorage.removeItem(SESSION_KEY);
         setSessionId(null);
+        loadedSessionRef.current = null;
       });
   }, [sessionId]);
 
+  // Select/clear item context when it changes
   useEffect(() => {
     const currentId = selectedItem?.id ?? null;
-    if (currentId === previousSelectedItemId.current) {
-      return;
-    }
+    if (currentId === prevSelectedItemId.current) return;
+    prevSelectedItemId.current = currentId;
 
-    previousSelectedItemId.current = currentId;
-
+    const sid = sessionIdRef.current;
     if (selectedItem) {
-      selectAgentContext(sessionId, {
+      selectAgentContext(sid, {
         id: selectedItem.id,
         name: selectedItem.name,
         season: selectedItem.season,
       })
-        .then((response) => {
-          if (response.session_id !== sessionId) {
-            setSessionId(response.session_id);
-          }
-          refreshSessions();
-        })
+        .then((r) => { if (r.session_id !== sid) setSessionId(r.session_id); })
         .catch(() => undefined);
-      return;
+    } else if (sid) {
+      clearAgentContext(sid).catch(() => undefined);
     }
+  }, [selectedItem]);
 
-    if (!sessionId) {
-      return;
-    }
+  const sendMessage = useCallback(async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || loading) return;
 
-    clearAgentContext(sessionId)
-      .then(() => {
-        refreshSessions();
-      })
-      .catch(() => undefined);
-  }, [refreshSessions, selectedItem, sessionId]);
+    // Optimistically add user message
+    const userMsg: AgentMessageType = {
+      id: `${Date.now()}-user`,
+      role: "user",
+      content: trimmed,
+    };
+    setMessages((prev) => [...prev, userMsg]);
+    setLoading(true);
+    setAgentState(inferPendingState(trimmed));
 
-  const sendMessage = useCallback(
-    async (text: string) => {
-      const trimmed = text.trim();
-      if (!trimmed || loading) {
-        return;
-      }
+    try {
+      const sid = sessionIdRef.current;
+      const response = await sendAgentMessage({
+        message: trimmed,
+        context: {
+          session_id: sid,        // ← Worker reads this from context
+          current_item: selectedItem
+            ? { id: selectedItem.id, name: selectedItem.name, season: selectedItem.season }
+            : null,
+          current_season: season,
+          profile,
+        },
+      });
 
-      const userMessage: AgentMessageType = {
-        id: `${Date.now()}-user`,
-        role: "user",
-        content: trimmed,
-      };
-
-      setMessages((prev) => [...prev, userMessage]);
-      setLoading(true);
-      setAgentState(inferPendingState(trimmed));
-
-      try {
-        const response = await sendAgentMessage({
-          message: trimmed,
-          session_id: sessionId,
-          context: {
-            current_item: selectedItem
-              ? {
-                  id: selectedItem.id,
-                  name: selectedItem.name,
-                  season: selectedItem.season,
-                }
-              : null,
-            current_season: season,
-            profile,
-          },
-        });
-
+      // Update session id if new
+      if (response.session_id && response.session_id !== sid) {
         setSessionId(response.session_id);
-        setAgentState(response.agent_state);
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-assistant`,
-            role: "assistant",
-            content: response.message,
-            cards: response.cards,
-            nextActions: response.next_actions,
-            metadata: {
-              mode: response.mode,
-              taskType: response.task_type,
-              citations: response.citations,
-            },
-          },
-        ]);
-        refreshSessions();
-      } catch {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-assistant-error`,
-            role: "assistant",
-            content: "Sorry, the agent could not complete that task. Please try again.",
-          },
-        ]);
-      } finally {
-        setLoading(false);
-        setAgentState("complete");
+        loadedSessionRef.current = response.session_id; // don't re-load from server
       }
-    },
-    [loading, profile, refreshSessions, season, selectedItem, sessionId],
-  );
 
-  const continueSession = useCallback(async (nextSessionId: string) => {
-    const session = await getAgentSession(nextSessionId);
-    setSessionId(nextSessionId);
-    setMessages(toUiMessages(session.messages));
+      // Add assistant response — append to existing messages, never replace
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-assistant`,
+          role: "assistant",
+          content: response.message,
+          cards: response.cards,
+          nextActions: response.next_actions,
+          metadata: {
+            mode: response.mode,
+            taskType: response.task_type,
+            citations: response.citations,
+          },
+        },
+      ]);
+
+      setAgentState("complete");
+      refreshSessions();
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-error`,
+          role: "assistant",
+          content: "Something went wrong. Please try again.",
+        },
+      ]);
+    } finally {
+      setLoading(false);
+      setAgentState("complete");
+    }
+  }, [loading, profile, refreshSessions, season, selectedItem]);
+
+  const continueSession = useCallback(async (sid: string) => {
+    try {
+      const session = await getAgentSession(sid);
+      setSessionId(sid);
+      loadedSessionRef.current = sid;
+      setMessages(session.messages?.map((m: any, i: number) => ({
+        id: `hist-${i}-${m.role}`,
+        role: m.role,
+        content: m.content,
+      })) ?? []);
+    } catch { /* ignore */ }
   }, []);
 
   const clearContext = useCallback(async () => {
-    const response = await clearAgentContext(sessionId);
-    if (!sessionId && response.session_id) {
-      setSessionId(response.session_id);
-    }
-    refreshSessions();
-  }, [refreshSessions, sessionId]);
+    try {
+      const sid = sessionIdRef.current;
+      if (sid) await clearAgentContext(sid);
+      refreshSessions();
+    } catch { /* ignore */ }
+  }, [refreshSessions]);
 
-  const starterPrompts = useMemo(
-    () => [
-      selectedItem ? `Analyze ${selectedItem.name}` : "Tell me what you can do",
-      selectedItem ? `What nutrients does ${selectedItem.name} have?` : "Suggest a seasonal food",
-      selectedItem ? `Compare ${selectedItem.name} with banana` : "Build my day plan",
-      "What is my BMI?",
-    ],
-    [selectedItem],
-  );
+  const starterPrompts = useMemo(() => [
+    selectedItem ? `Analyze ${selectedItem.name}` : "Tell me what you can do",
+    selectedItem ? `What nutrients does ${selectedItem.name} have?` : "Suggest a seasonal food",
+    selectedItem ? `Compare ${selectedItem.name} with banana` : "Build my day plan",
+    "What is my BMI?",
+  ], [selectedItem]);
 
   return {
-    messages,
-    loading,
-    agentState,
-    sessionId,
-    sessions,
-    starterPrompts,
-    sendMessage,
-    continueSession,
-    clearContext,
+    messages, loading, agentState, sessionId, sessions,
+    starterPrompts, sendMessage, continueSession, clearContext,
   };
 }

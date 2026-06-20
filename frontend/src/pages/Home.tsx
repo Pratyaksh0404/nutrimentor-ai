@@ -3,142 +3,149 @@ import ChatBox from "../components/chat/ChatBox";
 import SeasonSelector from "../components/season/SeasonSelector";
 import FoodGrid from "../components/food/FoodGrid";
 import FoodDetailPanel from "../components/food/FoodDetailPanel";
-import { useBackendHealth } from "../hooks/useBackendHealth";
-import { useItems } from "../hooks/useItems";
-import HeroHeader from "../components/layout/HeroHeader";
-import LogoCenter from "../components/layout/LogoCenter";
-import logo from "../components/layout/logo.png";
-import { RITU_INFO } from "../constants/ritu";
 import Footer from "../components/footer/Footer";
-import Container from "../components/layout/Container";
+import { useItems } from "../hooks/useItems";
+import { RITU_INFO } from "../constants/ritu";
+import logo from "../components/layout/logo.png";
 import type { Item } from "../types/item";
+import type { SeasonKey } from "../types/season";
 
-type SeasonKey =
-  | "all"
-  | "spring"
-  | "summer"
-  | "monsoon"
-  | "autumn"
-  | "prewinter"
-  | "winter";
+const RITU_KEY_MAP: Record<SeasonKey, keyof typeof RITU_INFO | null> = {
+  spring: "vasanta", summer: "grishma", monsoon: "varsha",
+  autumn: "sharad", prewinter: "hemanta", winter: "shishira", all: null,
+};
+
+const SEASON_BG: Record<SeasonKey, string> = {
+  all: "from-slate-50 to-white",
+  spring: "from-green-50 to-white",
+  summer: "from-amber-50 to-white",
+  monsoon: "from-blue-50 to-white",
+  autumn: "from-orange-50 to-white",
+  prewinter: "from-teal-50 to-white",
+  winter: "from-indigo-50 to-white",
+};
 
 export default function Home() {
-  const backendStatus = useBackendHealth();
   const [season, setSeason] = useState<SeasonKey>("all");
   const [hoveredItem, setHoveredItem] = useState<Item | null>(null);
   const [selectedItem, setSelectedItem] = useState<Item | null>(null);
 
-  const rituKeyMap = {
-    spring: "vasanta",
-    summer: "grishma",
-    monsoon: "varsha",
-    autumn: "sharad",
-    winter: "shishira",
-    prewinter: "hemanta",
-    all: null,
-  } as const;
+  const rituKey = RITU_KEY_MAP[season];
+  const ritu = rituKey ? RITU_INFO[rituKey] : null;
+  const { items, loading } = useItems(season);
 
-  const rituKey = rituKeyMap[season];
-  const ritu = rituKey
-    ? RITU_INFO[rituKey]
-    : null;
-
-  const { items, loading, error } = useItems(season);
   const displayItem = hoveredItem ?? selectedItem;
+  const bg = SEASON_BG[season];
 
-  if (backendStatus === "loading") {
-    return <div className="min-h-screen flex items-center justify-center">
-      Connecting to NutriMentor AI…
-    </div>;
+  function handleSelectItem(item: Item) {
+    setSelectedItem(item);
   }
 
-  if (backendStatus === "error") {
-    return <div className="min-h-screen flex items-center justify-center text-red-600">
-      Backend not reachable. Please start the server.
-    </div>;
+  function handleClearItem() {
+    setSelectedItem(null);
   }
 
   return (
-    <Container>
-      <main className="flex-1">
-        {/* ⬅️ horizontal scroll allowed here */}
-        <div className="w-full px-4 py-8 overflow-x-auto">
-            <div className="min-w-[1200px] mx-auto grid grid-cols-[420px_1fr_380px] gap-8">
-            {/* LEFT */}
-            <div className="flex flex-col gap-6">
-              <h2 className="text-xl font-semibold">
-                Explore seasonal fruits & veggies
+    <div className={`min-h-screen bg-gradient-to-br ${bg} transition-colors duration-500`}>
+      {/* ── Top nav ─────────────────────────────────────────────────────── */}
+      <header className="sticky top-0 z-20 backdrop-blur-md bg-white/80 border-b border-slate-200/60">
+        <div className="max-w-[1400px] mx-auto px-4 sm:px-6 flex items-center justify-between h-14">
+          <div className="flex items-center gap-2.5">
+            <img src={logo} alt="NutriMentor AI" className="h-8 w-8 rounded-lg object-cover" />
+            <span className="text-sm font-semibold text-slate-900 tracking-tight">NutriMentor AI</span>
+            <span className="hidden sm:inline text-[10px] text-slate-400 border border-slate-200 rounded-full px-2 py-0.5">
+              Season-aware nutrition
+            </span>
+          </div>
+          {ritu && (
+            <p className="hidden md:block text-xs text-slate-500 italic max-w-xs truncate">
+              {ritu.label} · {ritu.description}
+            </p>
+          )}
+        </div>
+      </header>
+
+      {/* ── Main layout ──────────────────────────────────────────────────── */}
+      <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-6">
+
+        {/* Season pills row */}
+        <div className="mb-5">
+          <SeasonSelector selectedSeason={season} onChange={setSeason} />
+        </div>
+
+        {/* Three column layout */}
+        <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr_360px] gap-5 items-start">
+
+          {/* ── LEFT: Food grid ───────────────────────────────────────────── */}
+          <div className="flex flex-col gap-3">
+            <div className="flex items-baseline justify-between">
+              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                {season === "all" ? "All foods" : `${ritu?.label ?? season} foods`}
               </h2>
-
-              <SeasonSelector selectedSeason={season} onChange={setSeason} />
-
-              {ritu && (
-                <div className="rounded-xl border bg-white px-4 py-3 shadow-sm">
-                  <div className="text-sm font-medium">
-                    {ritu.label} ({ritu.english})
-                  </div>
-                  <p className="mt-1 text-xs text-gray-600">
-                    {ritu.description}
-                  </p>
-                </div>
-              )}
-
-              {!loading && !error && (
-                <FoodGrid
-                  items={items}
-                  selectedItem={selectedItem}
-                  onHoverItem={setHoveredItem}
-                  onSelectItem={setSelectedItem}
-                />
+              {!loading && (
+                <span className="text-xs text-slate-400">{items.length} items</span>
               )}
             </div>
 
-            {/* CENTER */}
-            <div className="flex flex-col items-center gap-4">
-              <HeroHeader />
-              <LogoCenter logoSrc={logo} />
+            {loading ? (
+              <div className="grid grid-cols-2 gap-2.5">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} className="h-36 rounded-2xl bg-slate-100 animate-pulse" />
+                ))}
+              </div>
+            ) : (
+              <FoodGrid
+                items={items}
+                selectedItem={selectedItem}
+                onHoverItem={setHoveredItem}
+                onSelectItem={handleSelectItem}
+              />
+            )}
+          </div>
 
-              {/* 🔥 Spotlight panel */}
-              {displayItem && (
-                <div className="w-full max-w-md mt-4 rounded-xl border bg-white p-4 shadow-md">
-                  {selectedItem && displayItem.id === selectedItem.id && (
-                    <div className="mb-3 flex items-center justify-between gap-3 border-b pb-2">
-                      <span className="text-xs font-medium text-gray-600">
-                        Selected for agent context
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => setSelectedItem(null)}
-                        className="rounded border px-2 py-1 text-xs text-gray-700 hover:bg-gray-50"
-                      >
-                        Clear
-                      </button>
-                    </div>
-                  )}
-                  <FoodDetailPanel item={displayItem} />
-                </div>
-              )}
-            </div>
-
-            {/* RIGHT */}
-            <div className="bg-white rounded-xl shadow-lg p-4 h-[600px] flex flex-col">
-              <p className="text-lg italic font-semibold text-center mb-2">
-                Nutrition Agent
-              </p>
-              <div className="flex-1 overflow-hidden">
-                <ChatBox
-                  selectedItem={selectedItem}
-                  season={season}
-                  onClearSelectedItem={() => setSelectedItem(null)}
+          {/* ── CENTRE: Detail panel ─────────────────────────────────────── */}
+          <div className="flex flex-col gap-4">
+            {displayItem ? (
+              <div className="rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+                <FoodDetailPanel
+                  item={displayItem}
+                  isSelected={selectedItem?.id === displayItem.id}
+                  onSelect={() => handleSelectItem(displayItem)}
+                  onClear={handleClearItem}
                 />
               </div>
-            </div>
+            ) : (
+              /* Empty state */
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-white/60 p-10 flex flex-col items-center justify-center text-center gap-3 min-h-[320px]">
+                <div className="text-4xl">🥦</div>
+                <div>
+                  <p className="text-sm font-medium text-slate-700">Select a food to explore</p>
+                  <p className="text-xs text-slate-400 mt-1 max-w-xs">
+                    Click any food card to see its nutrients, seasonal fit, and ask the agent about it.
+                  </p>
+                </div>
+                {ritu && (
+                  <div className="mt-2 rounded-xl bg-slate-50 border border-slate-200 px-4 py-3 text-left max-w-sm">
+                    <p className="text-[11px] font-semibold text-slate-600">{ritu.label} ({ritu.english})</p>
+                    <p className="text-[11px] text-slate-500 mt-0.5">{ritu.description}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
+          {/* ── RIGHT: Agent panel ───────────────────────────────────────── */}
+          <div className="lg:sticky lg:top-20 rounded-2xl border border-slate-200 bg-white shadow-sm overflow-hidden"
+               style={{ height: "calc(100vh - 100px)", maxHeight: "760px" }}>
+            <ChatBox
+              selectedItem={selectedItem}
+              season={season}
+              onClearSelectedItem={handleClearItem}
+            />
           </div>
         </div>
-      </main>
-
+      </div>
       <Footer />
-    </Container>
+    </div>
   );
 }

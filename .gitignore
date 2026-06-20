@@ -25,3 +25,8 @@ backend/app/ml/intent_model/
 backend/app/ml/models/
 backend/nutrimentor.db
 backend/nutrimentor_backup.db
+worker/wrangler.toml
+.wrangler/
+
+frontend/.env.local
+frontend/.env.production

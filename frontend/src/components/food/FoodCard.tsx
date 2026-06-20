@@ -10,62 +10,55 @@ interface FoodCardProps {
   onSelect: () => void;
 }
 
-export default function FoodCard({
-  item,
-  active,
-  dimmed,
-  selected,
-  onHover,
-  onLeave,
-  onSelect,
-}: FoodCardProps) {
+export default function FoodCard({ item, active, dimmed, selected, onHover, onLeave, onSelect }: FoodCardProps) {
+  const imgSrc = item.image_url || "/images/placeholder.png";
+
   return (
-    <div
+    <button
+      type="button"
       onMouseEnter={onHover}
       onMouseLeave={onLeave}
       onClick={onSelect}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          onSelect();
-        }
-      }}
       className={`
-        bg-white
-        border
-        rounded-xl
-        cursor-pointer
-        transition-all
-        duration-300
-        flex
-        flex-col
-        items-center
-        justify-center
-        ${
-          active
-            ? "scale-[1.06] shadow-xl"
-            : dimmed
-            ? "opacity-60"
-            : "opacity-100 shadow-sm"
-        }
-        ${selected ? "ring-2 ring-blue-600 border-blue-600" : ""}
+        group relative w-full rounded-2xl border bg-white text-left
+        transition-all duration-200 overflow-hidden
+        ${active ? "shadow-lg scale-[1.03] border-emerald-300" : "shadow-sm border-slate-200"}
+        ${selected ? "ring-2 ring-emerald-500 border-emerald-400" : ""}
+        ${dimmed ? "opacity-50" : "opacity-100"}
+        hover:shadow-md hover:border-slate-300
       `}
-      style={{
-        width: "180px",
-        height: "190px",
-      }}
     >
-      <img
-        src={item.image_url || "/images/placeholder.png"}
-        alt={item.name}
-        className="h-24 object-contain"
-      />
+      {/* Image area */}
+      <div className="relative h-28 flex items-center justify-center bg-gradient-to-b from-slate-50 to-white pt-3 pb-1">
+        <img
+          src={imgSrc}
+          alt={item.name}
+          className="h-20 w-20 object-contain drop-shadow-sm transition-transform duration-200 group-hover:scale-105"
+          onError={(e) => {
+            const target = e.target as HTMLImageElement;
+            target.onerror = null;
+            target.style.display = "none";
+            const parent = target.parentElement;
+            if (parent && !parent.querySelector(".emoji-fallback")) {
+              const span = document.createElement("span");
+              span.className = "emoji-fallback text-4xl";
+              span.textContent = "🥗";
+              parent.appendChild(span);
+            }
+          }}
+        />
+        {selected && (
+          <span className="absolute top-2 right-2 flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white text-[10px]">
+            ✓
+          </span>
+        )}
+      </div>
 
-      <p className="mt-3 font-medium text-sm text-center">
-        {item.name}
-      </p>
-    </div>
+      {/* Name + meta */}
+      <div className="px-2 pb-2.5 text-center">
+        <p className="text-xs font-semibold text-slate-800 truncate">{item.name}</p>
+        <p className="text-[10px] text-slate-400 mt-0.5">{item.calories_per_100g} kcal</p>
+      </div>
+    </button>
   );
 }
