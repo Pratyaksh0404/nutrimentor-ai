@@ -11,6 +11,7 @@ interface AgentMessagePayload {
   message: string;
   context: {
     session_id: string | null;
+    profile_id?: string;           // ← stable browser identity (Phase 1)
     current_item?: AgentContextItem | null;
     current_season?: string;
     profile?: AgentProfile;
@@ -42,8 +43,14 @@ export async function clearAgentContext(
   return response.data;
 }
 
-export async function getAgentSessions(): Promise<AgentSessionSummary[]> {
-  const response = await apiClient.get("/agent/sessions");
+export async function getAgentSessions(
+  profileId?: string | null,
+  sessionId?: string | null,
+): Promise<AgentSessionSummary[]> {
+  const params: Record<string, string> = {};
+  if (profileId) params.profile_id = profileId;
+  if (sessionId) params.session_id = sessionId;
+  const response = await apiClient.get("/agent/sessions", { params });
   return response.data;
 }
 

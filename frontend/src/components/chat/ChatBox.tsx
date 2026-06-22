@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, History, Send, Sparkles, UserRound, X, Zap } from "lucide-react";
+import { ChevronDown, ChevronUp, History, PenSquare, Send, Sparkles, UserRound, X, Zap } from "lucide-react";
 import { useChat } from "../../hooks/useChat";
 import type { AgentPanelProps, AgentProfile } from "../../types/chat";
 
@@ -39,7 +39,7 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem }: A
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
   const { messages, loading, agentState, sessionId, sessions, starterPrompts,
-          sendMessage, continueSession, clearContext } = useChat({ selectedItem, season, profile });
+          sendMessage, continueSession, clearContext, startNewChat } = useChat({ selectedItem, season, profile });
 
   useEffect(() => {
     window.localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
@@ -80,17 +80,28 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem }: A
               {loading ? agentStateLabel(agentState) : "Ready"}
             </p>
           </div>
-          {/* Profile toggle */}
-          <button
-            type="button"
-            onClick={() => setShowProfile((p) => !p)}
-            title="Profile"
-            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-slate-500 transition-colors ${
-              showProfile ? "border-blue-200 bg-blue-50 text-blue-600" : "border-slate-200 hover:bg-slate-50"
-            }`}
-          >
-            <UserRound className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1.5">
+            {/* New chat */}
+            <button
+              type="button"
+              onClick={startNewChat}
+              title="New chat"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 transition-colors"
+            >
+              <PenSquare className="h-3.5 w-3.5" />
+            </button>
+            {/* Profile toggle */}
+            <button
+              type="button"
+              onClick={() => setShowProfile((p) => !p)}
+              title="Profile"
+              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-slate-500 transition-colors ${
+                showProfile ? "border-blue-200 bg-blue-50 text-blue-600" : "border-slate-200 hover:bg-slate-50"
+              }`}
+            >
+              <UserRound className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         {/* Context chips row */}
@@ -213,23 +224,62 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem }: A
         </button>
 
         {showSessions && (
-          <div className="px-3 pb-2 flex flex-col gap-1">
+          <div className="px-3 pb-2 flex flex-col gap-1.5">
+            {/* New chat button */}
+            <button
+              type="button"
+              onClick={startNewChat}
+              className="flex items-center gap-1.5 rounded-lg border border-dashed border-emerald-300 bg-emerald-50 px-3 py-1.5 text-[11px] text-emerald-700 hover:bg-emerald-100 transition-colors"
+            >
+              <PenSquare className="h-3 w-3" />
+              Start a new chat
+            </button>
+
             {sessions.length === 0 ? (
-              <p className="rounded-lg border border-dashed border-slate-200 px-3 py-2 text-[11px] text-slate-400 text-center">
-                No sessions yet
+              <p className="px-1 text-[11px] text-slate-400 text-center py-1">
+                No previous sessions yet
               </p>
             ) : (
-              sessions.slice(0, 3).map((s) => (
-                <button
-                  key={s.session_id}
-                  type="button"
-                  onClick={() => continueSession(s.session_id)}
-                  className="rounded-lg border border-slate-200 px-3 py-2 text-left hover:bg-slate-50 transition-colors"
-                >
-                  <p className="text-[11px] font-medium text-slate-800 truncate">{s.title}</p>
-                  <p className="text-[10px] text-slate-400 truncate mt-0.5">{s.preview}</p>
-                </button>
-              ))
+              sessions.slice(0, 5).map((s) => {
+                const isActive = s.session_id === sessionId;
+                // D1 stores datetime('now') as UTC without Z suffix
+                // Append Z so JS parses as UTC, then display in user's local timezone (IST)
+                const rawTs = s.updated_at
+                  ? s.updated_at.includes("T") ? s.updated_at : s.updated_at.replace(" ", "T") + "Z"
+                  : null;
+                const time = rawTs
+                  ? new Date(rawTs).toLocaleString("en-IN", {
+                      day: "numeric", month: "short",
+                      hour: "2-digit", minute: "2-digit",
+                      hour12: true,
+                    })
+                  : "";
+                const preview = (s as any).first_message || s.title || "Chat session";
+                return (
+                  <button
+                    key={s.session_id}
+                    type="button"
+                    onClick={() => continueSession(s.session_id)}
+                    className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                      isActive
+                        ? "border-emerald-300 bg-emerald-50"
+                        : "border-slate-200 hover:bg-slate-50"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <p className={`text-[11px] font-medium truncate ${isActive ? "text-emerald-700" : "text-slate-800"}`}>
+                        {preview.slice(0, 40)}{preview.length > 40 ? "…" : ""}
+                      </p>
+                      {isActive && (
+                        <span className="shrink-0 rounded-full bg-emerald-500 px-1.5 py-0.5 text-[9px] text-white font-medium">
+                          now
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-0.5">{time}</p>
+                  </button>
+                );
+              })
             )}
           </div>
         )}

@@ -15,6 +15,18 @@ import type {
 import type { Item } from "../types/item";
 
 const SESSION_KEY = "nutrimentor-session-id";
+// ── PHASE 1 FIX: Stable profile ID — survives session resets and refreshes
+// This is the persistent user identity for facts/preferences until Phase 5 OAuth
+const PROFILE_KEY = "nutrimentor-profile-id";
+
+function getOrCreateProfileId(): string {
+  let id = window.localStorage.getItem(PROFILE_KEY);
+  if (!id) {
+    id = crypto.randomUUID().replace(/-/g, "");
+    window.localStorage.setItem(PROFILE_KEY, id);
+  }
+  return id;
+}
 
 function inferPendingState(message: string): AgentState {
   const m = message.toLowerCase();
@@ -31,12 +43,15 @@ interface UseChatOptions {
 }
 
 export function useChat({ selectedItem, season, profile }: UseChatOptions) {
-  const [messages, setMessages]   = useState<AgentMessageType[]>([]);
-  const [loading, setLoading]     = useState(false);
+  const [messages, setMessages]     = useState<AgentMessageType[]>([]);
+  const [loading, setLoading]       = useState(false);
   const [agentState, setAgentState] = useState<AgentState>("idle");
-  const [sessions, setSessions]   = useState<AgentSessionSummary[]>([]);
+  const [sessions, setSessions]     = useState<AgentSessionSummary[]>([]);
 
-  // sessionId lives in a ref AND state — ref avoids stale closure issues
+  // Stable profile ID — never changes for this browser
+  const profileId = useMemo(() => getOrCreateProfileId(), []);
+
+  // sessionId — changes when user starts a new chat
   const [sessionId, setSessionIdState] = useState<string | null>(
     () => window.localStorage.getItem(SESSION_KEY)
   );
@@ -49,20 +64,22 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
     else window.localStorage.removeItem(SESSION_KEY);
   }
 
-  // Track last loaded session to avoid re-fetching on every render
   const loadedSessionRef = useRef<string | null>(null);
   const prevSelectedItemId = useRef<number | null>(selectedItem?.id ?? null);
 
-  // Refresh sessions sidebar
+  // Refresh sessions — scoped to THIS browser's profile_id
   const refreshSessions = useCallback(async () => {
     try {
-      setSessions(await getAgentSessions());
+      const sid = sessionIdRef.current;
+      // Pass profile_id for cross-session fact continuity
+      const data = await getAgentSessions(profileId, sid);
+      setSessions(data);
     } catch { /* ignore */ }
-  }, []);
+  }, [profileId]);
 
   useEffect(() => { refreshSessions(); }, [refreshSessions]);
 
-  // Load message history when session first loads — but NOT after each send
+  // Load message history when session loads
   useEffect(() => {
     const sid = sessionId;
     if (!sid || loadedSessionRef.current === sid) return;
@@ -79,7 +96,6 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         }
       })
       .catch(() => {
-        // Session not found on server (e.g. after restart) — clear it
         window.localStorage.removeItem(SESSION_KEY);
         setSessionId(null);
         loadedSessionRef.current = null;
@@ -110,7 +126,6 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
 
-    // Optimistically add user message
     const userMsg: AgentMessageType = {
       id: `${Date.now()}-user`,
       role: "user",
@@ -125,7 +140,8 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
       const response = await sendAgentMessage({
         message: trimmed,
         context: {
-          session_id: sid,        // ← Worker reads this from context
+          session_id: sid,
+          profile_id: profileId,          // ← stable identity for facts
           current_item: selectedItem
             ? { id: selectedItem.id, name: selectedItem.name, season: selectedItem.season }
             : null,
@@ -134,13 +150,11 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         },
       });
 
-      // Update session id if new
       if (response.session_id && response.session_id !== sid) {
         setSessionId(response.session_id);
-        loadedSessionRef.current = response.session_id; // don't re-load from server
+        loadedSessionRef.current = response.session_id;
       }
 
-      // Add assistant response — append to existing messages, never replace
       setMessages((prev) => [
         ...prev,
         {
@@ -172,7 +186,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
       setLoading(false);
       setAgentState("complete");
     }
-  }, [loading, profile, refreshSessions, season, selectedItem]);
+  }, [loading, profile, profileId, refreshSessions, season, selectedItem]);
 
   const continueSession = useCallback(async (sid: string) => {
     try {
@@ -195,6 +209,14 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
     } catch { /* ignore */ }
   }, [refreshSessions]);
 
+  // Start a brand new chat — clears screen but profile_id and facts persist
+  const startNewChat = useCallback(() => {
+    setMessages([]);
+    setSessionId(null);
+    loadedSessionRef.current = null;
+    prevSelectedItemId.current = null;
+  }, []);
+
   const starterPrompts = useMemo(() => [
     selectedItem ? `Analyze ${selectedItem.name}` : "Tell me what you can do",
     selectedItem ? `What nutrients does ${selectedItem.name} have?` : "Suggest a seasonal food",
@@ -204,6 +226,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
 
   return {
     messages, loading, agentState, sessionId, sessions,
-    starterPrompts, sendMessage, continueSession, clearContext,
+    starterPrompts, sendMessage, continueSession, clearContext, startNewChat,
+    profileId,
   };
 }
