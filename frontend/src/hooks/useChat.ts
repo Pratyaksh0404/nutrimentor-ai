@@ -14,9 +14,6 @@ import type {
 } from "../types/chat";
 import type { Item } from "../types/item";
 
-const SESSION_KEY = "nutrimentor-session-id";
-// ── PHASE 1 FIX: Stable profile ID — survives session resets and refreshes
-// This is the persistent user identity for facts/preferences until Phase 5 OAuth
 const PROFILE_KEY = "nutrimentor-profile-id";
 
 function getOrCreateProfileId(): string {
@@ -47,67 +44,32 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
   const [loading, setLoading]       = useState(false);
   const [agentState, setAgentState] = useState<AgentState>("idle");
   const [sessions, setSessions]     = useState<AgentSessionSummary[]>([]);
+  const [sessionId, setSessionId]   = useState<string | null>(null);
 
-  // Stable profile ID — never changes for this browser
-  const profileId = useMemo(() => getOrCreateProfileId(), []);
-
-  // sessionId — changes when user starts a new chat
-  const [sessionId, setSessionIdState] = useState<string | null>(
-    () => window.localStorage.getItem(SESSION_KEY)
-  );
-  const sessionIdRef = useRef<string | null>(sessionId);
-
-  function setSessionId(id: string | null) {
-    sessionIdRef.current = id;
-    setSessionIdState(id);
-    if (id) window.localStorage.setItem(SESSION_KEY, id);
-    else window.localStorage.removeItem(SESSION_KEY);
-  }
-
-  const loadedSessionRef = useRef<string | null>(null);
+  const sessionIdRef       = useRef<string | null>(null);
+  const loadedSessionRef   = useRef<string | null>(null);
   const prevSelectedItemId = useRef<number | null>(selectedItem?.id ?? null);
 
-  // Refresh sessions — scoped to THIS browser's profile_id
+  const profileId = useMemo(() => getOrCreateProfileId(), []);
+
+  function updateSessionId(id: string | null) {
+    sessionIdRef.current = id;
+    setSessionId(id);
+  }
+
   const refreshSessions = useCallback(async () => {
     try {
-      const sid = sessionIdRef.current;
-      // Pass profile_id for cross-session fact continuity
-      const data = await getAgentSessions(profileId, sid);
+      const data = await getAgentSessions(profileId, sessionIdRef.current);
       setSessions(data);
     } catch { /* ignore */ }
   }, [profileId]);
 
   useEffect(() => { refreshSessions(); }, [refreshSessions]);
 
-  // Load message history when session loads
-  useEffect(() => {
-    const sid = sessionId;
-    if (!sid || loadedSessionRef.current === sid) return;
-    loadedSessionRef.current = sid;
-
-    getAgentSession(sid)
-      .then((session) => {
-        if (session.messages?.length) {
-          setMessages(session.messages.map((m: any, i: number) => ({
-            id: `hist-${i}-${m.role}`,
-            role: m.role,
-            content: m.content,
-          })));
-        }
-      })
-      .catch(() => {
-        window.localStorage.removeItem(SESSION_KEY);
-        setSessionId(null);
-        loadedSessionRef.current = null;
-      });
-  }, [sessionId]);
-
-  // Select/clear item context when it changes
   useEffect(() => {
     const currentId = selectedItem?.id ?? null;
     if (currentId === prevSelectedItemId.current) return;
     prevSelectedItemId.current = currentId;
-
     const sid = sessionIdRef.current;
     if (selectedItem) {
       selectAgentContext(sid, {
@@ -115,7 +77,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         name: selectedItem.name,
         season: selectedItem.season,
       })
-        .then((r) => { if (r.session_id !== sid) setSessionId(r.session_id); })
+        .then((r) => { if (r.session_id !== sid) updateSessionId(r.session_id); })
         .catch(() => undefined);
     } else if (sid) {
       clearAgentContext(sid).catch(() => undefined);
@@ -126,12 +88,11 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
 
-    const userMsg: AgentMessageType = {
+    setMessages((prev) => [...prev, {
       id: `${Date.now()}-user`,
       role: "user",
       content: trimmed,
-    };
-    setMessages((prev) => [...prev, userMsg]);
+    }]);
     setLoading(true);
     setAgentState(inferPendingState(trimmed));
 
@@ -141,7 +102,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         message: trimmed,
         context: {
           session_id: sid,
-          profile_id: profileId,          // ← stable identity for facts
+          profile_id: profileId,
           current_item: selectedItem
             ? { id: selectedItem.id, name: selectedItem.name, season: selectedItem.season }
             : null,
@@ -151,37 +112,36 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
       });
 
       if (response.session_id && response.session_id !== sid) {
-        setSessionId(response.session_id);
+        updateSessionId(response.session_id);
         loadedSessionRef.current = response.session_id;
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-assistant`,
-          role: "assistant",
-          content: response.message,
-          cards: response.cards,
-          nextActions: response.next_actions,
-          metadata: {
-            mode: response.mode,
-            taskType: response.task_type,
-            citations: response.citations,
-          },
+      setMessages((prev) => [...prev, {
+        id: `${Date.now()}-assistant`,
+        role: "assistant",
+        content: response.message,
+        cards: response.cards,
+        nextActions: response.next_actions,
+        metadata: {
+          mode: response.mode,
+          taskType: response.task_type,
+          citations: response.citations,
         },
-      ]);
+      }]);
 
       setAgentState("complete");
       refreshSessions();
-    } catch {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `${Date.now()}-error`,
-          role: "assistant",
-          content: "Something went wrong. Please try again.",
-        },
-      ]);
+    } catch (err: any) {
+      console.error("sendMessage error:", err?.response?.data || err?.message || err);
+      const errMsg = err?.response?.status === 401 ? "Authentication error — please refresh the page."
+                   : err?.response?.status === 429 ? "Too many requests — please wait a moment and try again."
+                   : err?.response?.status >= 500 ? "Server error — please try again in a moment."
+                   : "Something went wrong. Please try again.";
+      setMessages((prev) => [...prev, {
+        id: `${Date.now()}-error`,
+        role: "assistant",
+        content: errMsg,
+      }]);
     } finally {
       setLoading(false);
       setAgentState("complete");
@@ -191,14 +151,16 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
   const continueSession = useCallback(async (sid: string) => {
     try {
       const session = await getAgentSession(sid);
-      setSessionId(sid);
+      updateSessionId(sid);
       loadedSessionRef.current = sid;
-      setMessages(session.messages?.map((m: any, i: number) => ({
+      setMessages(session.messages?.map((m, i) => ({
         id: `hist-${i}-${m.role}`,
         role: m.role,
         content: m.content,
       })) ?? []);
-    } catch { /* ignore */ }
+    } catch (err) {
+      console.error("continueSession error:", err);
+    }
   }, []);
 
   const clearContext = useCallback(async () => {
@@ -209,10 +171,9 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
     } catch { /* ignore */ }
   }, [refreshSessions]);
 
-  // Start a brand new chat — clears screen but profile_id and facts persist
   const startNewChat = useCallback(() => {
     setMessages([]);
-    setSessionId(null);
+    updateSessionId(null);
     loadedSessionRef.current = null;
     prevSelectedItemId.current = null;
   }, []);

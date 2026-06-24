@@ -1,199 +1,182 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, History, PenSquare, Send, Sparkles, UserRound, X, Zap } from "lucide-react";
+import { ChevronDown, ChevronUp, PenSquare, Send, UserRound, X } from "lucide-react";
 import { useChat } from "../../hooks/useChat";
+import FeedbackModal from "../footer/FeedbackModal";
 import type { AgentPanelProps, AgentProfile } from "../../types/chat";
 
-const defaultProfile: AgentProfile = { allergies: [], health_cautions: [] };
-const PROFILE_KEY = "nutrimentor-agent-profile";
+const PKEY = "nutrimentor-agent-profile";
+const DEF: AgentProfile = { allergies: [], health_cautions: [] };
 
-function computeBmi(p: AgentProfile): string | null {
+function loadProfile(): AgentProfile {
+  try { const r = localStorage.getItem(PKEY); return r ? { ...DEF, ...JSON.parse(r) } : DEF; }
+  catch { return DEF; }
+}
+
+function bmi(p: AgentProfile): string | null {
   if (!p.height_cm || !p.weight_kg) return null;
   return (p.weight_kg / ((p.height_cm / 100) ** 2)).toFixed(1);
 }
 
-function loadProfile(): AgentProfile {
-  try {
-    const raw = window.localStorage.getItem(PROFILE_KEY);
-    return raw ? { ...defaultProfile, ...JSON.parse(raw) } : defaultProfile;
-  } catch {
-    return defaultProfile;
-  }
+function greeting(): string {
+  const h = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
+  if (h < 12) return "Good morning! 🌅";
+  if (h < 17) return "Good afternoon! ☀️";
+  return "Good evening! 🌙";
 }
 
-function agentStateLabel(state: string) {
-  switch (state) {
-    case "retrieving":      return "Retrieving data…";
-    case "calculating":     return "Calculating…";
-    case "generating-plan": return "Building plan…";
-    case "thinking":        return "Thinking…";
-    default:                return "Ready";
-  }
+function status(state: string, loading: boolean): string {
+  if (!loading) return "Ready";
+  return state === "retrieving" ? "Retrieving…"
+       : state === "calculating" ? "Calculating…"
+       : state === "generating-plan" ? "Building plan…"
+       : "Thinking…";
 }
 
-export default function ChatBox({ selectedItem, season, onClearSelectedItem }: AgentPanelProps) {
-  const [input, setInput]             = useState("");
-  const [profile, setProfile]         = useState<AgentProfile>(loadProfile);
-  const [showProfile, setShowProfile] = useState(false);
-  const [showSessions, setShowSessions] = useState(false);
-  const [showTasks, setShowTasks]     = useState(false);
-  const messagesRef = useRef<HTMLDivElement | null>(null);
+// Simple markdown → safe HTML
+function md(t: string): string {
+  return t
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*\n]+?)\*/g, "<em>$1</em>")
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/^[•\-] (.+)$/gm, "<li>$1</li>")
+    .replace(/(<li>[\s\S]*?<\/li>(\n|$))+/g, m => `<ul>${m}</ul>`)
+    .replace(/\n\n+/g, "</p><p>")
+    .replace(/\n/g, "<br>")
+    .replace(/^(?!<[uop])/, "<p>")
+    .replace(/(?<![>])$/, "</p>");
+}
 
-  const { messages, loading, agentState, sessionId, sessions, starterPrompts,
-          sendMessage, continueSession, clearContext, startNewChat } = useChat({ selectedItem, season, profile });
+function fmtTime(raw: string): string {
+  if (!raw) return "";
+  const ts = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+  return new Date(ts).toLocaleString("en-IN", {
+    day:"numeric", month:"short", hour:"2-digit", minute:"2-digit", hour12:true
+  });
+}
 
+interface ExtProps extends AgentPanelProps {
+  pendingMessage?: string | null;
+  onPendingMessageSent?: () => void;
+}
+
+export default function ChatBox({ selectedItem, season, onClearSelectedItem, pendingMessage, onPendingMessageSent }: ExtProps) {
+  const [input,    setInput]    = useState("");
+  const [profile,  setProfile]  = useState<AgentProfile>(loadProfile);
+  const [showProf, setShowProf] = useState(false);
+  const [showSess, setShowSess] = useState(false);
+  const [showTask, setShowTask] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(false);
+  const msgRef  = useRef<HTMLDivElement>(null);
+  const inpRef  = useRef<HTMLTextAreaElement>(null);
+
+  const { messages, loading, agentState, sessionId, sessions,
+          starterPrompts, sendMessage, continueSession, clearContext, startNewChat }
+    = useChat({ selectedItem, season, profile });
+
+  useEffect(() => { localStorage.setItem(PKEY, JSON.stringify(profile)); }, [profile]);
+  useEffect(() => { const el = msgRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages, loading]);
+
+  // Handle prompts from centre panel
   useEffect(() => {
-    window.localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
-  }, [profile]);
+    if (pendingMessage && !loading) {
+      sendMessage(pendingMessage);
+      onPendingMessageSent?.();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingMessage]);
 
-  useEffect(() => {
-    const el = messagesRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, loading]);
-
-  const bmi = useMemo(() => computeBmi(profile), [profile]);
-
-  async function handleSend() {
-    const text = input.trim();
-    if (!text) return;
-    setInput("");
-    await sendMessage(text);
+  function resize(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    setInput(e.target.value);
+    e.target.style.height = "auto";
+    e.target.style.height = Math.min(e.target.scrollHeight, 120) + "px";
   }
 
-  async function handleClear() {
-    await clearContext();
-    onClearSelectedItem();
+  async function send() {
+    const t = input.trim(); if (!t || loading) return;
+    setInput(""); if (inpRef.current) inpRef.current.style.height = "38px";
+    await sendMessage(t);
   }
 
-  function updateProfile(patch: Partial<AgentProfile>) {
-    setProfile((prev) => ({ ...prev, ...patch }));
+  function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
   }
+
+  async function handleClear() { await clearContext(); onClearSelectedItem(); }
+  function upd(p: Partial<AgentProfile>) { setProfile(prev => ({ ...prev, ...p })); }
+
+  const BMI = useMemo(() => bmi(profile), [profile]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col rounded-xl border border-slate-200 bg-white overflow-hidden">
+    <div className="nm-chat" style={{ height:"100%" }}>
 
-      {/* ── TOP BAR: title + status + context chips ───────────────────── */}
-      <div className="shrink-0 border-b border-slate-100 px-4 pt-3 pb-2">
-        <div className="flex items-center justify-between gap-2">
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-slate-900 leading-tight">NutriMentor AI Agent</p>
-            <p className="text-[11px] text-slate-400 mt-0.5">
-              {loading ? agentStateLabel(agentState) : "Ready"}
-            </p>
+      {/* Header */}
+      <div className="nm-chat-header">
+        <div className="nm-chat-header-row">
+          <div>
+            <div className="nm-chat-title">NutriMentor AI</div>
+            <div className={`nm-chat-status${loading ? " thinking" : ""}`}>{status(agentState, loading)}</div>
           </div>
-          <div className="flex items-center gap-1.5">
-            {/* New chat */}
-            <button
-              type="button"
-              onClick={startNewChat}
-              title="New chat"
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 transition-colors"
-            >
-              <PenSquare className="h-3.5 w-3.5" />
+          <div className="nm-chat-btns">
+            <button type="button" className="nm-chat-btn" onClick={startNewChat}
+              title="New chat" aria-label="New chat">
+              <PenSquare size={13} />
             </button>
-            {/* Profile toggle */}
-            <button
-              type="button"
-              onClick={() => setShowProfile((p) => !p)}
-              title="Profile"
-              className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-slate-500 transition-colors ${
-                showProfile ? "border-blue-200 bg-blue-50 text-blue-600" : "border-slate-200 hover:bg-slate-50"
-              }`}
-            >
-              <UserRound className="h-4 w-4" />
+            <button type="button" className={`nm-chat-btn${showProf ? " on" : ""}`}
+              onClick={() => setShowProf(v => !v)} aria-label="Profile" aria-expanded={showProf}>
+              <UserRound size={13} />
             </button>
           </div>
         </div>
-
-        {/* Context chips row */}
-        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        <div className="nm-ctx-chips">
           {selectedItem ? (
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 border border-emerald-200 pl-2 pr-1 py-0.5 text-[11px] font-medium text-emerald-700">
-              <Sparkles className="h-3 w-3" />
-              {selectedItem.name}
-              <button
-                type="button"
-                onClick={handleClear}
-                className="flex h-4 w-4 items-center justify-center rounded-full hover:bg-emerald-200 transition-colors"
-              >
-                <X className="h-2.5 w-2.5" />
+            <span className="nm-ctx-chip food">
+              🌿 {selectedItem.name}
+              <button type="button" className="nm-ctx-chip-x" onClick={handleClear}
+                aria-label={`Remove ${selectedItem.name}`}>
+                <X size={10} />
               </button>
             </span>
           ) : (
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] text-slate-500">
-              No food selected
-            </span>
+            <span className="nm-ctx-chip">No food selected</span>
           )}
-          {sessionId && (
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] text-slate-500">
-              Session active
-            </span>
-          )}
+          {sessionId && <span className="nm-ctx-chip">Session active</span>}
         </div>
       </div>
 
-      {/* ── PROFILE DRAWER (collapses) ────────────────────────────────── */}
-      {showProfile && (
-        <div className="shrink-0 border-b border-slate-100 bg-slate-50 px-4 py-3">
-          <div className="mb-2 flex items-center justify-between">
+      {/* Profile */}
+      {showProf && (
+        <div className="nm-profile-panel">
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8 }}>
             <div>
-              <p className="text-xs font-semibold text-slate-800">Profile memory</p>
-              <p className="text-[11px] text-slate-400">Used for BMI and plan guidance.</p>
+              <div className="nm-profile-label">Profile memory</div>
+              <div className="nm-profile-sub">Used for BMI, calories & plans.</div>
             </div>
-            {bmi && (
-              <div className="text-right">
-                <p className="text-[10px] text-slate-400 uppercase tracking-wide">BMI</p>
-                <p className="text-sm font-semibold text-slate-800">{bmi}</p>
-              </div>
-            )}
+            {BMI && <div><div className="nm-profile-bmi-label">BMI</div><div className="nm-profile-bmi">{BMI}</div></div>}
           </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            <input
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
-              placeholder="Age"
-              type="number"
-              value={profile.age ?? ""}
-              onChange={(e) => updateProfile({ age: e.target.value ? +e.target.value : undefined })}
-            />
-            <select
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
-              value={profile.sex ?? ""}
-              onChange={(e) => updateProfile({ sex: e.target.value || undefined })}
-            >
+          <div className="nm-profile-grid">
+            <input className="nm-field" placeholder="Age" type="number"
+              value={profile.age ?? ""} onChange={e => upd({ age: e.target.value ? +e.target.value : undefined })} />
+            <select className="nm-field" value={profile.sex ?? ""}
+              onChange={e => upd({ sex: e.target.value || undefined })}>
               <option value="">Sex</option>
               <option value="male">Male</option>
               <option value="female">Female</option>
               <option value="other">Other</option>
             </select>
-            <input
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
-              placeholder="Height (cm)"
-              type="number"
-              value={profile.height_cm ?? ""}
-              onChange={(e) => updateProfile({ height_cm: e.target.value ? +e.target.value : undefined })}
-            />
-            <input
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:outline-none"
-              placeholder="Weight (kg)"
-              type="number"
-              value={profile.weight_kg ?? ""}
-              onChange={(e) => updateProfile({ weight_kg: e.target.value ? +e.target.value : undefined })}
-            />
-            <select
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
-              value={profile.goal ?? ""}
-              onChange={(e) => updateProfile({ goal: e.target.value || undefined })}
-            >
+            <input className="nm-field" placeholder="Height (cm)" type="number"
+              value={profile.height_cm ?? ""} onChange={e => upd({ height_cm: e.target.value ? +e.target.value : undefined })} />
+            <input className="nm-field" placeholder="Weight (kg)" type="number"
+              value={profile.weight_kg ?? ""} onChange={e => upd({ weight_kg: e.target.value ? +e.target.value : undefined })} />
+            <select className="nm-field" value={profile.goal ?? ""}
+              onChange={e => upd({ goal: e.target.value || undefined })}>
               <option value="">Goal</option>
               <option value="maintain weight">Maintain</option>
               <option value="lose weight">Lose weight</option>
               <option value="gain weight">Gain weight</option>
               <option value="better energy">Better energy</option>
             </select>
-            <select
-              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
-              value={profile.activity_level ?? ""}
-              onChange={(e) => updateProfile({ activity_level: e.target.value || undefined })}
-            >
+            <select className="nm-field" value={profile.activity_level ?? ""}
+              onChange={e => upd({ activity_level: e.target.value || undefined })}>
               <option value="">Activity</option>
               <option value="sedentary">Sedentary</option>
               <option value="light">Light</option>
@@ -204,220 +187,133 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem }: A
         </div>
       )}
 
-      {/* ── COLLAPSIBLE: SESSION HISTORY ─────────────────────────────── */}
-      <div className="shrink-0 border-b border-slate-100">
-        <button
-          type="button"
-          onClick={() => setShowSessions((p) => !p)}
-          className="flex w-full items-center justify-between px-4 py-2 text-left hover:bg-slate-50 transition-colors"
-        >
-          <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-            <History className="h-3 w-3" />
-            Sessions
-            {sessions.length > 0 && (
-              <span className="rounded-full bg-slate-200 px-1.5 text-[10px] font-medium text-slate-600">
-                {sessions.length}
-              </span>
-            )}
+      {/* Sessions */}
+      <div className="nm-section">
+        <button type="button" className="nm-section-btn"
+          onClick={() => setShowSess(v => !v)} aria-expanded={showSess}>
+          <span className="nm-section-lbl">
+            <span aria-hidden="true">🕐</span> Sessions
+            {sessions.length > 0 && <span className="nm-section-badge">{sessions.length}</span>}
           </span>
-          {showSessions ? <ChevronUp className="h-3 w-3 text-slate-400" /> : <ChevronDown className="h-3 w-3 text-slate-400" />}
+          {showSess ? <ChevronUp size={12} color="var(--text-3)" /> : <ChevronDown size={12} color="var(--text-3)" />}
         </button>
-
-        {showSessions && (
-          <div className="px-3 pb-2 flex flex-col gap-1.5">
-            {/* New chat button */}
-            <button
-              type="button"
-              onClick={startNewChat}
-              className="flex items-center gap-1.5 rounded-lg border border-dashed border-emerald-300 bg-emerald-50 px-3 py-1.5 text-[11px] text-emerald-700 hover:bg-emerald-100 transition-colors"
-            >
-              <PenSquare className="h-3 w-3" />
-              Start a new chat
+        {showSess && (
+          <div className="nm-section-body">
+            <button type="button" className="nm-new-chat" onClick={startNewChat}>
+              <PenSquare size={12} /> New chat
             </button>
-
-            {sessions.length === 0 ? (
-              <p className="px-1 text-[11px] text-slate-400 text-center py-1">
-                No previous sessions yet
-              </p>
-            ) : (
-              sessions.slice(0, 5).map((s) => {
-                const isActive = s.session_id === sessionId;
-                // D1 stores datetime('now') as UTC without Z suffix
-                // Append Z so JS parses as UTC, then display in user's local timezone (IST)
-                const rawTs = s.updated_at
-                  ? s.updated_at.includes("T") ? s.updated_at : s.updated_at.replace(" ", "T") + "Z"
-                  : null;
-                const time = rawTs
-                  ? new Date(rawTs).toLocaleString("en-IN", {
-                      day: "numeric", month: "short",
-                      hour: "2-digit", minute: "2-digit",
-                      hour12: true,
-                    })
-                  : "";
-                const preview = (s as any).first_message || s.title || "Chat session";
-                return (
-                  <button
-                    key={s.session_id}
-                    type="button"
-                    onClick={() => continueSession(s.session_id)}
-                    className={`rounded-lg border px-3 py-2 text-left transition-colors ${
-                      isActive
-                        ? "border-emerald-300 bg-emerald-50"
-                        : "border-slate-200 hover:bg-slate-50"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <p className={`text-[11px] font-medium truncate ${isActive ? "text-emerald-700" : "text-slate-800"}`}>
-                        {preview.slice(0, 40)}{preview.length > 40 ? "…" : ""}
-                      </p>
-                      {isActive && (
-                        <span className="shrink-0 rounded-full bg-emerald-500 px-1.5 py-0.5 text-[9px] text-white font-medium">
-                          now
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-[10px] text-slate-400 mt-0.5">{time}</p>
-                  </button>
-                );
-              })
-            )}
+            {sessions.length === 0
+              ? <p className="nm-empty-sessions">No previous sessions</p>
+              : sessions.slice(0,5).map(s => {
+                  const active = s.session_id === sessionId;
+                  const preview = (s as any).first_message || s.title || "Chat session";
+                  return (
+                    <button key={s.session_id} type="button"
+                      className={`nm-session-item${active ? " current" : ""}`}
+                      onClick={() => continueSession(s.session_id)}>
+                      <div className="nm-session-title">{preview.slice(0,42)}{preview.length > 42 ? "…" : ""}</div>
+                      <div className="nm-session-meta">
+                        <span className="nm-session-time">{fmtTime(s.updated_at)}</span>
+                        {active && <span className="nm-session-now">now</span>}
+                      </div>
+                    </button>
+                  );
+                })
+            }
           </div>
         )}
       </div>
 
-      {/* ── COLLAPSIBLE: QUICK TASKS ──────────────────────────────────── */}
-      <div className="shrink-0 border-b border-slate-100">
-        <button
-          type="button"
-          onClick={() => setShowTasks((p) => !p)}
-          className="flex w-full items-center justify-between px-4 py-2 text-left hover:bg-slate-50 transition-colors"
-        >
-          <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
-            <Zap className="h-3 w-3" />
-            Quick tasks
-          </span>
-          {showTasks ? <ChevronUp className="h-3 w-3 text-slate-400" /> : <ChevronDown className="h-3 w-3 text-slate-400" />}
+      {/* Quick tasks */}
+      <div className="nm-section">
+        <button type="button" className="nm-section-btn"
+          onClick={() => setShowTask(v => !v)} aria-expanded={showTask}>
+          <span className="nm-section-lbl"><span aria-hidden="true">⚡</span> Quick tasks</span>
+          {showTask ? <ChevronUp size={12} color="var(--text-3)" /> : <ChevronDown size={12} color="var(--text-3)" />}
         </button>
-
-        {showTasks && (
-          <div className="px-3 pb-2.5 flex flex-wrap gap-1.5">
-            {starterPrompts.map((prompt) => (
-              <button
-                key={prompt}
-                type="button"
-                onClick={() => { sendMessage(prompt); setShowTasks(false); }}
-                className="rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] text-slate-600 hover:border-blue-300 hover:text-blue-600 hover:bg-blue-50 transition-colors"
-              >
-                {prompt}
-              </button>
+        {showTask && (
+          <div className="nm-tasks">
+            {starterPrompts.map(p => (
+              <button key={p} type="button" className="nm-task-chip"
+                onClick={() => { sendMessage(p); setShowTask(false); }}>{p}</button>
             ))}
           </div>
         )}
       </div>
 
-      {/* ── MESSAGES (fills remaining height) ────────────────────────── */}
-      <div ref={messagesRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3">
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full gap-3 text-center px-6 py-8">
-            <div className="text-2xl">🥦</div>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Select a food from the grid, or ask a nutrition question, request a diet plan, or compare two foods.
+      {/* Messages */}
+      <div className="nm-messages" ref={msgRef} role="log" aria-live="polite">
+
+        {messages.length === 0 && !loading && (
+          <div className="nm-empty nm-anim-in">
+            <span className="nm-empty-icon" aria-hidden="true">🌿</span>
+            <p className="nm-empty-greeting">{greeting()}</p>
+            <p className="nm-empty-sub">
+              I'm NutriMentor AI — your seasonal nutrition companion. Select a food, ask anything, or try a quick task.
             </p>
-            <div className="flex flex-wrap justify-center gap-1.5 mt-1">
-              {starterPrompts.slice(0, 3).map((p) => (
-                <button
-                  key={p}
-                  type="button"
-                  onClick={() => sendMessage(p)}
-                  className="rounded-full border border-slate-200 px-3 py-1 text-[11px] text-slate-600 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-colors"
-                >
-                  {p}
-                </button>
+            <div className="nm-empty-chips">
+              {starterPrompts.slice(0,3).map(p => (
+                <button key={p} type="button" className="nm-task-chip" onClick={() => sendMessage(p)}>{p}</button>
               ))}
             </div>
           </div>
         )}
 
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
-          >
-            <div className={`max-w-[88%] flex flex-col gap-2 ${msg.role === "user" ? "items-end" : "items-start"}`}>
-              {/* Bubble */}
-              <div
-                className={`rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
-                  msg.role === "user"
-                    ? "bg-blue-600 text-white rounded-br-sm"
-                    : "bg-slate-100 text-slate-800 rounded-bl-sm"
-                }`}
-              >
-                <div className="whitespace-pre-wrap">{msg.content}</div>
-              </div>
-
-              {/* Cards */}
-              {msg.cards?.map((card) => (
-                <div
-                  key={`${msg.id}-${card.title}`}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 shadow-sm"
-                >
-                  <p className="text-[11px] font-semibold text-slate-700 uppercase tracking-wide">{card.title}</p>
-                  <p className="mt-1 text-xs text-slate-600">{card.body}</p>
-                </div>
-              ))}
-
-              {/* Next action chips */}
-              {msg.nextActions?.length ? (
-                <div className="flex flex-wrap gap-1.5">
-                  {msg.nextActions.map((action) => (
-                    <button
-                      key={`${msg.id}-${action}`}
-                      type="button"
-                      onClick={() => sendMessage(action)}
-                      className="rounded-full border border-slate-200 bg-white px-2.5 py-0.5 text-[11px] text-slate-600 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-600 transition-colors"
-                    >
-                      {action}
-                    </button>
+        {messages.map(msg => (
+          <div key={msg.id} className={`nm-msg-row ${msg.role}`}>
+            <div className={`nm-bubble ${msg.role}`}>
+              {msg.role === "assistant"
+                ? <div dangerouslySetInnerHTML={{ __html: md(msg.content) }} />
+                : msg.content
+              }
+              {msg.nextActions && msg.nextActions.length > 0 && (
+                <div className="nm-next-actions">
+                  {msg.nextActions.map(a => (
+                    <button key={a} type="button" className="nm-next-chip"
+                      onClick={() => sendMessage(a)}>{a}</button>
                   ))}
                 </div>
-              ) : null}
+              )}
             </div>
           </div>
         ))}
 
         {loading && (
-          <div className="flex justify-start">
-            <div className="rounded-2xl rounded-bl-sm bg-slate-100 px-4 py-2.5">
-              <div className="flex items-center gap-1.5">
-                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "0ms" }} />
-                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "150ms" }} />
-                <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: "300ms" }} />
-              </div>
+          <div className="nm-typing" aria-label="Agent is thinking">
+            <div className="nm-typing-bubble">
+              <span className="nm-dot" /><span className="nm-dot" /><span className="nm-dot" />
             </div>
           </div>
         )}
       </div>
 
-      {/* ── INPUT BAR ─────────────────────────────────────────────────── */}
-      <div className="shrink-0 border-t border-slate-100 px-3 py-2.5">
-        <div className="flex items-center gap-2">
-          <input
-            className="flex-1 min-w-0 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs placeholder:text-slate-400 focus:border-blue-400 focus:bg-white focus:outline-none transition-colors"
-            placeholder="Ask about food, nutrients, season, plan…"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") handleSend(); }}
-          />
-          <button
-            type="button"
-            onClick={handleSend}
-            disabled={loading || !input.trim()}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white disabled:opacity-40 hover:bg-blue-700 active:scale-95 transition-all"
-          >
-            <Send className="h-3.5 w-3.5" />
+      {/* Input */}
+      <div className="nm-input-bar">
+        <textarea ref={inpRef} className="nm-input" rows={1}
+          placeholder="Ask about food, nutrients, season, plan…"
+          value={input} onChange={resize} onKeyDown={onKey} aria-label="Message" />
+        <button type="button" className="nm-send"
+          onClick={send} disabled={loading || !input.trim()} aria-label="Send">
+          <Send size={14} />
+        </button>
+      </div>
+
+      {/* Branding footer */}
+      <div className="nm-footer">
+        <span className="nm-footer-copy">Built by Pratyaksh Agrawal</span>
+        <div className="nm-footer-links">
+          <a href="https://www.linkedin.com/in/pratyaksh-agrawal-59b82928a/" target="_blank"
+            rel="noopener noreferrer" className="nm-footer-link">LinkedIn</a>
+          <a href="#" title="Portfolio coming soon" target="_blank"
+            rel="noopener noreferrer" className="nm-footer-link">Portfolio</a>
+          <button type="button" className="nm-footer-link"
+            onClick={() => setShowFeedback(true)}>
+            Feedback
           </button>
         </div>
       </div>
+      {/* Feedback modal */}
+      <FeedbackModal open={showFeedback} onClose={() => setShowFeedback(false)} />
     </div>
   );
 }

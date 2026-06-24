@@ -11,7 +11,7 @@ interface AgentMessagePayload {
   message: string;
   context: {
     session_id: string | null;
-    profile_id?: string;           // ← stable browser identity (Phase 1)
+    profile_id?: string;
     current_item?: AgentContextItem | null;
     current_season?: string;
     profile?: AgentProfile;

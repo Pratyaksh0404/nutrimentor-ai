@@ -30,3 +30,5 @@ worker/wrangler.toml
 
 frontend/.env.local
 frontend/.env.production
+frontend/deploy.log
+frontend/src/components/layout/logo1.png

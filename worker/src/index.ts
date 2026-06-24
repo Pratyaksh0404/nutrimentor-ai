@@ -115,13 +115,21 @@ async function extractAndStoreFacts(
       for (const foodName of foodCandidates) {
         const firstWord = foodName.split(" ")[0];
         if (stopWords.includes(firstWord)) continue;
+        // Normalize common spelling variants before storing
+        const SPELLING_MAP: Record<string, string> = {
+          "soyabean": "soybean", "soya bean": "soybean", "soya": "soybean",
+          "chilli": "chili", "chillies": "chili",
+          "brinjal": "eggplant", "karela": "bitter gourd",
+          "aloo": "potato", "palak": "spinach", "pyaz": "onion",
+        };
+        const normalizedName = SPELLING_MAP[foodName.toLowerCase()] || foodName;
         await db.prepare(
           `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
            VALUES (?1, 'dislike', ?2, 'true', 'conversation', datetime('now'))
            ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
            fact_value='true', updated_at=datetime('now')`
-        ).bind(profileId, foodName).run();
-        stored.push(`dislike:${foodName}`);
+        ).bind(profileId, normalizedName).run();
+        stored.push(`dislike:${normalizedName}`);
       }
     }
   }
@@ -221,17 +229,28 @@ async function extractAndStoreFacts(
   }
 
   // ── Allergies ──
-  const allergyMatch = m.match(/(?:allergic to|allergy to) ([a-z\s]+?)(?:\.|,|$)/);
-  if (allergyMatch) {
-    const allergen = allergyMatch[1].trim();
-    if (allergen.length > 1 && allergen.length < 30) {
-      await db.prepare(
-        `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
-         VALUES (?1, 'allergy', ?2, 'true', 'conversation', datetime('now'))
-         ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
-         fact_value='true', updated_at=datetime('now')`
-      ).bind(profileId, allergen).run();
-      stored.push(`allergy:${allergen}`);
+  const allergyPatterns = [
+    /(?:allergic to|allergy to) ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+    /i have (?:an )?allergy (?:to|for) ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+    /i am (?:allergic|sensitive) to ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+  ];
+  for (const allergyPat of allergyPatterns) {
+    const allergyMatch = m.match(allergyPat);
+    if (allergyMatch?.[1]) {
+      const allergen = allergyMatch[1].trim();
+      // Skip non-food allergens like "dogs", "cats", "pollen"
+      const nonFoodAllergens = ["dog","cat","pollen","dust","pet","animal","bee","insect","latex","mold","mould"];
+      const isNonFood = nonFoodAllergens.some(a => allergen.includes(a));
+      if (!isNonFood && allergen.length > 1 && allergen.length < 30) {
+        await db.prepare(
+          `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
+           VALUES (?1, 'allergy', ?2, 'true', 'conversation', datetime('now'))
+           ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
+           fact_value='true', updated_at=datetime('now')`
+        ).bind(profileId, allergen).run();
+        stored.push(`allergy:${allergen}`);
+      }
+      break;
     }
   }
 
@@ -653,13 +672,14 @@ async function callGeminiFlash(
       body,
     });
 
-    if (resp.status === 429) {
+    if (resp.status === 429 || resp.status === 503) {
       if (attempt === 0) {
-        // Wait 6 seconds then retry — free tier is 10 RPM = one request per 6s
-        await new Promise(r => setTimeout(r, 6000));
+        // 429 = rate limit (wait 6s), 503 = service unavailable (wait 3s)
+        const waitMs = resp.status === 429 ? 6000 : 3000;
+        await new Promise(r => setTimeout(r, waitMs));
         continue;
       }
-      console.error("Gemini 429 rate limit — both attempts exhausted");
+      console.error(`Gemini ${resp.status} — both attempts exhausted`);
       return "";
     }
 
@@ -928,6 +948,175 @@ async function updateSessionTitle(db: D1Database, sessionId: string, firstMessag
   await db.prepare(
     `UPDATE sessions SET title = ?1, updated_at = datetime('now') WHERE id = ?2`
   ).bind(firstMessage.slice(0, 50), sessionId).run();
+}
+
+
+// ── PHASE 2: Season calendar ──────────────────────────────────────────────
+
+const SEASON_CALENDAR: Array<{ season: string; start: string }> = [
+  { season: "spring",    start: "02-20" },
+  { season: "summer",   start: "04-21" },
+  { season: "monsoon",  start: "06-22" },
+  { season: "autumn",   start: "08-23" },
+  { season: "prewinter",start: "10-23" },
+  { season: "winter",   start: "12-22" },
+];
+
+function getCurrentSeason(): string {
+  const now = new Date();
+  const mmdd = `${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  let current = "winter";
+  for (const s of SEASON_CALENDAR) {
+    if (mmdd >= s.start) current = s.season;
+  }
+  return current;
+}
+
+// ── PHASE 2: Morning insight generator ───────────────────────────────────
+
+async function generateMorningInsight(
+  profileId: string,
+  db: D1Database,
+  geminiKey: string
+): Promise<object | null> {
+  const today = new Date().toISOString().split("T")[0];
+
+  // Get last 7 days of meal logs (using session_id = profileId for guest users)
+  const logs = await db.prepare(
+    `SELECT ml.logged_date, i.name, i.calories_per_100g, ml.meal_slot,
+     GROUP_CONCAT(n.name || ':' || in_.amount_per_100g, '|') AS nutrients
+     FROM meal_logs ml
+     JOIN items i ON i.id = ml.item_id
+     LEFT JOIN item_nutrients in_ ON in_.item_id = ml.item_id
+     LEFT JOIN nutrients n ON n.id = in_.nutrient_id
+     WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+     GROUP BY ml.id
+     ORDER BY ml.logged_date DESC`
+  ).bind(profileId).all();
+
+  if (logs.results.length === 0) return null;
+
+  // RDA map
+  const rdaRows = await db.prepare(`SELECT nutrient_name, daily_amount FROM rda`).all();
+  const rdaMap: Record<string, number> = {};
+  for (const r of rdaRows.results as any[]) rdaMap[r.nutrient_name] = r.daily_amount;
+
+  // Tally nutrient totals per day
+  const dailyNutrients: Record<string, Record<string, number>> = {};
+  for (const log of logs.results as any[]) {
+    if (!dailyNutrients[log.logged_date]) dailyNutrients[log.logged_date] = {};
+    if (log.nutrients) {
+      for (const pair of log.nutrients.split("|")) {
+        const [name, val] = pair.split(":");
+        if (name && val) {
+          dailyNutrients[log.logged_date][name] =
+            (dailyNutrients[log.logged_date][name] || 0) + parseFloat(val);
+        }
+      }
+    }
+  }
+
+  const days = Object.keys(dailyNutrients);
+  const insights: Array<{ type: string; message: string; severity: string }> = [];
+
+  // Check for deficiency streaks — Phase 2.3
+  const nutrientDefDays: Record<string, number> = {};
+  for (const day of days) {
+    for (const [nutrient, rdaAmt] of Object.entries(rdaMap)) {
+      const amt = dailyNutrients[day][nutrient] ?? 0;
+      if (amt < rdaAmt * 0.4) {
+        nutrientDefDays[nutrient] = (nutrientDefDays[nutrient] || 0) + 1;
+      }
+    }
+  }
+
+  // Generate alerts for nutrients below 40% RDA for 3+ days
+  const currentSeason = getCurrentSeason();
+  for (const [nutrient, defDays] of Object.entries(nutrientDefDays)) {
+    if (defDays >= 3) {
+      // Find top seasonal sources for this nutrient
+      const sources = await db.prepare(
+        `SELECT i.name, in_.amount_per_100g as amount, n.unit
+         FROM item_nutrients in_
+         JOIN items i ON i.id = in_.item_id
+         JOIN nutrients n ON n.id = in_.nutrient_id
+         WHERE n.name = ?1 AND (i.season = ?2 OR i.season = 'all')
+         ORDER BY in_.amount_per_100g DESC LIMIT 3`
+      ).bind(nutrient, currentSeason).all();
+
+      const sourceStr = (sources.results as any[])
+        .map(s => `${s.name} (${s.amount}${s.unit})`)
+        .join(", ");
+
+      insights.push({
+        type: "deficiency_streak",
+        severity: defDays >= 5 ? "high" : "medium",
+        message: `Your ${nutrient} has been below 40% of the daily target for ${defDays} days.${
+          sourceStr ? ` Good seasonal sources: ${sourceStr}.` : ""
+        }`,
+      });
+    }
+  }
+
+  // Season transition insight
+  const loggedDates = [...new Set((logs.results as any[]).map(l => l.logged_date))];
+  const streak = loggedDates.filter(d => {
+    const dayAgo = new Date();
+    dayAgo.setDate(dayAgo.getDate() - 1);
+    return new Date(d) >= dayAgo;
+  }).length;
+
+  if (streak > 0 && insights.length === 0) {
+    insights.push({
+      type: "encouragement",
+      severity: "low",
+      message: `Great job logging your meals! You've been consistent. Keep it up for better nutritional insights.`,
+    });
+  }
+
+  if (insights.length === 0) return null;
+
+  // Convert UTC to IST (UTC+5:30) for correct greeting
+  const nowIST = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const hour = nowIST.getUTCHours();
+  const greeting = hour < 12 ? "Good morning! 🌅" : hour < 17 ? "Good afternoon! ☀️" : "Good evening! 🌙";
+
+  return {
+    type: "morning_insight",
+    date: today,
+    greeting,
+    insights: insights.slice(0, 3), // max 3 insights
+    season: currentSeason,
+  };
+}
+
+// ── PHASE 2: Scheduled cron handler (wrangler.toml: crons = ["0 2 * * *"]) ──
+
+async function runMorningInsights(env: Env): Promise<void> {
+  // Get all profiles with meal logs in last 7 days
+  const profiles = await env.DB.prepare(
+    `SELECT DISTINCT session_id FROM meal_logs
+     WHERE session_id IS NOT NULL
+     AND logged_date >= date('now', '-7 days')
+     LIMIT 500`
+  ).all();
+
+  const today = new Date().toISOString().split("T")[0];
+
+  for (const row of profiles.results as any[]) {
+    try {
+      const insight = await generateMorningInsight(row.session_id, env.DB, env.GEMINI_API_KEY ?? "");
+      if (insight) {
+        await env.SESSIONS.put(
+          `morning:${row.session_id}:${today}`,
+          JSON.stringify(insight),
+          { expirationTtl: 86400 }
+        );
+      }
+    } catch {
+      // Non-fatal — continue with other profiles
+    }
+  }
 }
 
 // ── Hono app ──────────────────────────────────────────────────────────────────
@@ -1260,8 +1449,12 @@ app.post("/agent/message", async (c) => {
   const msgClean = msgLower.replace(/[!?.]+$/, "").trim();
 
   const GREETINGS    = ["hi", "hello", "hey", "hola", "namaste", "howdy", "sup", "yo", "hai"];
-  const BYES         = ["bye", "goodbye", "see you", "ciao", "alvida", "tata", "byee", "byebye", "bye bye", "good bye"];
-  const THANKS       = ["thanks", "thank you", "thx", "ty", "dhanyawad", "shukriya"];
+  const BYES         = ["bye", "goodbye", "see you", "ciao", "alvida", "tata", "byee", "byebye",
+                         "bye bye", "good bye", "byeee", "byeeee", "bbye", "bay", "bb",
+                         "see ya", "later", "ttyl", "tata", "cheerio", "cya"];
+  const THANKS       = ["thanks", "thank you", "thx", "ty", "dhanyawad", "shukriya",
+                        "thnak you", "thnk you", "thankyou", "thanku", "thankyu",
+                        "thnaks", "thnakyou", "thankx", "thnx"];
   const HELP_PHRASES = ["what can you do", "what can you do for me", "what are your abilities", "what do you do",
                         "how can you help", "what are your features", "tell me what you can do",
                         "what can you help with", "your capabilities", "what are you capable of",
@@ -1274,9 +1467,9 @@ app.post("/agent/message", async (c) => {
                           "what do you remember about me", "what are my dislikes",
                           "tell me what you know about me", "what all do you know about me"];
 
-  const isBye      = BYES.some(b => msgClean === b || msgClean.startsWith(b + " "));
-  // Fuzzy greeting: "hiiii", "hellooo", "helo", "heyyy" etc — collapse repeated chars then check
-  const msgCollapsed = msgClean.replace(/(.)\1{2,}/g, "$1"); // "hellooo" -> "helo", "hiiii" -> "hi"
+  // Fuzzy collapse: "hellooo" -> "helo", "hiiii" -> "hi", "byeee" -> "bye"
+  const msgCollapsed = msgClean.replace(/(.)\1{2,}/g, "$1");
+  const isBye      = BYES.some(b => msgClean === b || msgClean.startsWith(b + " ") || msgCollapsed === b || msgCollapsed.startsWith(b + " "));
   const isGreeting = !isBye && (
     GREETINGS.some(g => msgClean === g || msgClean.startsWith(g + " ") || msgCollapsed === g) ||
     (message.trim().length <= 3 && !isBye)
@@ -1284,6 +1477,12 @@ app.post("/agent/message", async (c) => {
   const isThanks   = THANKS.some(t => msgClean.includes(t));
   const isHelp     = HELP_PHRASES.some(p => msgClean.includes(p));
   const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted"].includes(msgClean);
+  const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
+                       "that's wrong","thats wrong","incorrect","not right","what the","wtf","wth"].includes(msgClean)
+    || msgClean.startsWith("what the") || msgClean.startsWith("what ?");
+  const isFrustration = msgClean.includes("what the fuck") || msgClean.includes("wtf") ||
+                        msgClean.includes("what the hell") || msgClean.includes("this is wrong") ||
+                        msgClean.includes("stupid") || msgClean.includes("dumb");
   const isIdentity = msgClean.includes("who made you") || msgClean.includes("who are you") ||
                      msgClean.includes("who built you") || msgClean.includes("who created you") ||
                      msgClean.includes("what are you") || msgClean.includes("tell me about yourself") ||
@@ -1296,14 +1495,20 @@ app.post("/agent/message", async (c) => {
   const hasDietIntent = msgClean.includes("diet") || msgClean.includes("plan") || msgClean.includes("what to eat");
   const isMemory   = !hasDietIntent && MEMORY_PHRASES.some(p => msgClean.includes(p));
 
-  const VAGUE = ["this","it","this one","that","tell me about this","what is this",
-                 "what about this","about it","this food","should i eat this","is it good","is this good","this item",
+  const VAGUE = ["this","this one","tell me about this","what is this",
+                 "what about this","this food","should i eat this","is it good","is this good","this item",
                  "is it healthy","is it healthy for me","is this healthy","is this healthy for me",
                  "should i include this","should i include this in my diet","should i add this",
                  "should i add it","should i add it to my diet","should i add this to my diet",
                  "can i eat this","can i have this","is this good for me","is it good for me",
-                 "is this ok","is it ok","what is this food"];
-  const isVague = VAGUE.some(v => msgClean === v || msgClean.startsWith(v));
+                 "is this ok","is it ok","what is this food","about it"];
+  // Exclude "it" alone if it appears in a question about a plan ("will it help", "does it work")
+  const itAlone = msgClean === "it" || msgClean === "that";
+  const itInPlanQuestion = /will it|does it|can it|is it (?:good|healthy|ok)|about it/.test(msgClean);
+  const isVague = !itInPlanQuestion && (
+    VAGUE.some(v => msgClean === v || msgClean.startsWith(v)) ||
+    (itAlone)
+  );
 
   // Helper to save + respond
   const respond = async (
@@ -1344,6 +1549,25 @@ app.post("/agent/message", async (c) => {
       ? `Got it! You have **${currentItem.name}** selected. Want me to show its full nutrients, compare it with something, or build a plan around it?`
       : "Sure! Ask me about a food, nutrient, season, or diet goal — I'm here.";
     return respond(msg, "smalltalk", { used_selected_item: !!currentItem });
+  }
+
+  // ── Confusion handler ─────────────────────────────────────────────────────
+  if (isConfusion) {
+    const msg = currentItem
+      ? `You have **${currentItem.name}** selected. Did you want to know something specific about it? Try: "Tell me about ${currentItem.name}" or "Should I eat ${currentItem.name}?"`
+      : `I'm not sure what you're referring to. You can ask me about a food, request a diet plan, or compare two foods. Try: "Tell me about guava" or "Build my day plan".`;
+    return respond(msg, "clarification", { used_selected_item: !!currentItem });
+  }
+
+  // ── Frustration handler ────────────────────────────────────────────────────
+  if (isFrustration) {
+    const msg = `I understand that response wasn't what you were looking for — I'm sorry about that! Let me try again. What specifically would you like to know? You can ask me about:
+
+• A specific food: "Tell me about spinach"
+• Your diet plan: "Build my day plan"
+• A comparison: "Compare mango and banana"
+• What you ate: "I ate banana today"`;
+    return respond(msg, "clarification");
   }
 
   // ── Identity handler — deterministic, no Gemini needed ───────────────────
@@ -1506,18 +1730,30 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
   const isHealthStatement = /i have|i am|i suffer|i often|i get/.test(m);
   const wantsNutrientSources = !!(nutrientMentioned && !isHealthStatement && (m.includes("rich") || m.includes("source") || m.includes("high") || m.includes("best") || m.includes("foods")));
   const wantsCompare         = m.includes("compare") || m.includes(" vs ") || m.includes("versus") || m.includes("difference between") || m.includes("which is better") || m.includes("which has more");
-  // Exclude "will this diet plan help" type questions — they're asking about a plan not requesting one
-  const isAskingAboutPlan = /will this|does this|can this|is this|help me|cure|fix|heal/.test(m) && m.includes("plan");
-  const wantsMealSlot = /what (?:should i|can i|to) (?:eat|have|cook) (?:for|in|at) (?:breakfast|lunch|dinner|evening|morning|night)/.test(m)
-    || /(?:breakfast|lunch|dinner|evening snack) (?:idea|suggestion|option)/.test(m)
-    || /(?:now )?what (?:to|should i|can i) (?:eat|have|cook|make) (?:for|in|at) (?:breakfast|lunch|dinner|evening|morning|night)/.test(m)
-    || /what (?:to eat|should i eat|can i eat) (?:now|today|tonight) (?:for )?(?:breakfast|lunch|dinner|evening|morning|night)?/.test(m)
-    || (/(?:for|in|at) (?:breakfast|lunch|dinner|evening snack|morning|night)/.test(m) && /what|suggest|recommend|tell/.test(m));
-  const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && (
+  // Exclude questions ABOUT a plan (not requesting a new one)
+  // Also catches "will it help", "will this help", "is this good for"
+  const isAskingAboutPlan = (
+    /will (?:this|it) (?:help|work|be good|increase|decrease|reduce|improve)/.test(m) ||
+    (/will this|does this|can this|is this/.test(m) && /plan|diet|help|work/.test(m)) ||
+    /(?:help me|cure|fix|heal)/.test(m)
+  );
+  const MEAL_SLOTS = "breakfast|lunch|dinner|evening|morning|night|snack";
+  const wantsMealSlot =
+    new RegExp(`(?:now )?what (?:should i|can i|to) (?:eat|have|cook|make) (?:(?:for|in|at) )?(?:${MEAL_SLOTS})`).test(m)
+    || new RegExp(`what (?:to eat|should i eat|can i eat|do i eat) (?:now|today|tonight|for) (?:${MEAL_SLOTS})?`).test(m)
+    || new RegExp(`(?:for|in|at) (?:${MEAL_SLOTS}).*(?:what|suggest|recommend|eat|have)`).test(m)
+    || new RegExp(`(?:what|suggest|tell me).*(?:for|in|at) (?:${MEAL_SLOTS})`).test(m)
+    || new RegExp(`(?:${MEAL_SLOTS}) (?:idea|suggestion|option|recommendation)`).test(m);
+  // "what to eat now" / "what should i eat" without "plan" keyword → context suggestion, not full plan
+  const isVagueEatNow = /what (?:to eat|should i eat|can i eat) (?:now|next|today)(?:\s*\?)?$/.test(m)
+    && !m.includes("plan") && !m.includes("for the day") && !m.includes("week");
+  const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && !isVagueEatNow && (
     m.includes("diet") || m.includes("meal plan") || m.includes("day plan") ||
-    m.includes("week plan") || m.includes("what to eat") || (m.includes("build") && m.includes("plan"))
+    m.includes("week plan") || m.includes("what to eat") || (m.includes("build") && m.includes("plan")) ||
+    (m.includes("make") && m.includes("plan")) || (m.includes("create") && m.includes("plan"))
   );
   const wantsIntake          = m.includes("i ate") || m.includes("i had") || m.includes("i consumed") || m.includes("for breakfast") || m.includes("for lunch") || m.includes("for dinner") || m.includes("analyze my");
+  const wantsNextMeal        = /what (?:to|should i|can i) eat (?:now|next)|what now|what else|what next/.test(m) && !wantsDiet;
   const wantsSeason          = m.includes("season") || m.includes("ritu") || m.includes("what should i eat in") || (Object.keys(SEASON_MAP).some(k => m.includes(k)) && !foodInMsg);
   const wantsHealth          = !!(foodInMsg && (m.includes("healthy") || m.includes("good for") || m.includes("benefits") || m.includes("should i eat") || m.includes("is it good")));
 
@@ -1618,6 +1854,16 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       taskType = "get_nutrient_rich_foods"; toolsUsed = ["get_nutrient_rich_foods"];
     }
 
+    // Route 4.5: "what to eat now" / "what next" — suggest next meal based on logged meals
+    else if (wantsNextMeal) {
+      const hour = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
+      const nextSlot = hour < 10 ? "breakfast" : hour < 13 ? "lunch" : hour < 17 ? "evening snack" : "dinner";
+      const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned !== "all" ? seasonMentioned : agentContext.current_season ?? "all");
+      const suggestion = result.foods?.slice(0, 3).map((f: any) => `**${f.name}**`).join(", ") ?? "seasonal foods";
+      finalResponse = `For ${nextSlot}, try: ${suggestion}. These fit your current season and your weight management goal.`;
+      taskType = "meal_suggestion"; toolsUsed = ["get_seasonal_foods"];
+    }
+
     // Route 5: Seasonal foods
     else if (wantsSeason) {
       const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned);
@@ -1674,6 +1920,36 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
 
         taskType = "analyze_intake"; toolsUsed = ["analyze_intake"];
       }
+    }
+
+    // Route 8a: "What to eat now?" — context-aware suggestion based on today's intake
+    else if (isVagueEatNow) {
+      // Look at what they've eaten today and suggest what's missing
+      const mealLogToday = await c.env.DB.prepare(
+        `SELECT i.name, i.calories_per_100g FROM meal_logs ml
+         JOIN items i ON i.id = ml.item_id
+         WHERE ml.session_id = ?1 AND ml.logged_date = date('now')`
+      ).bind(profileId).all();
+      const eaten = (mealLogToday.results as any[]).map(l => l.name);
+      const cal = (mealLogToday.results as any[]).reduce((s: number, l: any) => s + l.calories_per_100g, 0);
+      const tdee = profile ? computeTdee(profile) : 1800;
+      const remaining = (tdee ?? 1800) - cal;
+
+      if (eaten.length > 0) {
+        const seasonResult = await toolGetSeasonalFoods(c.env.DB, agentContext.current_season ?? "all", undefined, 6);
+        const suggestions = (seasonResult.foods as any[])
+          .filter(f => !eaten.includes(f.name) && !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d)))
+          .slice(0, 3)
+          .map(f => `**${f.name}** (${f.calories_per_100g} kcal)`)
+          .join(", ");
+        finalResponse = `You've had ${eaten.join(", ")} today — about **${cal} kcal** so far. You have ~${remaining} kcal remaining.${suggestions ? `
+
+Good options for your next meal: ${suggestions}.` : ""}`;
+      } else {
+        finalResponse = `You haven't logged any meals today. Try something light to start — a fruit and some whole grains for breakfast. What season are you eating for?`;
+      }
+      taskType = "intake_suggestion";
+      toolsUsed = ["meal_log"];
     }
 
     // Route 8: Symptoms
@@ -1742,24 +2018,76 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
   });
 });
 
+
+// ── PHASE 2: Morning Insight endpoint ────────────────────────────────────
+
+app.get("/agent/morning/:profile_id", async (c) => {
+  const profileId = c.req.param("profile_id");
+  const today = new Date().toISOString().split("T")[0];
+  const cached = await c.env.SESSIONS.get(`morning:${profileId}:${today}`);
+  if (cached) return c.json(JSON.parse(cached));
+
+  // Generate on-demand if not pre-generated by cron
+  const insight = await generateMorningInsight(profileId, c.env.DB, c.env.GEMINI_API_KEY ?? "");
+  if (insight) {
+    await c.env.SESSIONS.put(`morning:${profileId}:${today}`, JSON.stringify(insight), {
+      expirationTtl: 86400,
+    });
+    return c.json(insight);
+  }
+  return c.json(null);
+});
+
+// ── PHASE 2: Season transition endpoint ──────────────────────────────────
+
+app.get("/agent/season-check/:profile_id", async (c) => {
+  const profileId = c.req.param("profile_id");
+  const current = getCurrentSeason();
+  const lastSeen = await c.env.SESSIONS.get(`last_season:${profileId}`);
+
+  if (lastSeen && lastSeen !== current) {
+    // Season changed since last visit!
+    const journal = await c.env.DB.prepare(
+      `SELECT * FROM ritu_journal WHERE season = ?1`
+    ).bind(current).first<any>();
+
+    await c.env.SESSIONS.put(`last_season:${profileId}`, current, {
+      expirationTtl: 60 * 60 * 24 * 30,
+    });
+
+    return c.json({
+      changed: true,
+      from: lastSeen,
+      to: current,
+      journal,
+    });
+  }
+
+  // Store current season
+  await c.env.SESSIONS.put(`last_season:${profileId}`, current, {
+    expirationTtl: 60 * 60 * 24 * 30,
+  });
+
+  return c.json({ changed: false, current });
+});
+
 // ── Diet plan endpoint ────────────────────────────────────────────────────────
 
 app.post("/agent/task/diet-plan", async (c) => {
   const body = await c.req.json();
   const { season, goal, days, profile, profile_id } = body;
 
-  // PHASE 1: load dislikes if profile_id provided
-  const dislikes = profile_id
-    ? (await loadUserFacts(profile_id, c.env.DB)).dislikes
-    : [];
+  // PHASE 1: load dislikes and dietary preference if profile_id provided
+  const userFactsForPlan = profile_id
+    ? await loadUserFacts(profile_id, c.env.DB)
+    : { dislikes: [], likes: [], dietary: "", health_notes: [], allergies: [], goal: "", lifestyle: "" };
 
-  // Apply dietary preference from facts
-  const profileWithFacts = (profile || facts.dietary) ? {
+  const profileWithFacts: Profile | null = (profile || userFactsForPlan.dietary) ? {
     ...(profile ?? {}),
-    dietary_preference: facts.dietary || profile?.dietary_preference,
+    dietary_preference: userFactsForPlan.dietary || profile?.dietary_preference,
   } as Profile : null;
   const result = await toolBuildDietPlan(
-    c.env.DB, profileWithFacts, season ?? "all", goal, Math.min(days ?? 1, 7), dislikes
+    c.env.DB, profileWithFacts, season ?? "all", goal, Math.min(days ?? 1, 7), userFactsForPlan.dislikes
   );
   return c.json(result);
 });
@@ -1774,6 +2102,12 @@ app.post("/agent/task/analyze-intake", async (c) => {
   return c.json(result);
 });
 
-// ── Export ────────────────────────────────────────────────────────────────────
-
-export default app;
+// ── Export — includes scheduled cron for Phase 2 ────────────────────────────
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    return app.fetch(request, env);
+  },
+  async scheduled(_event: ScheduledEvent, env: Env): Promise<void> {
+    await runMorningInsights(env);
+  },
+};
