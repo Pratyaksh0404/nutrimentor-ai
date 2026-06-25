@@ -516,8 +516,17 @@ async function toolBuildDietPlan(
   else if (effectiveGoal.includes("lose") || effectiveGoal.includes("weight loss")) targetCal -= 400;
 
   // Exclude disliked foods using LIKE for fuzzy name matching
-  // Handles user spelling variations: "soyabean" matches "Soybean", etc.
-  const dislikedLower = dislikedFoods.map(d => d.toLowerCase().trim());
+  // Normalize spelling variants AND expand to catch all forms in the DB
+  const PLAN_SPELLING_MAP: Record<string, string> = {
+    "soyabean": "soybean", "soya bean": "soybean", "soya": "soybean",
+    "brinjal": "eggplant", "karela": "bitter gourd", "palak": "spinach",
+  };
+  // Normalize + deduplicate dislikes, then expand each to catch DB name variants
+  const rawDislikes = dislikedFoods.map(d => d.toLowerCase().trim());
+  const normalizedDislikes = [...new Set(rawDislikes.map(d => PLAN_SPELLING_MAP[d] || d))];
+  // Add both original and normalized forms so '%soyabean%' and '%soybean%' both filter
+  const allDislikeForms = [...new Set([...rawDislikes, ...normalizedDislikes])];
+  const dislikedLower = allDislikeForms;
 
   // Build NOT LIKE conditions — each dislike gets its own ?N param
   // Produce: ?1=season, ?2..=dislikes
@@ -525,7 +534,7 @@ async function toolBuildDietPlan(
     ? dislikedLower.map((_, i) => `LOWER(i.name) NOT LIKE ?${i + 2}`).join(" AND ")
     : "";
   const produceDislikeFilter = produceNotLike ? `AND ${produceNotLike}` : "";
-  // Add % wildcards for fuzzy match: "soyabean" → "%soyabean%"
+  // Add % wildcards for fuzzy match
   const dislikedFuzzy = dislikedLower.map(d => `%${d}%`);
   const produceBinds: any[] = [season, ...dislikedFuzzy];
   const produceQ = db.prepare(
@@ -754,6 +763,17 @@ Safety rules:
 - Do not give specific medication advice
 
 IMPORTANT: Respond in plain conversational text only. No JSON, no code blocks.
+
+Agent behaviour rules — you are an AGENT, not a chatbot:
+- You remember everything learned about the user. Reference it proactively.
+- When a user selects a food, you know about it. Use it in your answer.
+- When you know their goal/health/dislikes, weave them into every response.
+- If you can infer what they need, do it — don't ask unnecessary clarifying questions.
+- Give complete, actionable answers. Don't just say "it depends".
+- If they ask a question about food, give a direct answer first, then explain.
+- Never repeat information you already told the user in the same session.
+- Sound like a knowledgeable friend, not a search engine.
+
 Today is a great day to eat well.`;
 }
 
@@ -783,7 +803,21 @@ async function buildSystemPromptWithFacts(
     return null;
   }).filter(Boolean).join("\n");
 
-  return base + `\n\nWhat I know about this user from our conversations:\n${factLines}\n\nAlways use these learned preferences when giving advice. Never suggest foods the user has said they dislike.`;
+  // Also inject today's meal log summary so Gemini knows what they ate
+  let todayMealContext = "";
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const todayLogs = await db.prepare(
+      `SELECT i.name, ml.meal_slot FROM meal_logs ml JOIN items i ON i.id = ml.item_id
+       WHERE ml.session_id = ?1 AND ml.logged_date = ?2 ORDER BY ml.created_at ASC LIMIT 8`
+    ).bind(profileId, today).all();
+    if (todayLogs.results.length > 0) {
+      const mealLines = (todayLogs.results as any[]).map(l => `${l.meal_slot}: ${l.name}`).join(", ");
+      todayMealContext = `\n\nToday's logged meals: ${mealLines}`;
+    }
+  } catch { /* non-fatal */ }
+
+  return base + `\n\nWhat I know about this user from our conversations:\n${factLines}\n\nAlways use these learned preferences when giving advice. Never suggest foods the user has said they dislike.` + todayMealContext;
 }
 
 // ── Unit cleaner ──────────────────────────────────────────────────────────────
@@ -1081,11 +1115,41 @@ async function generateMorningInsight(
   const hour = nowIST.getUTCHours();
   const greeting = hour < 12 ? "Good morning! 🌅" : hour < 17 ? "Good afternoon! ☀️" : "Good evening! 🌙";
 
+  // ── Phase 2.3: Use Gemini to write insight copy (warm, conversational tone) ──
+  // Build a compact summary of the raw insights for Gemini to narrate
+  if (geminiKey) {
+    try {
+      const rawSummary = insights.slice(0, 3).map(i => i.message).join(" | ");
+      const seasonLabel = SEASON_LABELS[currentSeason] ?? currentSeason;
+      const geminiPrompt =
+        `You are NutriMentor AI, a warm nutrition companion. Write a single short paragraph (2-3 sentences, max 60 words) that a caring nutritionist would say as a morning greeting based on these data points: ${rawSummary}. ` +
+        `The current season is ${seasonLabel}. ` +
+        `Be encouraging, specific, and practical. Start with a warm opener. Do NOT use JSON or lists. Plain text only.`;
+
+      const geminiBody = JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: geminiPrompt }] }],
+        generationConfig: { maxOutputTokens: 120, temperature: 0.4 },
+      });
+      const geminiResp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: geminiBody }
+      );
+      if (geminiResp.ok) {
+        const gdata = await geminiResp.json() as any;
+        const geminiCopy = gdata.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+        // Inject Gemini-written copy as first insight if it looks valid
+        if (geminiCopy && !geminiCopy.startsWith("{") && geminiCopy.length > 20) {
+          insights.unshift({ type: "gemini_copy", severity: "low", message: geminiCopy });
+        }
+      }
+    } catch { /* Gemini failure is non-fatal — keep deterministic insights */ }
+  }
+
   return {
     type: "morning_insight",
     date: today,
     greeting,
-    insights: insights.slice(0, 3), // max 3 insights
+    insights: insights.slice(0, 3), // max 3 insights (Gemini copy + up to 2 data points)
     season: currentSeason,
   };
 }
@@ -1148,7 +1212,7 @@ app.get("/health", (c) => c.json({
   status: "ok",
   service: "NutriMentor AI",
   version: "2.2.0",
-  phase: "1 — Memory Layer",
+  phase: "2 — Proactive Agent",
   ai_backend: "gemini-2.5-flash-lite",
 }));
 
@@ -1465,7 +1529,11 @@ app.post("/agent/message", async (c) => {
   // "my preferences" removed — it conflicts with "diet plan according to my preferences"
   const MEMORY_PHRASES = ["what do you know about me", "what have you learned about me",
                           "what do you remember about me", "what are my dislikes",
-                          "tell me what you know about me", "what all do you know about me"];
+                          "tell me what you know about me", "what all do you know about me",
+                          "what allergy do i have", "what are my allergies",
+                          "what do you know about my allergy", "my allergy",
+                          "what are my health", "what are my health notes",
+                          "what is my goal", "what is my fitness goal"];
 
   // Fuzzy collapse: "hellooo" -> "helo", "hiiii" -> "hi", "byeee" -> "bye"
   const msgCollapsed = msgClean.replace(/(.)\1{2,}/g, "$1");
@@ -1474,7 +1542,11 @@ app.post("/agent/message", async (c) => {
     GREETINGS.some(g => msgClean === g || msgClean.startsWith(g + " ") || msgCollapsed === g) ||
     (message.trim().length <= 3 && !isBye)
   );
-  const isThanks   = THANKS.some(t => msgClean.includes(t));
+  // isThanks only fires when the message is PURELY a thanks — not "thank you, now give me a plan"
+  const hasActionAfterThanks = /(?:give|build|make|show|tell|create|what|how|now|also|and|but)/.test(
+    msgClean.replace(/thanks?|thank you|thx|ty|dhanyawad|shukriya|thnak you|thnk you|thankyou|thanku|thankyu|thnaks|thnakyou|thankx|thnx/gi, "").trim()
+  );
+  const isThanks   = !hasActionAfterThanks && THANKS.some(t => msgClean.includes(t));
   const isHelp     = HELP_PHRASES.some(p => msgClean.includes(p));
   const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted"].includes(msgClean);
   const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
@@ -1494,6 +1566,9 @@ app.post("/agent/message", async (c) => {
                      msgClean.includes("is that all you know") || msgClean.includes("accuracy");
   const hasDietIntent = msgClean.includes("diet") || msgClean.includes("plan") || msgClean.includes("what to eat");
   const isMemory   = !hasDietIntent && MEMORY_PHRASES.some(p => msgClean.includes(p));
+  // Memory update: "remove X from likes" / "delete X from dislikes"
+  const isMemoryUpdate = /(?:remove|delete|forget) .{1,30} from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i.test(message)
+    || /(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) .{1,30}/i.test(message);
 
   const VAGUE = ["this","this one","tell me about this","what is this",
                  "what about this","this food","should i eat this","is it good","is this good","this item",
@@ -1603,15 +1678,54 @@ For general guidance I'm highly reliable. For medical nutrition therapy (e.g. pr
     return respond(msg, "memory_recall", { next_actions: ["Update my preferences", "Build a personalised diet plan"] });
   }
 
+  // Memory update handler — "remove panner from likes", "forget that I dislike soybean"
+  if (isMemoryUpdate) {
+    // Extract the food name and operation from the message
+    const removeMatch = message.match(/(?:remove|delete|forget) (.{1,30}?) from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i);
+    const noLongerMatch = message.match(/(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) (.{1,30})/i);
+    const itemToRemove = (removeMatch?.[1] || noLongerMatch?.[1] || "").trim().toLowerCase();
+    const isFromLikes = /likes|preference/i.test(message);
+    const isFromDislikes = /dislikes|hate/i.test(message);
+
+    if (itemToRemove) {
+      // Delete from user_facts
+      try {
+        if (isFromDislikes) {
+          await c.env.DB.prepare(
+            `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
+          ).bind(profileId, `%${itemToRemove}%`).run();
+        } else {
+          // Remove from likes (preference table, not 'dietary')
+          await c.env.DB.prepare(
+            `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
+          ).bind(profileId, `%${itemToRemove}%`).run();
+        }
+      } catch { /* non-fatal */ }
+
+      // Reload updated facts and confirm
+      const updatedFacts = await loadUserFacts(profileId, c.env.DB);
+      const lines: string[] = [];
+      if (updatedFacts.dislikes.length)     lines.push(`🚫 Dislikes: ${updatedFacts.dislikes.join(", ")}`);
+      if (updatedFacts.likes.length)        lines.push(`✅ Likes: ${updatedFacts.likes.join(", ")}`);
+      if (updatedFacts.health_notes.length) lines.push(`🏥 Health notes: ${updatedFacts.health_notes.join(", ")}`);
+      const memSummary = lines.length ? `\n\n${lines.join("\n")}` : "";
+      const msg = `Got it! I've removed **${itemToRemove}** from your ${isFromDislikes ? "dislikes" : "likes"}. Here's what I know now:${memSummary}`;
+      return respond(msg, "memory_update", { next_actions: ["What do you know about me?", "Build a personalised diet plan"] });
+    }
+  }
+
   if (isHelp) {
     const msg = `Here's what I can do for you:\n\n🔍 **Food lookup** — "Tell me about guava"\n⚖️ **Compare foods** — "Compare mango and banana"\n🗓️ **Diet plans** — "Build me a summer diet plan"\n📊 **Intake analysis** — "I ate banana and oats today"\n🌱 **Seasonal foods** — "What should I eat in monsoon?"\n💊 **Nutrient sources** — "Foods rich in iron"\n🏃 **BMI & calories** — "What is my BMI?"\n🤒 **Symptom advice** — "What should I eat when I have a cold?"\n🧠 **Memory** — "What do you know about me?"\n\nI also **remember your preferences** — tell me what you like, dislike, or your health conditions and I'll personalise every response.`;
     return respond(msg, "help", { next_actions: ["Tell me about guava", "What do you know about me?", "Build a diet plan"] });
   }
 
-  // For vague references, prefer food mentioned in the LAST assistant message
-  // over the KV-stored selected item (which may be from an old card click)
-  let contextFood = currentItem;
-  if (history.length >= 2) {
+  // For vague references ("what is this?", "can I eat this?"):
+  // Priority 1 — KV-selected item: the food the user clicked in the grid (most explicit intent)
+  // Priority 2 — Only use last-message history if nothing is selected in the grid
+  // OLD bug: history ALWAYS overrode the KV item → brown rice stuck forever
+  let contextFood = currentItem;   // KV item is authoritative
+  if (!currentItem && history.length >= 2) {
+    // No food selected in grid — look at last assistant message as fallback
     const lastAssistantMsg = [...history].reverse().find(h => h.role === "assistant");
     if (lastAssistantMsg) {
       const foodInLastMsg = await findFoodInMessage(lastAssistantMsg.content.toLowerCase(), c.env.DB);
@@ -1743,18 +1857,54 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     || new RegExp(`what (?:to eat|should i eat|can i eat|do i eat) (?:now|today|tonight|for) (?:${MEAL_SLOTS})?`).test(m)
     || new RegExp(`(?:for|in|at) (?:${MEAL_SLOTS}).*(?:what|suggest|recommend|eat|have)`).test(m)
     || new RegExp(`(?:what|suggest|tell me).*(?:for|in|at) (?:${MEAL_SLOTS})`).test(m)
-    || new RegExp(`(?:${MEAL_SLOTS}) (?:idea|suggestion|option|recommendation)`).test(m);
+    || new RegExp(`(?:${MEAL_SLOTS}) (?:idea|suggestion|option|recommendation)`).test(m)
+    || new RegExp(`now what (?:should i|can i|to) (?:eat|have) (?:(?:in|for|at) )?(?:${MEAL_SLOTS})`).test(m)
+    || new RegExp(`(?:what|suggest) (?:should i|can i) (?:eat|have) (?:in|for|at) (?:${MEAL_SLOTS})`).test(m);
   // "what to eat now" / "what should i eat" without "plan" keyword → context suggestion, not full plan
   const isVagueEatNow = /what (?:to eat|should i eat|can i eat) (?:now|next|today)(?:\s*\?)?$/.test(m)
     && !m.includes("plan") && !m.includes("for the day") && !m.includes("week");
-  const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && !isVagueEatNow && (
+  // "add X to my diet" = a food question, NOT a plan-build request
+  // "should I add wheat in my diet?" = wantsHealth question
+  const isAddToDietQuestion = (
+    /add .{1,30} to my (?:diet|plan)/i.test(m) ||
+    /should i add .{1,30} (?:to|in) my (?:diet|plan)/i.test(m) ||
+    /include .{1,30} in my (?:diet|plan)/i.test(m)
+  );
+  // "build me a seasonal diet plan" / "diet plan for monsoon" = wantsDiet, NOT wantsSeason
+  const isSeasonalDietPlan = (
+    (m.includes("build") || m.includes("make") || m.includes("create") || m.includes("give")) &&
+    m.includes("plan") && (m.includes("season") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
+  ) || (
+    m.includes("diet plan") && (m.includes("season") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
+  ) || (
+    m.includes("seasonal") && (m.includes("diet") || m.includes("plan"))
+  );
+  const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && !isVagueEatNow && !isAddToDietQuestion && (
+    isSeasonalDietPlan ||
     m.includes("diet") || m.includes("meal plan") || m.includes("day plan") ||
     m.includes("week plan") || m.includes("what to eat") || (m.includes("build") && m.includes("plan")) ||
     (m.includes("make") && m.includes("plan")) || (m.includes("create") && m.includes("plan"))
   );
-  const wantsIntake          = m.includes("i ate") || m.includes("i had") || m.includes("i consumed") || m.includes("for breakfast") || m.includes("for lunch") || m.includes("for dinner") || m.includes("analyze my");
+  // "what should I eat for dinner" is a meal-slot suggestion, NOT intake logging
+  // Only trigger intake when user is REPORTING what they ate, not asking what to eat
+  const isReportingIntake = m.includes("i ate") || m.includes("i had") || m.includes("i consumed") || m.includes("analyze my");
+  // "for breakfast/lunch/dinner" triggers intake ONLY when combined with reporting words
+  const hasMealSlotReport = (m.includes("for breakfast") || m.includes("for lunch") || m.includes("for dinner"))
+    && !m.includes("what should") && !m.includes("what can") && !m.includes("what to eat") && !m.includes("suggest");
+  const wantsIntake = isReportingIntake || hasMealSlotReport;
   const wantsNextMeal        = /what (?:to|should i|can i) eat (?:now|next)|what now|what else|what next/.test(m) && !wantsDiet;
-  const wantsSeason          = m.includes("season") || m.includes("ritu") || m.includes("what should i eat in") || (Object.keys(SEASON_MAP).some(k => m.includes(k)) && !foodInMsg);
+  // ── Phase 2 fix: "what is the current season?" must answer directly, not fall into food-list route ──
+  const wantsCurrentSeasonInfo = (
+    /(?:what|which|tell me)(?: is| the)?(?: current| today.?s?)? (?:season|ritu)/.test(m) ||
+    /(?:current|today.?s?|right now|now|which) (?:season|ritu)/.test(m) ||
+    m === "what season is it" || m === "which season is it" ||
+    m === "what ritu is it" || m === "what is the ritu" ||
+    m === "what season are we in" || m === "what ritu are we in" ||
+    (m.includes("what season") && !m.includes("what should i eat")) ||
+    (m.includes("which season") && !m.includes("what should i eat"))
+  );
+  // wantsSeason handles "what should I eat in monsoon?" — exclude season-info AND diet-plan requests
+  const wantsSeason          = !wantsCurrentSeasonInfo && !wantsDiet && (m.includes("season") || m.includes("ritu") || m.includes("what should i eat in") || (Object.keys(SEASON_MAP).some(k => m.includes(k)) && !foodInMsg));
   const wantsHealth          = !!(foodInMsg && (m.includes("healthy") || m.includes("good for") || m.includes("benefits") || m.includes("should i eat") || m.includes("is it good")));
 
   try {
@@ -1808,40 +1958,95 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
 
     // Route 2: Comparison
     else if (wantsCompare) {
-      const food1Name = foodInMsg?.name ?? currentItem?.name;
+      let food1Name = foodInMsg?.name ?? currentItem?.name ?? null;
+      let food2Name: string | null = null;
+
+      // If no food in current message, try to recover both foods from history
+      // e.g. "Which has more protein?" after "compare broccoli and cabbage"
+      if (!food1Name || !food2Name) {
+        for (const h of [...history].reverse()) {
+          const matches: string[] = [];
+          const allFoods = await c.env.DB.prepare(`SELECT name FROM items ORDER BY LENGTH(name) DESC`).all();
+          for (const row of allFoods.results as any[]) {
+            if (h.content.toLowerCase().includes(row.name.toLowerCase())) matches.push(row.name);
+            if (matches.length >= 2) break;
+          }
+          if (matches.length >= 2) {
+            food1Name = food1Name ?? matches[0];
+            food2Name = food2Name ?? matches[1];
+            break;
+          }
+        }
+      }
+
       if (!food1Name) {
         finalResponse = "Tell me which two foods to compare — e.g. 'compare mango and banana'.";
         taskType = "clarification";
       } else {
+        // Try to find second food in current message, then fall back to history
         const food2Match = await findSecondFoodInMessage(m, food1Name, c.env.DB);
-        const food2Name  = food2Match?.name ?? (food1Name !== currentItem?.name ? currentItem?.name : null);
-        if (!food2Name || food2Name === food1Name) {
-          finalResponse = `I can see **${food1Name}** — which food should I compare it with?`;
+        const resolvedFood2 = food2Match?.name ?? food2Name ?? (food1Name !== currentItem?.name ? currentItem?.name : null);
+        if (!resolvedFood2 || resolvedFood2 === food1Name) {
+          finalResponse = `I have **${food1Name}** — which food should I compare it with?`;
           taskType = "clarification";
         } else {
-          const result = await toolCompareFoods(c.env.DB, food1Name, food2Name, nutrientMentioned);
+          const result = await toolCompareFoods(c.env.DB, food1Name, resolvedFood2, nutrientMentioned);
           finalResponse = buildDirectResponse("compare_foods", result, message);
           taskType = "compare_foods"; toolsUsed = ["compare_foods"];
         }
       }
     }
 
-    // Route 3: Food lookup
-    else if (wantsFoodInfo || wantsHealth || (foodInMsg && !wantsDiet && !wantsIntake)) {
+    // Route 3: Food lookup + "add to diet" advisor
+    else if (wantsFoodInfo || wantsHealth || isAddToDietQuestion || (foodInMsg && !wantsDiet && !wantsIntake)) {
       const result = await toolFoodLookup(c.env.DB, foodInMsg!.name);
       finalResponse = buildDirectResponse("food_lookup", result, message);
-      if (wantsHealth && result.found) {
-        // PHASE 1: add personalised note if we know their BMI
+      if (result.found) {
         const bmiCtx = profile && computeBmi(profile);
-        if (bmiCtx) {
-          finalResponse += `\n\nFor your profile (BMI ${bmiCtx.bmi}, ${bmiCtx.label}): `;
-          finalResponse += result.calories_per_100g! > 300
-            ? `${result.name} is calorie-dense — have it in small portions.`
-            : `${result.name} fits well into a balanced diet at ${result.calories_per_100g} kcal/100g.`;
-        }
-        // PHASE 1: warn if food is in their dislike list
-        if (userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()))) {
-          finalResponse += `\n\n_(You've mentioned you don't usually eat ${result.name} — I'll keep that in mind for your plans.)_`;
+        const isDisliked = userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()));
+
+        if (isAddToDietQuestion) {
+          // "add X to my diet / should I add wheat?" — give a direct yes/no + reasoning
+          if (isDisliked) {
+            finalResponse += `\n\nYou've mentioned you don't like **${result.name}** — I'd skip it. There are better alternatives that you enjoy.`;
+          } else {
+            const goal = userFacts.goal || profile?.goal || "";
+            const cal = result.calories_per_100g ?? 0;
+            const isHighCal = cal > 300;
+            const isGoodForGoal =
+              goal.includes("lose") ? !isHighCal :
+              goal.includes("gain") ? isHighCal :
+              true;
+            const verdict = isGoodForGoal ? "✅ Yes" : "⚠️ In moderation";
+            const reason = goal.includes("lose") && isHighCal
+              ? `It's calorie-dense at ${cal} kcal/100g — have small portions if you're trying to lose weight.`
+              : goal.includes("gain") && !isHighCal
+              ? `It's relatively light at ${cal} kcal/100g — pair it with higher-calorie foods for weight gain.`
+              : `At ${cal} kcal/100g it fits well into a balanced diet.`;
+            if (userFacts.health_notes.includes("diabetes")) {
+              const hasHighSugar = (result.nutrients ?? []).find((n: any) => n.name === "Sugar" && n.amount > 10);
+              finalResponse += hasHighSugar
+                ? `\n\n${verdict}, but watch portion sizes. ${result.name} has ${hasHighSugar.amount}g sugar per 100g — eat with a meal, not alone, for blood sugar management.`
+                : `\n\n${verdict} — ${reason} Good choice for blood sugar management too.`;
+            } else if (userFacts.health_notes.includes("high blood pressure")) {
+              const sodium = (result.nutrients ?? []).find((n: any) => n.name === "Sodium");
+              finalResponse += sodium && sodium.amount > 400
+                ? `\n\n⚠️ High sodium (${sodium.amount}mg/100g) — limit this if you have high blood pressure.`
+                : `\n\n${verdict} — ${reason}`;
+            } else {
+              finalResponse += `\n\n${verdict} — ${reason}`;
+            }
+          }
+        } else if (wantsHealth) {
+          if (bmiCtx) {
+            finalResponse += `\n\nFor your profile (BMI ${bmiCtx.bmi}, ${bmiCtx.label}): `;
+            finalResponse += (result.calories_per_100g ?? 0) > 300
+              ? `${result.name} is calorie-dense — have it in small portions.`
+              : `${result.name} fits well into a balanced diet at ${result.calories_per_100g} kcal/100g.`;
+          }
+          if (isDisliked) {
+            finalResponse += `\n\n_(You've mentioned you don't usually eat ${result.name} — I'll keep that in mind for your plans.)_`;
+          }
         }
       }
       taskType = "food_lookup"; toolsUsed = ["food_lookup"];
@@ -1864,16 +2069,95 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       taskType = "meal_suggestion"; toolsUsed = ["get_seasonal_foods"];
     }
 
-    // Route 5: Seasonal foods
-    else if (wantsSeason) {
-      const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned);
-      // Filter out disliked foods from seasonal suggestion
-      if (result.foods && userFacts.dislikes.length > 0) {
-        result.foods = result.foods.filter((f: any) =>
-          !userFacts.dislikes.some(d => d.toLowerCase() === f.name?.toLowerCase())
-        );
+    // Route 4a.5: "What should I avoid this season?" / "foods to avoid in monsoon"
+    else if (
+      (m.includes("avoid") || m.includes("not eat") || m.includes("stay away") || m.includes("skip")) &&
+      (m.includes("season") || m.includes("ritu") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
+    ) {
+      const avoidSeason = seasonMentioned !== "all" ? seasonMentioned : getCurrentSeason();
+      const avoidLabel = SEASON_LABELS[avoidSeason] ?? avoidSeason;
+      const journal = await c.env.DB.prepare(
+        `SELECT avoid, eat_more, dosha, description FROM ritu_journal WHERE season = ?1`
+      ).bind(avoidSeason).first<any>();
+      if (journal?.avoid) {
+        let msg = `In **${avoidLabel}**, you should avoid: **${journal.avoid}**.`;
+        if (journal.dosha) msg += `\n\nThis season aggravates the **${journal.dosha}** dosha — these foods make it worse.`;
+        if (journal.eat_more) msg += `\n\nInstead, focus on: ${journal.eat_more}.`;
+        finalResponse = msg;
+      } else {
+        finalResponse = `I don't have specific avoid-list data for that season right now. Generally, avoid heavy, fried, or stale foods and focus on fresh, seasonal produce.`;
       }
-      finalResponse = buildDirectResponse("get_seasonal_foods", result, message);
+      taskType = "season_info"; toolsUsed = ["ritu_journal"];
+    }
+
+    // Route 4b: Current season info — Phase 2 fix
+    // "What is the current season?" / "Which Ritu is it now?" — answers directly
+    else if (wantsCurrentSeasonInfo) {
+      const cs = getCurrentSeason();
+      const csLabel = SEASON_LABELS[cs] ?? cs;
+      const journal = await c.env.DB.prepare(
+        `SELECT title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal WHERE season = ?1`
+      ).bind(cs).first<any>();
+      const foods = await toolGetSeasonalFoods(c.env.DB, cs, undefined, 6);
+      const foodList = (foods.foods as any[])
+        .filter((f: any) => !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d.toLowerCase())))
+        .slice(0, 5)
+        .map((f: any) => `**${f.name}**`)
+        .join(", ");
+
+      let msg = `We are currently in **${csLabel}**.`;
+      if (journal) {
+        msg += `\n\n${journal.description}`;
+        if (journal.dosha) msg += ` This season is governed by the **${journal.dosha}** dosha.`;
+        if (foodList) msg += `\n\n🌿 **Best foods right now:** ${foodList}.`;
+        if (journal.eat_more) msg += `\n\n✅ **Eat more:** ${journal.eat_more}.`;
+        if (journal.avoid) msg += `\n\n❌ **Avoid:** ${journal.avoid}.`;
+        if (journal.ayurvedic_note) msg += `\n\n_${journal.ayurvedic_note}_`;
+      } else if (foodList) {
+        msg += ` Good foods to eat right now: ${foodList}.`;
+      }
+      finalResponse = msg;
+      taskType = "season_info";
+      toolsUsed = ["get_seasonal_foods"];
+    }
+
+    // Route 5: Seasonal foods / season journal
+    else if (wantsSeason) {
+      // "tell me about spring season" / "about Hemanta Ritu" → full journal + foods
+      const wantsSeasonDetail = m.includes("tell me about") || m.includes("about the") ||
+        m.includes("what is") || m.includes("describe") || m.includes("explain") ||
+        (m.includes("about") && !m.includes("what should i eat"));
+
+      if (wantsSeasonDetail && seasonMentioned !== "all") {
+        // Return full journal entry for named season
+        const journal = await c.env.DB.prepare(
+          `SELECT title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal WHERE season = ?1`
+        ).bind(seasonMentioned).first<any>();
+        const foods = await toolGetSeasonalFoods(c.env.DB, seasonMentioned, undefined, 6);
+        const foodList = (foods.foods as any[])
+          .filter((f: any) => !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d.toLowerCase())))
+          .slice(0, 5).map((f: any) => `**${f.name}**`).join(", ");
+        if (journal) {
+          let msg = `**${journal.title}**\n\n${journal.description}`;
+          if (journal.dosha) msg += ` This season is governed by the **${journal.dosha}** dosha.`;
+          if (foodList) msg += `\n\n🌿 **Foods in season:** ${foodList}.`;
+          if (journal.eat_more) msg += `\n\n✅ **Eat more:** ${journal.eat_more}.`;
+          if (journal.avoid) msg += `\n\n❌ **Avoid:** ${journal.avoid}.`;
+          if (journal.ayurvedic_note) msg += `\n\n_${journal.ayurvedic_note}_`;
+          finalResponse = msg;
+        } else {
+          finalResponse = buildDirectResponse("get_seasonal_foods", foods, message);
+        }
+      } else {
+        // Simple: "what should I eat in monsoon?" → food list
+        const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned);
+        if (result.foods && userFacts.dislikes.length > 0) {
+          result.foods = result.foods.filter((f: any) =>
+            !userFacts.dislikes.some(d => d.toLowerCase() === f.name?.toLowerCase())
+          );
+        }
+        finalResponse = buildDirectResponse("get_seasonal_foods", result, message);
+      }
       taskType = "get_seasonal_foods"; toolsUsed = ["get_seasonal_foods"];
     }
 
@@ -1963,6 +2247,29 @@ Good options for your next meal: ${suggestions}.` : ""}`;
       taskType = "symptom";
     }
 
+    // Route 8b: User correction — "not brown rice, I selected guava" / "I said mango not banana"
+    // Detect when user is correcting the agent about which food they meant
+    else if (
+      /not (?:brown rice|banana|oats|lentils|the|that|it|this)/i.test(m) ||
+      /i (?:said|selected|chose|meant|have selected|have clicked|am talking about) (.{2,25})/i.test(m) ||
+      /that.?s (?:not|wrong)|you.?re wrong|incorrect|it is not|it.?s not/i.test(m)
+    ) {
+      // Try to find the food the user is actually referring to
+      const correctionFoodMatch = await findFoodInMessage(m, c.env.DB);
+      if (correctionFoodMatch) {
+        const result = await toolFoodLookup(c.env.DB, correctionFoodMatch.name);
+        finalResponse = `Got it — you meant **${correctionFoodMatch.name}**! ` + buildDirectResponse("food_lookup", result, message);
+        taskType = "food_lookup"; toolsUsed = ["food_lookup"];
+      } else if (currentItem) {
+        const result = await toolFoodLookup(c.env.DB, currentItem.name);
+        finalResponse = `I see you have **${currentItem.name}** selected. ` + buildDirectResponse("food_lookup", result, message);
+        taskType = "food_lookup"; toolsUsed = ["food_lookup"];
+      } else {
+        finalResponse = `I'm sorry about the confusion! Which food were you asking about? You can click it in the food grid on the left and I'll pick it up automatically.`;
+        taskType = "clarification";
+      }
+    }
+
     // Route 9: Gemini Flash — with PHASE 1 enriched system prompt
     else {
       const geminiKey = c.env.GEMINI_API_KEY ?? "";
@@ -2009,11 +2316,51 @@ Good options for your next meal: ${suggestions}.` : ""}`;
     ).bind(sessionId, JSON.stringify({ message, taskType, tools: toolsUsed }), finalResponse.slice(0, 200)).run();
   } catch { /* non-fatal */ }
 
+  // ── Smart next_actions based on task type + context ───────────────────
+  function buildNextActions(task: string, food: string | null, hasProfile: boolean): string[] {
+    const dietGoal = userFacts.goal || profile?.goal || "";
+    const seasonLabel = agentContext.current_season && agentContext.current_season !== "all"
+      ? SEASON_LABELS[agentContext.current_season] ?? agentContext.current_season : "";
+    if (task === "food_lookup" && food) {
+      return [
+        `Compare ${food} with ${food === "Banana" ? "mango" : "banana"}`,
+        `Should I eat ${food}?`,
+        dietGoal ? `Build a ${dietGoal} plan including ${food}` : `Add ${food} to my diet plan`,
+      ];
+    }
+    if (task === "compare_foods") {
+      return ["Which has more protein?", "Build my diet plan", seasonLabel ? `What should I eat in ${seasonLabel}?` : "What should I eat today?"];
+    }
+    if (task === "build_diet_plan") {
+      return ["Give me a full week plan", "What do you know about me?", seasonLabel ? `Tell me about ${seasonLabel}` : "Tell me about the current season"];
+    }
+    if (task === "analyze_intake") {
+      return ["What should I eat next?", dietGoal ? `How is this for my ${dietGoal} goal?` : "How does this fit my goal?", "Log my dinner too"];
+    }
+    if (task === "get_seasonal_foods" || task === "season_info") {
+      return ["Build me a seasonal diet plan", "What should I avoid this season?", "What do you know about me?"];
+    }
+    if (task === "get_nutrient_rich_foods") {
+      return ["Build me a diet plan", food ? `Tell me more about ${food}` : "Tell me about guava", "What do you know about me?"];
+    }
+    if (task === "bmi") {
+      return ["Build a diet plan for my goal", "What should I eat today?", "Tell me about my nutrition score"];
+    }
+    if (task === "meal_suggestion" || task === "intake_suggestion") {
+      return ["Log this meal", "What's my calorie count today?", "Build my day plan"];
+    }
+    return hasProfile
+      ? ["What should I eat today?", "Build my diet plan", "What do you know about me?"]
+      : ["Tell me about guava", "Build my day plan", "What can you do?"];
+  }
+
+  const smartNextActions = buildNextActions(taskType, currentItem?.name ?? null, !!profile || Object.keys(userFacts).some(k => (userFacts as any)[k]?.length > 0));
+
   return c.json({
     session_id: sessionId, message: finalResponse, task_type: taskType,
     tools_used: toolsUsed, mode: toolsUsed.length > 0 ? "tool-assisted" : "conversational",
     agent_state: "complete", used_profile: !!profile, used_selected_item: !!currentItem,
-    selected_item: currentItem, next_actions: [], cards: [],
+    selected_item: currentItem, next_actions: smartNextActions, cards: [],
     citations: toolsUsed.length > 0 ? ["NutriMentor food database (ICMR-NIN)"] : [],
   });
 });
