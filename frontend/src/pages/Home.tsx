@@ -2,12 +2,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Moon, Sun } from "lucide-react";
 import ChatBox from "../components/chat/ChatBox";
 import FoodGrid from "../components/food/FoodGrid";
+import DashboardPage from "./DashboardPage";
+import MealLogPage from "./MealLogPage";
 import { useItems } from "../hooks/useItems";
+import { useDashboard } from "../hooks/useDashboard";
 import { RITU_INFO } from "../constants/ritu";
 import logo from "../components/layout/logo.png";
 import type { Item } from "../types/item";
 import type { SeasonKey } from "../types/season";
 import { API_BASE_URL } from "../api/config";
+
+const PROFILE_KEY = "nutrimentor-profile-id";
+function getProfileId(): string {
+  let id = localStorage.getItem(PROFILE_KEY);
+  if (!id) { id = crypto.randomUUID().replace(/-/g, ""); localStorage.setItem(PROFILE_KEY, id); }
+  return id;
+}
 
 function getISTGreeting(): string {
   const h = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
@@ -20,12 +30,10 @@ const SEASON_KEY_MAP: Record<SeasonKey, string> = {
   all:"all", spring:"spring", summer:"summer",
   monsoon:"monsoon", autumn:"autumn", prewinter:"prewinter", winter:"winter",
 };
-
 const RITU_KEY_MAP: Record<SeasonKey, keyof typeof RITU_INFO | null> = {
   spring:"vasanta", summer:"grishma", monsoon:"varsha",
   autumn:"sharad", prewinter:"hemanta", winter:"shishira", all:null,
 };
-
 const SEASONS = [
   { key:"all",       icon:"🌐", ritu:"All",      eng:"Year-round" },
   { key:"spring",    icon:"🌸", ritu:"Vasanta",  eng:"Spring"     },
@@ -35,19 +43,17 @@ const SEASONS = [
   { key:"prewinter", icon:"🍃", ritu:"Hemanta",  eng:"Pre-winter" },
   { key:"winter",    icon:"❄️",  ritu:"Shishira", eng:"Winter"     },
 ] as const;
-
 const SEASON_LABELS_UI: Record<string, string> = {
   spring:"Vasanta Ritu (Spring)", summer:"Grishma Ritu (Summer)",
   monsoon:"Varsha Ritu (Monsoon)", autumn:"Sharad Ritu (Autumn)",
   prewinter:"Hemanta Ritu (Pre-winter)", winter:"Shishira Ritu (Winter)",
 };
-
 const NAV = [
-  { id:"foods",     icon:"🥗", tip:"Foods"       },
-  { id:"dashboard", icon:"📊", tip:"Dashboard"   },
-  { id:"ritu",      icon:"🌱", tip:"Ritu Journal" },
-  { id:"log",       icon:"📝", tip:"Meal Log"    },
-  { id:"settings",  icon:"⚙️",  tip:"Settings"    },
+  { id:"foods",     icon:"🥗", tip:"Foods"        },
+  { id:"dashboard", icon:"📊", tip:"Dashboard"    },
+  { id:"ritu",      icon:"🌱", tip:"Ritu Journal"  },
+  { id:"log",       icon:"📝", tip:"Meal Log"     },
+  { id:"settings",  icon:"⚙️",  tip:"Settings"     },
 ] as const;
 
 export const EMOJI: Record<string, string> = {
@@ -55,34 +61,21 @@ export const EMOJI: Record<string, string> = {
   legume:"🫘", nut:"🥜", protein:"🍗", spice:"🌿",
 };
 
-interface MorningInsight {
-  greeting?: string;
-  insights: Array<{ message: string }>;
-}
-
-interface SeasonTransition {
-  changed: boolean;
-  from?: string;
-  to?: string;
-  journal?: {
-    title: string;
-    description: string;
-    eat_more: string;
-    avoid: string;
-    dosha?: string;
-    ayurvedic_note?: string;
-  };
-}
-
-// ── Tab placeholder data ──────────────────────────────────────────────────────
-const TAB_INFO: Record<string, { icon: string; title: string; desc: string; phase: string }> = {
-  dashboard: { icon:"📊", title:"Dashboard",  desc:"Your weekly nutrition score, 7-day charts, and deficiency alerts.", phase:"Phase 3" },
-  ritu:      { icon:"🌱", title:"Ritu Journal",desc:"Deep dives into all 6 Ritu seasons — what to eat, what to avoid, and Ayurvedic wisdom.", phase:"Phase 4" },
-  log:       { icon:"📝", title:"Meal Log",   desc:"View, edit, and delete your logged meals.", phase:"Phase 3" },
-  settings:  { icon:"⚙️",  title:"Settings",   desc:"Profile settings, clear memory, preferences.", phase:"Phase 5" },
+// Phase-3 coming-soon tabs that don't have real pages yet
+const COMING_SOON: Record<string, { icon: string; title: string; desc: string; phase: string }> = {
+  ritu:     { icon:"🌱", title:"Ritu Journal",  desc:"Deep dives into all 6 Ritu seasons — eat, avoid, Ayurvedic wisdom.", phase:"Phase 4" },
+  settings: { icon:"⚙️",  title:"Settings",      desc:"Profile settings, clear memory, preferences.", phase:"Phase 5" },
 };
 
+interface MorningInsight { insights: Array<{ message: string }>; }
+interface SeasonTransition {
+  changed: boolean; from?: string; to?: string;
+  journal?: { title: string; description: string; eat_more: string; avoid: string; dosha?: string; };
+}
+
 export default function Home() {
+  const profileId = useMemo(() => getProfileId(), []);
+
   const [season, setSeason]       = useState<SeasonKey>("all");
   const [selected, setSelected]   = useState<Item | null>(null);
   const [light, setLight]         = useState(false);
@@ -95,49 +88,39 @@ export default function Home() {
 
   const rituKey = RITU_KEY_MAP[season];
   const ritu    = rituKey ? RITU_INFO[rituKey] : null;
-  const { items, loading } = useItems(season);
+  const { items, loading: itemsLoading } = useItems(season);
 
-  // Season theme
-  useEffect(() => {
-    document.documentElement.dataset.season = SEASON_KEY_MAP[season];
-  }, [season]);
+  // Dashboard data — always loaded so the badge is live
+  const { dashboard, todayLog, weekLog, loading: dashLoading, error: dashError, refresh: dashRefresh, deleteMeal } = useDashboard(profileId);
 
-  // Light/dark
-  useEffect(() => {
-    document.documentElement.classList.toggle("light", light);
-  }, [light]);
+  useEffect(() => { document.documentElement.dataset.season = SEASON_KEY_MAP[season]; }, [season]);
+  useEffect(() => { document.documentElement.classList.toggle("light", light); }, [light]);
 
   // Morning insight
   useEffect(() => {
-    const pid = localStorage.getItem("nutrimentor-profile-id");
-    if (!pid) return;
     const today = new Date().toISOString().split("T")[0];
     if (localStorage.getItem(`nm-morning-${today}`)) return;
-    fetch(`${API_BASE_URL}/agent/morning/${pid}`)
+    fetch(`${API_BASE_URL}/agent/morning/${profileId}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.insights?.length) setMorning(d); })
       .catch(() => {});
-  }, []);
+  }, [profileId]);
 
-  // Season transition check
+  // Season transition
   useEffect(() => {
-    const pid = localStorage.getItem("nutrimentor-profile-id");
-    if (!pid) return;
-    const lastShownFrom = localStorage.getItem("nm-season-transition-from");
-    fetch(`${API_BASE_URL}/agent/season-check/${pid}`)
+    const lastFrom = localStorage.getItem("nm-season-transition-from");
+    fetch(`${API_BASE_URL}/agent/season-check/${profileId}`)
       .then(r => r.ok ? r.json() : null)
       .then((d: SeasonTransition | null) => {
-        if (d?.changed && d.from && d.to && lastShownFrom !== d.from)
-          setSeasonTransition(d);
+        if (d?.changed && d.from && d.to && lastFrom !== d.from) setSeasonTransition(d);
       })
       .catch(() => {});
-  }, []);
+  }, [profileId]);
 
   // Close avatar on outside click
   useEffect(() => {
     function handle(e: MouseEvent) {
-      if (avatarRef.current && !avatarRef.current.contains(e.target as Node))
-        setShowAvatar(false);
+      if (avatarRef.current && !avatarRef.current.contains(e.target as Node)) setShowAvatar(false);
     }
     if (showAvatar) document.addEventListener("mousedown", handle);
     return () => document.removeEventListener("mousedown", handle);
@@ -147,14 +130,13 @@ export default function Home() {
     setMorning(null);
     localStorage.setItem(`nm-morning-${new Date().toISOString().split("T")[0]}`, "1");
   }
-
   function dismissSeasonTransition() {
     if (seasonTransition?.from) localStorage.setItem("nm-season-transition-from", seasonTransition.from);
     setSeasonTransition(null);
   }
-
   function handleAskAgent(prompt: string) {
     setPendingMsg(prompt);
+    // Also switch to foods view so the user sees the chat response
   }
 
   const heroChips = useMemo(() => [
@@ -165,13 +147,12 @@ export default function Home() {
 
   const getSeasonIcon = (s: string) => SEASONS.find(x => x.key === s)?.icon ?? "🌿";
 
-  // ── Centre content: which panel to show ─────────────────────────────────────
+  // ── Centre content ───────────────────────────────────────────────────────────
   function renderCentre() {
-    // Foods tab
+    // ── FOODS ──
     if (activeTab === "foods") {
       return (
         <>
-          {/* Season pills */}
           <div className="nm-season-bar" role="navigation" aria-label="Season filter">
             {SEASONS.map(s => (
               <button key={s.key} type="button"
@@ -184,23 +165,17 @@ export default function Home() {
               </button>
             ))}
           </div>
-
           <div className="nm-centre-body">
             {/* Season transition banner */}
             {seasonTransition?.changed && seasonTransition.journal && (
               <div className="nm-season-transition" role="alert">
-                <span className="nm-season-transition-icon" aria-hidden="true">
-                  {getSeasonIcon(seasonTransition.to ?? "")}
-                </span>
+                <span className="nm-season-transition-icon">{getSeasonIcon(seasonTransition.to ?? "")}</span>
                 <div className="nm-season-transition-body">
                   <div className="nm-season-transition-label">Season change</div>
                   <div className="nm-season-transition-title">
                     Welcome to {SEASON_LABELS_UI[seasonTransition.to ?? ""] ?? seasonTransition.journal.title}!
                   </div>
-                  <div className="nm-season-transition-desc">
-                    {seasonTransition.journal.description}
-                    {seasonTransition.journal.dosha && <> Governed by the <strong>{seasonTransition.journal.dosha}</strong> dosha.</>}
-                  </div>
+                  <div className="nm-season-transition-desc">{seasonTransition.journal.description}</div>
                   <div className="nm-season-transition-chips">
                     <button type="button" className="nm-season-transition-chip"
                       onClick={() => { handleAskAgent(`What should I eat in ${SEASON_LABELS_UI[seasonTransition.to ?? ""] ?? "this season"}?`); dismissSeasonTransition(); }}>
@@ -212,46 +187,62 @@ export default function Home() {
                     </button>
                   </div>
                 </div>
-                <button type="button" className="nm-season-transition-close"
-                  onClick={dismissSeasonTransition} aria-label="Dismiss">×</button>
+                <button type="button" className="nm-season-transition-close" onClick={dismissSeasonTransition}>×</button>
               </div>
             )}
 
-            {/* Season hero */}
+            {/* Hero */}
             <div className="nm-hero" role="banner">
-              <span className="nm-hero-icon" aria-hidden="true">
-                {SEASONS.find(s => s.key === season)?.icon ?? "🌐"}
-              </span>
+              <span className="nm-hero-icon">{SEASONS.find(s => s.key === season)?.icon ?? "🌐"}</span>
               <div style={{ flex:1, minWidth:0 }}>
                 <div className="nm-hero-label">{season === "all" ? "Year-round" : "Current season"}</div>
-                <div className="nm-hero-title">
-                  {ritu ? `${ritu.label} · ${ritu.english}` : "All Seasons"}
-                </div>
+                <div className="nm-hero-title">{ritu ? `${ritu.label} · ${ritu.english}` : "All Seasons"}</div>
                 {ritu && <div className="nm-hero-desc">{ritu.description}</div>}
                 <div className="nm-hero-chips">
                   {heroChips.map(c => (
-                    <button key={c} type="button" className="nm-hero-chip" onClick={() => handleAskAgent(c)}>
-                      {c}
-                    </button>
+                    <button key={c} type="button" className="nm-hero-chip" onClick={() => handleAskAgent(c)}>{c}</button>
                   ))}
                 </div>
               </div>
             </div>
 
-            {/* Food grid */}
-            <FoodGrid
-              items={items} loading={loading} season={season}
-              selected={selected}
-              onSelect={item => setSelected(item)}
-              onAskAgent={handleAskAgent}
-            />
+            <FoodGrid items={items} loading={itemsLoading} season={season}
+              selected={selected} onSelect={i => setSelected(i)} onAskAgent={handleAskAgent} />
           </div>
         </>
       );
     }
 
-    // Coming-soon tabs: dashboard, ritu, log, settings
-    const info = TAB_INFO[activeTab];
+    // ── DASHBOARD (Phase 3 — live) ──
+    if (activeTab === "dashboard") {
+      return (
+        <DashboardPage
+          data={dashboard}
+          loading={dashLoading}
+          error={dashError}
+          onRefresh={dashRefresh}
+          onAskAgent={handleAskAgent}
+        />
+      );
+    }
+
+    // ── MEAL LOG (Phase 3 — live) ──
+    if (activeTab === "log") {
+      return (
+        <MealLogPage
+          todayLog={todayLog}
+          weekLog={weekLog}
+          loading={dashLoading}
+          error={dashError}
+          onDelete={deleteMeal}
+          onRefresh={dashRefresh}
+          onAskAgent={handleAskAgent}
+        />
+      );
+    }
+
+    // ── COMING SOON (ritu, settings) ──
+    const info = COMING_SOON[activeTab];
     if (!info) return null;
     return (
       <div className="nm-centre-body" style={{ alignItems:"center", justifyContent:"center", textAlign:"center" }}>
@@ -259,15 +250,10 @@ export default function Home() {
           <div style={{ fontSize:56, lineHeight:1 }}>{info.icon}</div>
           <div style={{ fontSize:20, fontWeight:700, color:"var(--text-1)" }}>{info.title}</div>
           <div style={{ fontSize:13, color:"var(--text-2)", lineHeight:1.7 }}>{info.desc}</div>
-          <div style={{
-            fontSize:11, fontWeight:600, letterSpacing:".1em", textTransform:"uppercase",
-            color:"var(--accent)", background:"var(--accent-bg)", border:"1px solid var(--accent-border)",
-            borderRadius:"var(--r-pill)", padding:"4px 14px",
-          }}>
+          <div style={{ fontSize:11, fontWeight:600, letterSpacing:".1em", textTransform:"uppercase", color:"var(--accent)", background:"var(--accent-bg)", border:"1px solid var(--accent-border)", borderRadius:"var(--r-pill)", padding:"4px 14px" }}>
             Coming in {info.phase}
           </div>
-          <button type="button" className="nm-hero-chip" style={{ marginTop:8 }}
-            onClick={() => setActiveTab("foods")}>
+          <button type="button" className="nm-hero-chip" style={{ marginTop:8 }} onClick={() => setActiveTab("foods")}>
             ← Back to Foods
           </button>
         </div>
@@ -275,23 +261,37 @@ export default function Home() {
     );
   }
 
+  // ── Dashboard badge — show score if available ──────────────────────────────
+  const dashScore = dashboard?.has_data ? dashboard.score : null;
+
   return (
     <div className="nm-app">
 
-      {/* ── Sidebar ── */}
+      {/* Sidebar */}
       <aside className="nm-sidebar" aria-label="Navigation">
         <div className="nm-sidebar-logo">
           <img src={logo} alt="NutriMentor AI" />
         </div>
 
         {NAV.map(n => (
-          <button key={n.id} type="button"
-            className={`nm-nav-btn${activeTab === n.id ? " active" : ""}`}
-            data-tip={n.tip}
-            onClick={() => setActiveTab(n.id)}
-            aria-label={n.tip}>
-            <span aria-hidden="true">{n.icon}</span>
-          </button>
+          <div key={n.id} style={{ position:"relative" }}>
+            <button type="button"
+              className={`nm-nav-btn${activeTab === n.id ? " active" : ""}`}
+              data-tip={n.tip} onClick={() => setActiveTab(n.id)} aria-label={n.tip}>
+              <span aria-hidden="true">{n.icon}</span>
+            </button>
+            {/* Live score badge on dashboard icon */}
+            {n.id === "dashboard" && dashScore !== null && (
+              <div style={{
+                position:"absolute", top:4, right:4, fontSize:8, fontWeight:800,
+                background: dashScore >= 70 ? "#4ade80" : dashScore >= 40 ? "#f59e0b" : "#f87171",
+                color: dashScore >= 70 ? "#052e16" : "#1a0a00",
+                borderRadius:10, padding:"1px 4px", lineHeight:1.4, pointerEvents:"none",
+              }}>
+                {dashScore}
+              </div>
+            )}
+          </div>
         ))}
 
         <div className="nm-sidebar-spacer" />
@@ -302,19 +302,16 @@ export default function Home() {
         </button>
 
         <div ref={avatarRef} style={{ position:"relative" }}>
-          <div className="nm-sidebar-avatar"
-            onClick={() => setShowAvatar(v => !v)}
+          <div className="nm-sidebar-avatar" onClick={() => setShowAvatar(v => !v)}
             role="button" tabIndex={0} aria-label="Profile"
-            onKeyDown={e => e.key === "Enter" && setShowAvatar(v => !v)}>
-            P
-          </div>
+            onKeyDown={e => e.key === "Enter" && setShowAvatar(v => !v)}>P</div>
           {showAvatar && (
             <div className="nm-avatar-menu" role="menu">
               <div style={{ padding:"6px 10px 4px", fontSize:"10px", color:"var(--text-3)", fontWeight:600, letterSpacing:".06em", textTransform:"uppercase" }}>
                 Pratyaksh Agrawal
               </div>
               <div className="nm-avatar-divider" />
-              <a href="https://www.linkedin.com/in/pratyaksh-agrawal-59b82928a/" target="_blank"
+              <a href="https://www.linkedin.com/in/pratyaksh-agrawal/" target="_blank"
                 rel="noopener noreferrer" className="nm-avatar-link" role="menuitem">
                 <span aria-hidden="true">🔗</span> LinkedIn
               </a>
@@ -326,33 +323,30 @@ export default function Home() {
                 rel="noopener noreferrer" className="nm-avatar-link" role="menuitem">
                 <span aria-hidden="true">🌐</span> Portfolio
               </a>
-              </div>
+            </div>
           )}
         </div>
       </aside>
 
-      {/* ── Centre column — always column 2, shows whichever tab is active ── */}
+      {/* Centre column — always column 2 */}
       <main className="nm-centre" aria-label={activeTab}>
         {renderCentre()}
       </main>
 
-      {/* ── Right: Chat — always column 3, never moves ── */}
+      {/* Chat — always column 3 */}
       <div className="nm-chat" aria-label="AI Agent">
-        {/* Morning insight banner */}
         {morning && (
           <div className="nm-banner" role="alert">
-            <span className="nm-banner-icon" aria-hidden="true">🌅</span>
+            <span className="nm-banner-icon">🌅</span>
             <div className="nm-banner-content">
               <div className="nm-banner-title">{getISTGreeting()} · Nutrition insight</div>
               {morning.insights.slice(0,1).map((ins,i) => (
                 <div key={i} className="nm-banner-body">{ins.message}</div>
               ))}
             </div>
-            <button type="button" className="nm-banner-close"
-              onClick={dismissMorning} aria-label="Dismiss">×</button>
+            <button type="button" className="nm-banner-close" onClick={dismissMorning}>×</button>
           </div>
         )}
-
         <ChatBox
           selectedItem={selected}
           season={season}
@@ -362,19 +356,17 @@ export default function Home() {
         />
       </div>
 
-      {/* ── Mobile tab bar ── */}
-      <nav className="nm-tabbar" role="navigation" aria-label="Main navigation"
-        style={{ gridColumn:"1/-1" }}>
+      {/* Mobile tab bar */}
+      <nav className="nm-tabbar" role="navigation" style={{ gridColumn:"1/-1" }}>
         {[
           { id:"foods", icon:"🥗", label:"Foods" },
-          { id:"agent", icon:"💬", label:"Agent"  },
-          { id:"log",   icon:"📝", label:"Log"    },
+          { id:"agent", icon:"💬", label:"Agent" },
+          { id:"log",   icon:"📝", label:"Log"   },
         ].map(t => (
           <button key={t.id} type="button"
             className={`nm-tab${activeTab === t.id ? " active" : ""}`}
-            onClick={() => setActiveTab(t.id)}
-            aria-label={t.label}>
-            <span className="nm-tab-icon" aria-hidden="true">{t.icon}</span>
+            onClick={() => setActiveTab(t.id)} aria-label={t.label}>
+            <span className="nm-tab-icon">{t.icon}</span>
             <span className="nm-tab-label">{t.label}</span>
           </button>
         ))}

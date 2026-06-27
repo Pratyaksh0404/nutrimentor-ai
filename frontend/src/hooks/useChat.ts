@@ -52,9 +52,14 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
 
   const profileId = useMemo(() => getOrCreateProfileId(), []);
 
+  const LAST_SESSION_KEY = "nm-last-session";
+
   function updateSessionId(id: string | null) {
     sessionIdRef.current = id;
     setSessionId(id);
+    // Persist so the current chat survives a page refresh
+    if (id) window.localStorage.setItem(LAST_SESSION_KEY, id);
+    else window.localStorage.removeItem(LAST_SESSION_KEY);
   }
 
   const refreshSessions = useCallback(async () => {
@@ -65,6 +70,31 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
   }, [profileId]);
 
   useEffect(() => { refreshSessions(); }, [refreshSessions]);
+
+  // Auto-restore the last active session on page refresh
+  useEffect(() => {
+    const lastSid = window.localStorage.getItem("nm-last-session");
+    if (!lastSid) return;
+    // Set the session ID immediately so the header shows it
+    // Then fetch the full message history
+    sessionIdRef.current = lastSid;
+    setSessionId(lastSid);
+    getAgentSession(lastSid, profileId)
+      .then(session => {
+        if (!session.messages?.length) return;
+        setMessages(session.messages.map((m: { role: string; content: string }, i: number) => ({
+          id: `hist-${i}-${m.role}`,
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        })));
+        loadedSessionRef.current = lastSid;
+      })
+      .catch(() => {
+        // Session gone (expired/deleted) — clear the stale key
+        window.localStorage.removeItem("nm-last-session");
+      });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // runs once on mount only
 
   useEffect(() => {
     const currentId = selectedItem?.id ?? null;
@@ -77,7 +107,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         name: selectedItem.name,
         season: selectedItem.season,
       })
-        .then((r) => { if (r.session_id !== sid) updateSessionId(r.session_id); })
+        .then((r: { session_id: string }) => { if (r.session_id !== sid) updateSessionId(r.session_id); })
         .catch(() => undefined);
     } else if (sid) {
       clearAgentContext(sid).catch(() => undefined);
@@ -122,6 +152,8 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
         content: response.message,
         cards: response.cards,
         nextActions: response.next_actions,
+        planData: response.plan_data ?? null,
+        wantsPdf: response.wants_pdf ?? false,
         metadata: {
           mode: response.mode,
           taskType: response.task_type,
@@ -150,12 +182,12 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
 
   const continueSession = useCallback(async (sid: string) => {
     try {
-      const session = await getAgentSession(sid);
+      const session = await getAgentSession(sid, profileId);
       updateSessionId(sid);
       loadedSessionRef.current = sid;
-      setMessages(session.messages?.map((m, i) => ({
+      setMessages(session.messages?.map((m: { role: string; content: string }, i: number) => ({
         id: `hist-${i}-${m.role}`,
-        role: m.role,
+        role: m.role as "user" | "assistant",
         content: m.content,
       })) ?? []);
     } catch (err) {
@@ -173,7 +205,7 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
 
   const startNewChat = useCallback(() => {
     setMessages([]);
-    updateSessionId(null);
+    updateSessionId(null); // also clears nm-last-session from localStorage
     loadedSessionRef.current = null;
     prevSelectedItemId.current = null;
   }, []);

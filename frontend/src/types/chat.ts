@@ -50,6 +50,8 @@ export interface AgentResponse {
   cards: AgentCard[];
   next_actions: string[];
   selected_item?: AgentContextItem | null;
+  plan_data?: any | null;    // structured 7-day plan for PDF generation
+  wants_pdf?: boolean;       // true when user explicitly asked for PDF
 }
 
 export interface AgentMessageType {
@@ -58,6 +60,8 @@ export interface AgentMessageType {
   content: string;
   cards?: AgentCard[];
   nextActions?: string[];
+  planData?: any | null;     // diet plan data for PDF download
+  wantsPdf?: boolean;        // show PDF download button
   metadata?: {
     mode?: AgentMode;
     taskType?: string;

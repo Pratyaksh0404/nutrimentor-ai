@@ -54,7 +54,8 @@ export async function getAgentSessions(
   return response.data;
 }
 
-export async function getAgentSession(sessionId: string): Promise<AgentSessionDetail> {
-  const response = await apiClient.get(`/agent/sessions/${sessionId}`);
+export async function getAgentSession(sessionId: string, profileId?: string | null): Promise<AgentSessionDetail> {
+  const params = profileId ? { profile_id: profileId } : {};
+  const response = await apiClient.get(`/agent/sessions/${sessionId}`, { params });
   return response.data;
 }

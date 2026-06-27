@@ -79,6 +79,84 @@ function computeTdee(profile: Profile): number | null {
   return Math.round(bmr * (m[activity_level ?? "moderate"] ?? 1.55));
 }
 
+// ── Master food alias / typo map — single source of truth ───────────────────
+// Applied in extractAndStoreFacts (DB writes) AND in message routing.
+// Adding a variant here fixes it everywhere automatically.
+const MASTER_FOOD_ALIAS: Record<string, string> = {
+  // Dairy
+  "panner":"paneer","panneer":"paneer","paner":"paneer","panir":"paneer","panear":"paneer",
+  "dahi":"curd","doodh":"milk","dudh":"milk",
+  // Legumes
+  "soyabean":"soybean","soya bean":"soybean","soya":"soybean","soy":"soybean",
+  "rajmah":"rajma","chana":"chickpeas","chane":"chickpeas","chole":"chickpeas",
+  "choley":"chickpeas","chhole":"chickpeas","chholey":"chickpeas",
+  "moong":"moong dal","mung":"moong dal","mung dal":"moong dal",
+  "masoor dal":"lentils","masoor":"lentils","masur":"lentils","dal":"lentils","daal":"lentils",
+  // Grains
+  "roti":"wheat","chapati":"wheat","chapatti":"wheat","chapaati":"wheat",
+  "brownrice":"brown rice","basmati":"brown rice","rice":"brown rice",
+  "bajri":"bajra","baajra":"bajra","bajre":"bajra","bajre ki roti":"bajra",
+  "jwaar":"jowar","jwar":"jowar",
+  "makka":"corn","daliya":"oats",
+  // Vegetables
+  "palak":"spinach","paalak":"spinach",
+  "karela":"bitter gourd","bittergourd":"bitter gourd",
+  "lauki":"bottle gourd","ghiya":"bottle gourd","loki":"bottle gourd","bottlegourd":"bottle gourd",
+  "turai":"ridge gourd","tori":"ridge gourd","torai":"ridge gourd",
+  "brinjal":"eggplant","baingan":"eggplant",
+  "methi":"fenugreek leaves",
+  "sarson":"mustard greens","sarso":"mustard greens",
+  "shimla mirch":"bell pepper","capsicum":"bell pepper","shimlamirch":"bell pepper",
+  "gajar":"carrot","tamatar":"tomato","broccolli":"broccoli",
+  "kheera":"cucumber","kheere":"cucumber",
+  "pyaaz":"onion","pyaj":"onion","pyaaj":"onion","pyaz":"onion",
+  "kaddu":"pumpkin","shakarkand":"sweet potato",
+  "aalu":"potato","aalo":"potato","aaloo":"potato","aloo":"potato",
+  "gobhi":"cauliflower","gobi":"cauliflower","patta gobhi":"cabbage","patta gobi":"cabbage",
+  "matar":"green peas","greenpeas":"green peas","chukandar":"beetroot",
+  // Fruits
+  "amrud":"guava","amrood":"guava",
+  "kela":"banana","seb":"apple",
+  "aam":"mango",
+  "tarbooz":"watermelon","tarbooj":"watermelon",
+  "papita":"papaya",
+  "anaar":"pomegranate","angoor":"grape",
+  "nashpati":"pear","naashpati":"pear",
+  "jaamun":"jamun","jaamoon":"jamun",
+  "lychee":"litchi","lichee":"litchi",
+  "avla":"amla",
+  "khajoor":"dates",
+  "aadu":"peach",
+  "ananas":"pineapple","annanas":"pineapple",
+  "alubukhara":"plum","aalubukhara":"plum",
+  "santra":"orange","kinnow":"orange","kinoo":"orange","kinnoo":"orange",
+  // Nuts
+  "badam":"almonds","badaam":"almonds",
+  "akhrot":"walnuts",
+  "moongfali":"peanuts",
+  "kaju":"cashews",
+  "til":"sesame seeds","sesame":"sesame seeds",
+  // Protein
+  "chicken":"chicken breast","murgi":"chicken breast","hen":"chicken breast","meat":"chicken breast",
+  "fish":"salmon","machli":"salmon",
+  "ande":"egg","andey":"egg",
+};
+
+// Apply alias map to a string — normalises all known variants to canonical names.
+// Handles multi-word aliases by checking longest match first.
+function applyFoodAlias(text: string): string {
+  let result = text.toLowerCase().trim();
+  // Sort by length descending so longer aliases (e.g. "soya bean") match before shorter ("soya")
+  const sorted = Object.entries(MASTER_FOOD_ALIAS).sort((a, b) => b[0].length - a[0].length);
+  for (const [alias, canonical] of sorted) {
+    // Word-boundary replacement
+    const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    result = result.replace(new RegExp(`(?<![a-z])${escaped}(?![a-z])`, "g"), canonical);
+  }
+  return result;
+}
+
+
 // ── PHASE 1: Fact extraction — learns from conversation ──────────────────────
 // Deterministic pattern matching — no AI needed for this.
 // All learned facts stored in user_facts table.
@@ -93,13 +171,14 @@ async function extractAndStoreFacts(
   // Wrap all fact storage in try/catch — a DB error must never crash the agent response
 
   // ── Dislikes ──
+  // Dislike patterns — same clause-stop approach, max 30 chars
   const dislikePatterns: Array<[RegExp, number]> = [
-    [/i (?:don't|do not|hate|dislike|avoid)(?: (?:eating|having|drinking|consuming|to eat|to drink|to have|to consume))? ([a-z][a-z\s]{1,35}?)(?:\s*[.,!]|$)/, 1],
-    [/([a-z][a-z\s]{1,35}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/, 1],
-    [/not a fan of ([a-z][a-z\s]{1,35}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:can't|cannot) (?:eat|stand|have|drink|consume) ([a-z][a-z\s]{1,35}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:don't|do not) like (?:to )?(?:eat|drink|have|consume) ([a-z][a-z\s]{1,35}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:don't|do not) like ([a-z][a-z\s]{1,35}?)(?:\s*[.,!]|$)/, 1],
+    [/i (?:don't|do not|hate|dislike|avoid)(?: (?:eating|having|drinking|consuming|to eat|to drink|to have|to consume))? ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|\s+(?:now|but|please)|$)/, 1],
+    [/([a-z][a-z\s]{1,30}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/, 1],
+    [/not a fan of ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
+    [/i (?:can't|cannot) (?:eat|stand|have|drink|consume) ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
+    [/i (?:don't|do not) like (?:to )?(?:eat|drink|have|consume) ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
+    [/i (?:don't|do not) like ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|\s+(?:now|but|please)|$)/, 1],
   ];
   for (const [pattern, group] of dislikePatterns) {
     const match = m.match(pattern);
@@ -115,14 +194,8 @@ async function extractAndStoreFacts(
       for (const foodName of foodCandidates) {
         const firstWord = foodName.split(" ")[0];
         if (stopWords.includes(firstWord)) continue;
-        // Normalize common spelling variants before storing
-        const SPELLING_MAP: Record<string, string> = {
-          "soyabean": "soybean", "soya bean": "soybean", "soya": "soybean",
-          "chilli": "chili", "chillies": "chili",
-          "brinjal": "eggplant", "karela": "bitter gourd",
-          "aloo": "potato", "palak": "spinach", "pyaz": "onion",
-        };
-        const normalizedName = SPELLING_MAP[foodName.toLowerCase()] || foodName;
+        // Normalise using the master alias map — covers all variants
+        const normalizedName = applyFoodAlias(foodName);
         await db.prepare(
           `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
            VALUES (?1, 'dislike', ?2, 'true', 'conversation', datetime('now'))
@@ -135,10 +208,13 @@ async function extractAndStoreFacts(
   }
 
   // ── Likes ──
+  // Like patterns — stop at clause boundaries to avoid capturing full sentence
+  // e.g. "i like soybean now, remove it from dislikes" → captures only "soybean"
+  const CLAUSE_STOP = "(?:\\s*[,!.]|\\s+(?:now|but|and also|however|though|please|,)|$)";
   const likePatterns: Array<[RegExp, number]> = [
-    [/i (?:love|enjoy|prefer|adore)(?: eating)? ([a-z][a-z\s,]{1,60}?)(?:\s*[.!]|$)/, 1],
-    [/i like ([a-z][a-z\s,]{1,60}?)(?:\s*[.!]|$)/, 1],
-    [/([a-z][a-z\s]{1,35}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/, 1],
+    [new RegExp(`i (?:love|enjoy|prefer|adore)(?: eating)? ([a-z][a-z\\s]{1,30}?)${CLAUSE_STOP}`), 1],
+    [new RegExp(`i like ([a-z][a-z\\s]{1,30}?)${CLAUSE_STOP}`), 1],
+    [/([a-z][a-z\s]{1,30}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/, 1],
   ];
   // Only run likes patterns if message does NOT contain negation near "like"
   const hasNegationBeforeLike = /(?:don't|do not|can't|cannot|never)\s+(?:like|enjoy|eat|have)/i.test(m);
@@ -157,13 +233,15 @@ async function extractAndStoreFacts(
         const firstWord = foodName.split(" ")[0];
         if (stopWords.includes(firstWord)) continue;
         if (foodName.length > 1 && foodName.length < 40) {
+          // Normalise before storing — "panner" → "paneer" so no duplicates
+          const normLike = applyFoodAlias(foodName);
           await db.prepare(
             `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
              VALUES (?1, 'preference', ?2, 'like', 'conversation', datetime('now'))
              ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
              fact_value='like', updated_at=datetime('now')`
-          ).bind(profileId, foodName).run();
-          stored.push(`like:${foodName}`);
+          ).bind(profileId, normLike).run();
+          stored.push(`like:${normLike}`);
         }
       }
     }
@@ -339,20 +417,118 @@ function detectMealSlot(message: string): string {
   return "meal";
 }
 
+// ── Quantity / serving-size parser ───────────────────────────────────────────
+// Converts "3 eggs", "2 glass milk", "1 bowl rice", "100g paneer" → grams
+const UNIT_TO_G: Record<string, number> = {
+  // weight
+  "g": 1, "gram": 1, "grams": 1,
+  "kg": 1000, "kilogram": 1000,
+  // volume (ml ≈ g for liquids)
+  "ml": 1, "milliliter": 1,
+  "l": 1000, "litre": 1000, "liter": 1000,
+  // common servings
+  "glass": 240, "glasses": 240,
+  "cup": 240, "cups": 240,
+  "bowl": 150, "bowls": 150,
+  "plate": 200, "plates": 200,
+  "tablespoon": 15, "tbsp": 15,
+  "teaspoon": 5, "tsp": 5,
+  "handful": 30, "handfuls": 30,
+  "piece": 100, "pieces": 100,
+  "slice": 30, "slices": 30,
+  "roti": 30, "rotis": 30,
+  "chapati": 30, "chapatis": 30,
+};
+
+// Per-food default unit weights (when no unit specified, e.g. "3 eggs")
+const FOOD_UNIT_G: Record<string, number> = {
+  "egg": 55, "eggs": 55,
+  "banana": 120, "bananas": 120,
+  "apple": 180, "apples": 180,
+  "mango": 200, "mangoes": 200,
+  "orange": 150, "oranges": 150,
+  "guava": 100, "guavas": 100,
+  "date": 10, "dates": 10,
+  "litchi": 15, "lychee": 15,
+  "almond": 1, "almonds": 1,
+  "walnut": 5, "walnuts": 5,
+  "cashew": 3, "cashews": 3,
+  "roti": 30, "chapati": 30,
+};
+
+function parseAmountG(quantityWord: string, unit: string, foodName: string): number {
+  const qty = parseFloat(quantityWord) || 1;
+  const unitLower = unit.toLowerCase().trim();
+  // Check explicit unit
+  if (UNIT_TO_G[unitLower]) return Math.round(qty * UNIT_TO_G[unitLower]);
+  // No unit — check food-specific default
+  const foodKey = foodName.toLowerCase().trim();
+  for (const [key, grams] of Object.entries(FOOD_UNIT_G)) {
+    if (foodKey.includes(key)) return Math.round(qty * grams);
+  }
+  // Default: assume 100g per item
+  return Math.round(qty * 100);
+}
+
+// Extract food names WITH quantities from a message
+// e.g. "3 eggs and 2 glass milk" → [{ name:"egg", amount_g:165 }, { name:"milk", amount_g:480 }]
+async function extractFoodsWithAmounts(
+  message: string,
+  db: D1Database
+): Promise<Array<{ name: string; amount_g: number }>> {
+  const m = message.toLowerCase();
+
+  // Pattern: (number)? (unit)? (food_name)
+  // Match things like: "3 eggs", "2 glass milk", "100g paneer", "a bowl of rice", "some banana"
+  // We extract all food items first using the existing extractor, then scan for their quantities
+  const rawFoods = await extractFoodsFromText(m, db);
+  const result: Array<{ name: string; amount_g: number }> = [];
+
+  for (const foodName of rawFoods) {
+    // Search in original message for a quantity near this food name
+    // Patterns: "3 eggs", "2 glass of milk", "100g paneer", "a handful of almonds"
+    const escaped = foodName.replace(/[.*+?^${}()|[\]\\]/g, "\$&");
+    const patterns = [
+      // "100g paneer" or "100 g paneer"
+      new RegExp(`(\d+(?:\.\d+)?)\s*(g|kg|ml|l|gram|grams)\s+(?:of\s+)?${escaped}`),
+      // "3 glass milk" or "2 glasses of milk"
+      new RegExp(`(\d+(?:\.\d+)?)\s+(${Object.keys(UNIT_TO_G).join("|")})\s+(?:of\s+)?${escaped}`),
+      // "3 eggs" (number directly before food)
+      new RegExp(`(\d+(?:\.\d+)?)\s+(?:of\s+)?${escaped}`),
+      // food name followed by "100g" etc. (rare)
+      new RegExp(`${escaped}\s+(\d+(?:\.\d+)?)\s*(g|kg|ml|l|gram)`),
+    ];
+
+    let amount_g = 100; // default
+    for (const pat of patterns) {
+      const match = m.match(pat);
+      if (match) {
+        const qty = match[1];
+        // Determine unit from match — check if match[2] exists and is a unit
+        const unitCandidate = match[2] ?? "";
+        amount_g = parseAmountG(qty, unitCandidate, foodName);
+        break;
+      }
+    }
+    result.push({ name: foodName, amount_g });
+  }
+  return result;
+}
+
 async function logMealFromMessage(
   message: string,
   profileId: string,
   db: D1Database
 ): Promise<{ logged: string[]; notFound: string[] }> {
-  const foods = await extractFoodsFromText(message.toLowerCase(), db);
-  if (foods.length === 0) return { logged: [], notFound: [] };
+  const foodsWithAmounts = await extractFoodsWithAmounts(message, db);
+  if (foodsWithAmounts.length === 0) return { logged: [], notFound: [] };
 
   const mealSlot = detectMealSlot(message);
   const today = new Date().toISOString().split("T")[0];
   const logged: string[] = [];
   const notFound: string[] = [];
 
-  for (const foodName of foods) {
+  for (const { name: foodName, amount_g } of foodsWithAmounts) {
     const item = await db.prepare(
       `SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`
     ).bind(`%${foodName}%`).first<any>();
@@ -360,8 +536,8 @@ async function logMealFromMessage(
     if (item) {
       await db.prepare(
         `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-         VALUES (NULL, ?1, ?2, ?3, 100, ?4, datetime('now'))`
-      ).bind(profileId, today, item.id, mealSlot).run();
+         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+      ).bind(profileId, today, item.id, amount_g, mealSlot).run();
       logged.push(foodName);
     } else {
       notFound.push(foodName);
@@ -498,128 +674,253 @@ async function toolGetNutrientRichFoods(db: D1Database, nutrient: string, season
 }
 
 // PHASE 1 ENHANCED: Diet plan now respects dislikes from user_facts
+// ── Diet plan helpers — module level (NOT inside async functions) ─────────────
+// Cloudflare Workers V8 strict mode: function declarations inside async
+// functions are unreliable. All helpers live at module scope.
+
+function dietRng<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function dietSeq(arr: string[], n: number): string[] {
+  if (!arr.length) return Array(n).fill("seasonal food");
+  const out: string[] = [];
+  let sh = dietRng(arr);
+  let i = 0;
+  while (out.length < n) {
+    out.push(sh[i % sh.length]);
+    i++;
+    if (i % sh.length === 0) sh = dietRng(arr);
+  }
+  return out;
+}
+
+function dietPickSeq(
+  s: string[], d: number, usedToday: Set<string>, fallback: string[]
+): string {
+  const first = s[d];
+  if (!usedToday.has(first)) { usedToday.add(first); return first; }
+  for (const name of dietRng([...fallback])) {
+    if (!usedToday.has(name)) { usedToday.add(name); return name; }
+  }
+  usedToday.add(first);
+  return first;
+}
+
+async function dietFetchCat(
+  db: D1Database,
+  cat: string,
+  seasonForSQL: string,
+  dislikeClause: string,
+  dislikedFuzzy: string[]
+): Promise<string[]> {
+  const q = `SELECT name FROM items
+     WHERE category = '${cat}'
+     ${dislikeClause}
+     ORDER BY
+       CASE season
+         WHEN '${seasonForSQL}' THEN 0
+         WHEN 'all'             THEN 1
+         ELSE                       2
+       END,
+       RANDOM()
+     LIMIT 30`;
+  const rows = dislikedFuzzy.length > 0
+    ? await db.prepare(q).bind(...dislikedFuzzy).all()
+    : await db.prepare(q).all();
+  return (rows.results as any[]).map((r: any) => r.name as string);
+}
+
+
 async function toolBuildDietPlan(
   db: D1Database,
   profile: Profile | null,
   season: string,
   goal?: string,
   days = 1,
-  dislikedFoods: string[] = []   // ← Phase 1: excluded foods
+  dislikedFoods: string[] = []
 ) {
   const effectiveGoal = goal || profile?.goal || "balanced";
-  const tdee = profile ? computeTdee(profile) : null;
-  const isVeg = profile?.dietary_preference === "vegetarian"
-    || profile?.dietary_preference === "vegan";
+  const isVeg  = profile?.dietary_preference === "vegetarian"
+               || profile?.dietary_preference === "vegan";
+  const isMale   = (profile?.sex ?? "").toLowerCase() === "male";
+  const weightKg = profile?.weight_kg ?? (isMale ? 70 : 60);
+  const heightCm = profile?.height_cm ?? (isMale ? 170 : 160);
+  const age      = profile?.age       ?? 25;
 
-  let targetCal = tdee ?? 2000;
-  if (effectiveGoal.includes("gain") || effectiveGoal.includes("increase")) targetCal += 400;
-  else if (effectiveGoal.includes("lose") || effectiveGoal.includes("weight loss")) targetCal -= 400;
-
-  // Exclude disliked foods using LIKE for fuzzy name matching
-  // Normalize spelling variants AND expand to catch all forms in the DB
-  const PLAN_SPELLING_MAP: Record<string, string> = {
-    "soyabean": "soybean", "soya bean": "soybean", "soya": "soybean",
-    "brinjal": "eggplant", "karela": "bitter gourd", "palak": "spinach",
+  // Mifflin-St Jeor BMR → TDEE
+  const bmr = isMale
+    ? 10 * weightKg + 6.25 * heightCm - 5 * age + 5
+    : 10 * weightKg + 6.25 * heightCm - 5 * age - 161;
+  const actMult: Record<string, number> = {
+    sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, very_active: 1.9,
   };
-  // Normalize + deduplicate dislikes, then expand each to catch DB name variants
-  const rawDislikes = dislikedFoods.map(d => d.toLowerCase().trim());
-  const normalizedDislikes = [...new Set(rawDislikes.map(d => PLAN_SPELLING_MAP[d] || d))];
-  // Add both original and normalized forms so '%soyabean%' and '%soybean%' both filter
-  const allDislikeForms = [...new Set([...rawDislikes, ...normalizedDislikes])];
-  const dislikedLower = allDislikeForms;
+  const tdee = Math.round(bmr * (actMult[profile?.activity_level ?? "sedentary"] ?? 1.2));
 
-  // Build NOT LIKE conditions — each dislike gets its own ?N param
-  // Produce: ?1=season, ?2..=dislikes
-  const produceNotLike = dislikedLower.length > 0
-    ? dislikedLower.map((_, i) => `LOWER(i.name) NOT LIKE ?${i + 2}`).join(" AND ")
+  let targetCal = tdee;
+  if (effectiveGoal.includes("lose") || effectiveGoal.includes("weight loss"))
+    targetCal = Math.max(tdee - 500, 1200);
+  else if (effectiveGoal.includes("gain") || effectiveGoal.includes("increase") || effectiveGoal.includes("muscle"))
+    targetCal = tdee + 400;
+
+  const proteinG = Math.round(weightKg * (effectiveGoal.includes("muscle") ? 2.0 : 1.4));
+  const fatG     = Math.round(targetCal * 0.28 / 9);
+  const carbG    = Math.round((targetCal - proteinG * 4 - fatG * 9) / 4);
+
+  const mealCal = {
+    breakfast:   Math.round(targetCal * 0.25),
+    mid_morning: Math.round(targetCal * 0.10),
+    lunch:       Math.round(targetCal * 0.35),
+    evening:     Math.round(targetCal * 0.10),
+    dinner:      Math.round(targetCal * 0.20),
+  };
+
+  // Dislike normalisation
+  const SMAP: Record<string, string> = {
+    soyabean:"soybean", "soya bean":"soybean", soya:"soybean",
+    brinjal:"eggplant", karela:"bitter gourd", palak:"spinach",
+  };
+  const rawD  = dislikedFoods.map(d => d.toLowerCase().trim());
+  const normD = [...new Set([...rawD, ...rawD.map(d => SMAP[d] ?? d)])];
+  const dFuzzy = normD.map(d => `%${d}%`);
+
+  // Dislike SQL clause — ?1, ?2... mapped to dFuzzy array
+  const dClause = dFuzzy.length > 0
+    ? "AND " + dFuzzy.map((_, i) => `LOWER(name) NOT LIKE ?${i + 1}`).join(" AND ")
     : "";
-  const produceDislikeFilter = produceNotLike ? `AND ${produceNotLike}` : "";
-  // Add % wildcards for fuzzy match
-  const dislikedFuzzy = dislikedLower.map(d => `%${d}%`);
-  const produceBinds: any[] = [season, ...dislikedFuzzy];
-  const produceQ = db.prepare(
-    `SELECT i.id, i.name, i.category, i.calories_per_100g FROM items i
-     WHERE i.category IN ('fruit', 'vegetable') AND (i.season = ?1 OR i.season = 'all')
-     AND i.calories_per_100g >= 20 ${produceDislikeFilter} ORDER BY RANDOM() LIMIT 12`
-  ).bind(...produceBinds);
 
-  // Protein: ?1..=dislikes (no season)
-  const cats = isVeg ? "'legume','dairy','nut','grain'" : "'legume','dairy','nut','grain','protein'";
-  const proteinNotLike = dislikedLower.length > 0
-    ? dislikedLower.map((_, i) => `LOWER(i.name) NOT LIKE ?${i + 1}`).join(" AND ")
-    : "";
-  const proteinDislikeFilter = proteinNotLike ? `AND ${proteinNotLike}` : "";
-  const proteinBinds: any[] = [...dislikedFuzzy];
-  const proteinQ = db.prepare(
-    `SELECT i.id, i.name, i.category, i.calories_per_100g FROM items i
-     WHERE i.category IN (${cats}) ${proteinDislikeFilter} ORDER BY RANDOM() LIMIT 12`
-  ).bind(...proteinBinds);
+  const cs = getCurrentSeason();
+  const sqlSeason = (season === "all" || !season) ? cs : season;
 
-  const [produceRes, proteinRes] = await Promise.all([produceQ.all(), proteinQ.all()]);
-  const produce = produceRes.results as any[];
-  const proteins = proteinRes.results as any[];
+  // Fetch all categories — using module-level dietFetchCat (no nested async fn)
+  const [fruits, veggies, grains, dals, dairy, nuts, meats] = await Promise.all([
+    dietFetchCat(db, "fruit",     sqlSeason, dClause, dFuzzy),
+    dietFetchCat(db, "vegetable", sqlSeason, dClause, dFuzzy),
+    dietFetchCat(db, "grain",     sqlSeason, dClause, dFuzzy),
+    dietFetchCat(db, "legume",    sqlSeason, dClause, dFuzzy),
+    dietFetchCat(db, "dairy",     sqlSeason, dClause, dFuzzy),
+    dietFetchCat(db, "nut",       sqlSeason, dClause, dFuzzy),
+    isVeg ? Promise.resolve([] as string[]) : dietFetchCat(db, "protein", sqlSeason, dClause, dFuzzy),
+  ]);
 
-  const fruits   = produce.filter((f: any) => f.category === "fruit");
-  const veggies  = produce.filter((f: any) => f.category === "vegetable");
-  const grains   = proteins.filter((p: any) => p.category === "grain");
-  const dals     = proteins.filter((p: any) => p.category === "legume");
-  const dairy    = proteins.filter((p: any) => p.category === "dairy");
-  const nuts     = proteins.filter((p: any) => p.category === "nut");
-  const meats    = proteins.filter((p: any) => p.category === "protein");
+  const F  = fruits.length  ? fruits  : ["Banana", "Apple", "Guava", "Mango", "Papaya"];
+  const V  = veggies.length ? veggies : ["Spinach", "Carrot", "Broccoli", "Tomato", "Onion"];
+  const G  = grains.length  ? grains  : ["Oats", "Brown Rice", "Bajra", "Jowar", "Wheat"];
+  const D  = dals.length    ? dals    : ["Lentils", "Moong Dal", "Chickpeas", "Rajma"];
+  const Da = dairy.length   ? dairy   : ["Curd", "Milk", "Paneer"];
+  const N  = nuts.length    ? nuts    : ["Almonds", "Walnuts", "Peanuts", "Sesame Seeds"];
+  const M  = meats.length   ? meats   : [];
 
-  const fallbackGrain = grains.length  ? grains  : [{ name: "Brown Rice" }, { name: "Oats" }];
-  const fallbackDal   = dals.length    ? dals    : [{ name: "Lentils" }, { name: "Moong Dal" }];
-  const fallbackDairy = dairy.length   ? dairy   : [{ name: "Curd" }, { name: "Paneer" }];
-  const fallbackNut   = nuts.length    ? nuts    : [{ name: "Almonds" }, { name: "Walnuts" }];
-  const fallbackFruit = fruits.length  ? fruits  : [{ name: "Banana" }, { name: "Apple" }];
-  const fallbackVeg   = veggies.length ? veggies : [{ name: "Spinach" }, { name: "Carrot" }];
-  const proteinSource = meats.length && !isVeg ? meats : fallbackDal;
+  // Professional meal structure — 5 meals, every slot different pool
+  // Breakfast:   Fruit + Grain + Dairy    (~25% kcal)
+  // Mid-morning: Fruit + Nut              (~10% kcal)
+  // Lunch:       Veg + Legume + Grain     (~35% kcal) + curd raita side
+  // Evening:     Fruit + Nut              (~10% kcal)
+  // Dinner:      Veg + Protein + Grain    (~20% kcal)
+  const numDays = Math.max(days, 1);
+  const protSource = isVeg ? D : (M.length > 0 ? M : D);
 
-  const pick = (arr: any[], i = 0) => arr[i % arr.length]?.name ?? arr[0]?.name ?? "seasonal food";
+  const sBkF = dietSeq(F,  numDays);
+  const sBkG = dietSeq(G,  numDays);
+  const sBkD = dietSeq(Da, numDays);
+  const sMmF = dietSeq(F,  numDays);
+  const sMmN = dietSeq(N,  numDays);
+  const sLuV = dietSeq(V,  numDays);
+  const sLuD = dietSeq(D,  numDays);
+  const sLuG = dietSeq(G,  numDays);
+  const sEvF = dietSeq(F,  numDays);
+  const sEvN = dietSeq(N,  numDays);
+  const sDiV = dietSeq(V,  numDays);
+  const sDiP = dietSeq(protSource, numDays);
+  const sDiG = dietSeq(G,  numDays);
 
   const plan = [];
-  for (let d = 0; d < days; d++) {
+  for (let d = 0; d < numDays; d++) {
+    const used = new Set<string>();
+
+    const bkFruit = dietPickSeq(sBkF, d, used, F);
+    const bkGrain = dietPickSeq(sBkG, d, used, G);
+    const bkDairy = dietPickSeq(sBkD, d, used, Da);
+
+    const mmFruit = dietPickSeq(sMmF, d, used, F);
+    const mmNut   = dietPickSeq(sMmN, d, used, N);
+
+    const luVeg   = dietPickSeq(sLuV, d, used, V);
+    const luDal   = dietPickSeq(sLuD, d, used, D);
+    const luGrain = dietPickSeq(sLuG, d, used, G);
+    const luSide  = Da.find((name: string) => !used.has(name)) ?? "";
+    if (luSide) used.add(luSide);
+
+    const evFruit = dietPickSeq(sEvF, d, used, F);
+    const evNut   = dietPickSeq(sEvN, d, used, N);
+
+    const diVeg   = dietPickSeq(sDiV, d, used, V);
+    const diProt  = dietPickSeq(sDiP, d, used, protSource);
+    const diGrain = dietPickSeq(sDiG, d, used, G);
+
     plan.push({
       day: d + 1,
       day_label: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][d % 7],
       calorie_target: targetCal,
+      calorie_estimate: targetCal,
       meals: {
-        breakfast:   { foods: [pick(fallbackFruit, d), pick(fallbackGrain, d)],           note: "Start light — fruit gives natural sugars, grain provides sustained energy" },
-        mid_morning: { foods: [pick(fallbackFruit, d + 1), pick(fallbackNut, d)],          note: "Small snack to maintain blood sugar" },
-        lunch:       { foods: [pick(fallbackVeg, d), pick(fallbackDal, d), pick(fallbackGrain, d + 1)], note: "Main meal — balanced macros: protein, carbs, and fibre" },
-        evening:     { foods: [pick(fallbackFruit, d + 2), pick(fallbackNut, d + 1)],      note: "Light energy before dinner" },
-        dinner:      { foods: [pick(fallbackVeg, d + 1), pick(proteinSource, d), pick(fallbackGrain, d + 2)], note: "Lighter than lunch — easier digestion at night" },
+        breakfast:   { foods: [bkFruit, bkGrain, bkDairy],
+                       note: `~${mealCal.breakfast} kcal · Fruit + whole grain + dairy` },
+        mid_morning: { foods: [mmFruit, mmNut],
+                       note: `~${mealCal.mid_morning} kcal · Fruit + healthy fat` },
+        lunch:       { foods: luSide ? [luVeg, luDal, luGrain, luSide] : [luVeg, luDal, luGrain],
+                       note: `~${mealCal.lunch} kcal · Veg + legume protein + complex carbs${luSide ? " + probiotic" : ""}` },
+        evening:     { foods: [evFruit, evNut],
+                       note: `~${mealCal.evening} kcal · Light energy boost` },
+        dinner:      { foods: [diVeg, diProt, diGrain],
+                       note: `~${mealCal.dinner} kcal · Light veg + protein + grain` },
       },
     });
   }
 
   return {
-    profile_used: !!profile,
-    goal: effectiveGoal,
+    profile_used:   !!profile,
+    goal:           effectiveGoal,
     season,
-    season_label: SEASON_LABELS[season] ?? season,
+    season_label:   SEASON_LABELS[season] ?? season,
     calorie_target: targetCal,
-    vegetarian: isVeg,
+    macro_targets:  { protein_g: proteinG, fat_g: fatG, carb_g: carbG },
+    vegetarian:     isVeg,
     excluded_foods: dislikedFoods,
-    days: plan,
+    days:           plan,
     note: "All quantities approximate at 100g per food item. Adjust portions to your calorie target.",
   };
 }
 
-async function toolAnalyzeIntake(db: D1Database, foods: string[], profile: Profile | null) {
+
+async function toolAnalyzeIntake(
+  db: D1Database,
+  foods: string[],
+  profile: Profile | null,
+  // Optional: amounts in grams for each food (same order as foods array)
+  amounts_g?: number[]
+) {
   const totals: Record<string, { amount: number; unit: string }> = {};
   let totalCal = 0;
   const foundFoods: string[] = [];
   const notFound: string[] = [];
 
-  for (const foodName of foods) {
+  for (let i = 0; i < foods.length; i++) {
+    const foodName = foods[i];
+    const amtG = amounts_g?.[i] ?? 100;  // default 100g if no amount provided
+    const scaleFactor = amtG / 100;       // nutrients are per 100g in DB
     const r = await toolFoodLookup(db, foodName);
     if (!r.found) { notFound.push(foodName); continue; }
     foundFoods.push(r.name!);
-    totalCal += r.calories_per_100g!;
+    totalCal += (r.calories_per_100g! * scaleFactor); // scale by actual amount
     for (const n of r.nutrients ?? []) {
       if (!totals[n.name]) totals[n.name] = { amount: 0, unit: n.unit };
-      totals[n.name].amount += n.amount;
+      totals[n.name].amount += n.amount * scaleFactor; // scale nutrients too
     }
   }
 
@@ -671,38 +972,47 @@ async function callGeminiFlash(
     generationConfig: { maxOutputTokens: 400, temperature: 0.3 },
   });
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+  // Model cascade: try Flash-Lite first, fall back to gemini-2.0-flash if rate-limited
+  // Short waits only — Cloudflare Workers have a 30s CPU limit, 6s sleep wastes it
+  const MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",   // fallback — separate quota pool
+  ];
 
-  // Try once, retry after 6s on 429 (rate limit)
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-    });
+  for (const model of MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
 
-    if (resp.status === 429 || resp.status === 503) {
-      if (attempt === 0) {
-        // 429 = rate limit (wait 6s), 503 = service unavailable (wait 3s)
-        const waitMs = resp.status === 429 ? 6000 : 3000;
-        await new Promise(r => setTimeout(r, waitMs));
-        continue;
+      if (resp.status === 429 || resp.status === 503) {
+        if (attempt === 0) {
+          // Short wait only — 6s was too long and risked Worker CPU timeout
+          // 429: wait 1.5s then retry same model once; if still 429, try next model
+          // 503: wait 800ms then retry
+          const waitMs = resp.status === 429 ? 1500 : 800;
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        // Both attempts failed on this model — try the next one
+        break;
       }
-      console.error(`Gemini ${resp.status} — both attempts exhausted`);
-      return "";
-    }
 
-    if (!resp.ok) {
-      console.error("Gemini error:", resp.status, await resp.text());
-      return "";
-    }
+      if (!resp.ok) {
+        console.error(`Gemini ${model} error:`, resp.status);
+        break; // try next model
+      }
 
-    const data = await resp.json() as any;
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
-    // Guard: reject JSON blobs — all nutrition data must come from D1
-    if (text.startsWith("{") || text.startsWith("[") || text.includes('"name":')) return "";
-    return text;
-  }
+      const data = await resp.json() as any;
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
+      // Guard: reject JSON blobs — all nutrition data must come from D1
+      if (text.startsWith("{") || text.startsWith("[") || text.includes('"name":')) return "";
+      return text;
+    } // end attempt loop
+  } // end model loop
 
   return "";
 }
@@ -885,14 +1195,20 @@ function buildDirectResponse(toolName: string, result: any, userMessage: string)
       // Single day plan
       const d = result.days[0];
       const m = d.meals;
-      return `**Day plan for ${result.season_label}** (target: ~${result.calorie_target} kcal)\n\n🌅 Breakfast: ${m.breakfast?.foods?.join(" + ")}\n🍎 Mid-morning: ${m.mid_morning?.foods?.join(" + ")}\n🍱 Lunch: ${m.lunch?.foods?.join(" + ")}\n🫖 Evening: ${m.evening?.foods?.join(" + ")}\n🌙 Dinner: ${m.dinner?.foods?.join(" + ")}\n\n${result.note}${excludeNote}`;
+      const macros = result.macro_targets
+        ? ` · Targets: ${result.macro_targets.protein_g}g protein, ${result.macro_targets.carb_g}g carbs, ${result.macro_targets.fat_g}g fat`
+        : "";
+      return `**Day plan for ${result.season_label}** (~${result.calorie_target} kcal/day${macros})\n\n🌅 **Breakfast** (~${Math.round(result.calorie_target * 0.25)} kcal): ${m.breakfast?.foods?.join(" + ")}\n🍎 **Mid-morning** (~${Math.round(result.calorie_target * 0.10)} kcal): ${m.mid_morning?.foods?.join(" + ")}\n🍱 **Lunch** (~${Math.round(result.calorie_target * 0.35)} kcal): ${m.lunch?.foods?.join(" + ")}\n🫖 **Evening** (~${Math.round(result.calorie_target * 0.10)} kcal): ${m.evening?.foods?.join(" + ")}\n🌙 **Dinner** (~${Math.round(result.calorie_target * 0.20)} kcal): ${m.dinner?.foods?.join(" + ")}\n\n${result.note}${excludeNote}`;
     } else {
       // Multi-day plan — show all days
       const dayLines = result.days.map((d: any) => {
         const m = d.meals;
-        return `**${d.day_label} (Day ${d.day})**\n🌅 ${m.breakfast?.foods?.join(" + ")} · 🍱 ${m.lunch?.foods?.join(" + ")} · 🌙 ${m.dinner?.foods?.join(" + ")}`;
+        return `**${d.day_label}**\n🌅 ${m.breakfast?.foods?.join(" + ")}\n🍎 ${m.mid_morning?.foods?.join(" + ")}\n🍱 ${m.lunch?.foods?.join(" + ")}\n🫖 ${m.evening?.foods?.join(" + ")}\n🌙 ${m.dinner?.foods?.join(" + ")}`;
       }).join("\n\n");
-      return `**${result.days.length}-day plan for ${result.season_label}** (~${result.calorie_target} kcal/day)\n\n${dayLines}\n\n${result.note}${excludeNote}`;
+      const macrosW = result.macro_targets
+        ? ` | Targets: ${result.macro_targets.protein_g}g protein · ${result.macro_targets.carb_g}g carbs · ${result.macro_targets.fat_g}g fat`
+        : "";
+      return `**${result.days.length}-day plan for ${result.season_label}** (~${result.calorie_target} kcal/day${macrosW})\n\n${dayLines}\n\n${result.note}${excludeNote}`;
     }
   }
 
@@ -961,9 +1277,47 @@ async function extractFoodsFromText(msg: string, db: D1Database): Promise<string
 
 // ── Session helpers ───────────────────────────────────────────────────────────
 
-async function getOrCreateSession(db: D1Database, kv: KVNamespace, sessionId: string) {
+const MAX_SESSIONS_PER_PROFILE = 10;
+
+async function getOrCreateSession(
+  db: D1Database,
+  kv: KVNamespace,
+  sessionId: string,
+  profileId?: string   // passed so we can prune oldest session for this profile
+) {
   const existing = await db.prepare(`SELECT id FROM sessions WHERE id = ?1`).bind(sessionId).first();
   if (existing) return existing;
+
+  // Before creating a new session, prune oldest if the profile already has MAX_SESSIONS_PER_PROFILE
+  if (profileId) {
+    try {
+      // Collect all session IDs this profile owns via KV
+      const kvKeys = await kv.list({ prefix: `profile_sessions:${profileId}:` });
+      const allSids: string[] = [];
+      for (const key of kvKeys.keys) {
+        const sid = await kv.get(key.name);
+        if (sid) allSids.push(sid);
+      }
+
+      if (allSids.length >= MAX_SESSIONS_PER_PROFILE) {
+        // Find the oldest session by updated_at from D1
+        const placeholders = allSids.map((_, i) => `?${i + 1}`).join(",");
+        const oldest = await db.prepare(
+          `SELECT id FROM sessions WHERE id IN (${placeholders})
+           ORDER BY updated_at ASC LIMIT 1`
+        ).bind(...allSids).first<{ id: string }>();
+
+        if (oldest) {
+          // Delete messages first (FK constraint), then session
+          await db.prepare(`DELETE FROM messages WHERE session_id = ?1`).bind(oldest.id).run();
+          await db.prepare(`DELETE FROM sessions WHERE id = ?1`).bind(oldest.id).run();
+          // Remove the KV registration key for the deleted session
+          await kv.delete(`profile_sessions:${profileId}:${oldest.id}`);
+        }
+      }
+    } catch { /* pruning is best-effort — non-fatal */ }
+  }
+
   await db.prepare(
     `INSERT INTO sessions (id, profile_id, title, created_at, updated_at)
      VALUES (?1, NULL, 'New session', datetime('now'), datetime('now'))`
@@ -1130,11 +1484,18 @@ async function generateMorningInsight(
         contents: [{ role: "user", parts: [{ text: geminiPrompt }] }],
         generationConfig: { maxOutputTokens: 120, temperature: 0.4 },
       });
-      const geminiResp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: geminiBody }
-      );
-      if (geminiResp.ok) {
+      // Try Flash-Lite, fall back to 2.0-Flash-Lite if rate limited
+      let geminiResp: Response | null = null;
+      for (const mModel of ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]) {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${mModel}:generateContent?key=${geminiKey}`,
+          { method: "POST", headers: { "Content-Type": "application/json" }, body: geminiBody }
+        );
+        if (r.status === 429 || r.status === 503) { await new Promise(res => setTimeout(res, 800)); continue; }
+        geminiResp = r;
+        break;
+      }
+      if (geminiResp?.ok) {
         const gdata = await geminiResp.json() as any;
         const geminiCopy = gdata.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
         // Inject Gemini-written copy as first insight if it looks valid
@@ -1294,7 +1655,9 @@ app.get("/agent/sessions", async (c) => {
 
   if (knownSessions.length === 0) return c.json([]);
 
-  const unique = [...new Set(knownSessions)].slice(0, 10);
+  // De-duplicate. Do NOT slice here — D1 will sort by updated_at DESC and we
+  // cap AFTER sorting so we always keep the most recent sessions, never the newest.
+  const unique = [...new Set(knownSessions)];
   const placeholders = unique.map((_, i) => `?${i + 1}`).join(",");
 
   const result = await c.env.DB.prepare(
@@ -1304,7 +1667,8 @@ app.get("/agent/sessions", async (c) => {
      (SELECT COUNT(*) FROM messages WHERE session_id = s.id) as message_count
      FROM sessions s
      WHERE s.id IN (${placeholders})
-     ORDER BY s.updated_at DESC`
+     ORDER BY s.updated_at DESC
+     LIMIT ${MAX_SESSIONS_PER_PROFILE}`
   ).bind(...unique).all();
 
   const withMessages = (result.results as any[]).filter(
@@ -1314,12 +1678,27 @@ app.get("/agent/sessions", async (c) => {
 });
 
 app.get("/agent/sessions/:id", async (c) => {
-  const session = await c.env.DB.prepare(`SELECT * FROM sessions WHERE id = ?1`).bind(c.req.param("id")).first();
+  const sid = c.req.param("id");
+  const session = await c.env.DB.prepare(`SELECT * FROM sessions WHERE id = ?1`).bind(sid).first();
   if (!session) return c.json({ error: "Not found" }, 404);
+
+  // Register this session under the profile so it always appears in the sessions list,
+  // even when the user navigates to it without sending a message.
+  const profileId = c.req.query("profile_id");
+  if (profileId && profileId !== sid) {
+    try {
+      await c.env.SESSIONS.put(
+        `profile_sessions:${profileId}:${sid}`,
+        sid,
+        { expirationTtl: 60 * 60 * 24 * 90 }
+      );
+    } catch { /* non-fatal */ }
+  }
+
   const messages = await c.env.DB.prepare(
     `SELECT role, content, task_type, created_at FROM messages
-     WHERE session_id = ?1 ORDER BY created_at ASC LIMIT 50`
-  ).bind(c.req.param("id")).all();
+     WHERE session_id = ?1 ORDER BY created_at ASC LIMIT 100`
+  ).bind(sid).all();
   return c.json({ ...session, messages: messages.results });
 });
 
@@ -1437,6 +1816,154 @@ app.delete("/facts/:profile_id", async (c) => {
   return c.json({ ok: true });
 });
 
+
+// ── PHASE 3: Weekly nutrition score ──────────────────────────────────────────
+
+const SCORE_WEIGHTS: Record<string, number> = {
+  "Protein": 15, "Iron": 12, "Calcium": 10, "Vitamin C": 10,
+  "Fiber": 10, "Vitamin D": 8, "Magnesium": 7, "Folate": 7,
+  "Potassium": 6, "Zinc": 5, "Vitamin A": 5, "Vitamin B6": 5,
+};
+
+function calculateWeeklyScore(
+  nutrientAverages: Record<string, number>,
+  rdaMap: Record<string, number>
+): number {
+  let totalWeight = 0, weightedScore = 0;
+  for (const [nutrient, weight] of Object.entries(SCORE_WEIGHTS)) {
+    const avg = nutrientAverages[nutrient] ?? 0;
+    const rda = rdaMap[nutrient] ?? 1;
+    const pct = Math.min((avg / rda) * 100, 100);
+    weightedScore += pct * weight;
+    totalWeight += weight;
+  }
+  return totalWeight > 0 ? Math.round(weightedScore / totalWeight) : 0;
+}
+
+// GET /nutrition-score/:profile_id
+// Returns weekly nutrition score, per-nutrient averages, deficiencies, streak, seasonal compliance
+app.get("/nutrition-score/:profile_id", async (c) => {
+  const profileId = c.req.param("profile_id");
+
+  // 1. Get last 7 days of meal logs with nutrients
+  // NOTE: meal_logs stores profileId in session_id column (profile_id column is NULL for guest users)
+  // nutrients table column is "name" (not "nutrient_name")
+  // item_nutrients column is "amount_per_100g" (not "amount")
+  const logs = await c.env.DB.prepare(
+    `SELECT ml.logged_date, ml.amount_g, i.name, i.season,
+     n.name as nutrient_name, (in_.amount_per_100g * ml.amount_g / 100.0) as nutrient_amount
+     FROM meal_logs ml
+     JOIN items i ON i.id = ml.item_id
+     JOIN item_nutrients in_ ON in_.item_id = i.id
+     JOIN nutrients n ON n.id = in_.nutrient_id
+     WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+     ORDER BY ml.logged_date DESC`
+  ).bind(profileId).all();
+
+  // 2. RDA map
+  const rdaRows = await c.env.DB.prepare(
+    `SELECT nutrient_name, daily_amount FROM rda`
+  ).all();
+  const rdaMap: Record<string, number> = {};
+  for (const r of rdaRows.results as any[]) rdaMap[r.nutrient_name] = r.daily_amount;
+
+  // 3. Current season foods for seasonal compliance check
+  const currentSeason = getCurrentSeason();
+
+  if ((logs.results as any[]).length === 0) {
+    return c.json({
+      score: 0,
+      has_data: false,
+      message: "No meals logged in the last 7 days. Start logging meals to see your score!",
+      nutrient_averages: {},
+      deficiencies: [],
+      streak: 0,
+      seasonal_compliance: 0,
+      current_season: currentSeason,
+    });
+  }
+
+  // 4. Aggregate per-day nutrients
+  const byDate: Record<string, Record<string, number>> = {};
+  const logsByDate: Record<string, Set<string>> = {};
+  const allLoggedFoods: Array<{name: string; season: string}> = [];
+
+  for (const row of logs.results as any[]) {
+    if (!byDate[row.logged_date]) { byDate[row.logged_date] = {}; logsByDate[row.logged_date] = new Set(); }
+    byDate[row.logged_date][row.nutrient_name] = (byDate[row.logged_date][row.nutrient_name] ?? 0) + row.nutrient_amount;
+    logsByDate[row.logged_date].add(row.name);
+    if (!allLoggedFoods.find(f => f.name === row.name)) {
+      allLoggedFoods.push({ name: row.name, season: row.season });
+    }
+  }
+
+  const days = Object.keys(byDate);
+  const numDays = days.length || 1;
+
+  // 5. Average nutrients across days
+  const nutrientAverages: Record<string, number> = {};
+  for (const dayNutrients of Object.values(byDate)) {
+    for (const [nutrient, amount] of Object.entries(dayNutrients)) {
+      nutrientAverages[nutrient] = (nutrientAverages[nutrient] ?? 0) + amount;
+    }
+  }
+  for (const k of Object.keys(nutrientAverages)) nutrientAverages[k] /= numDays;
+
+  // 6. Score
+  const score = calculateWeeklyScore(nutrientAverages, rdaMap);
+
+  // 7. Per-nutrient breakdown for chart
+  const breakdown = Object.entries(SCORE_WEIGHTS).map(([nutrient, weight]) => {
+    const avg = nutrientAverages[nutrient] ?? 0;
+    const rda = rdaMap[nutrient] ?? 1;
+    const pct = Math.round(Math.min((avg / rda) * 100, 100));
+    return { nutrient, avg: Math.round(avg * 10) / 10, rda, pct, weight,
+             status: pct >= 70 ? "good" : pct >= 40 ? "low" : "deficient" };
+  }).sort((a, b) => a.pct - b.pct);
+
+  // 8. Deficiencies (< 40% RDA on average)
+  const deficiencies = breakdown.filter(n => n.status === "deficient").map(n => n.nutrient);
+
+  // 9. Streak — consecutive days with score ≥ 50%
+  let streak = 0;
+  const sortedDays = [...days].sort().reverse();
+  for (const day of sortedDays) {
+    const dayNutrients = byDate[day] ?? {};
+    const dayScore = calculateWeeklyScore(dayNutrients, rdaMap);
+    if (dayScore >= 50) streak++;
+    else break;
+  }
+
+  // 10. Seasonal compliance — % of logged foods matching current season
+  const seasonalFoods = allLoggedFoods.filter(f => f.season === currentSeason || f.season === "all");
+  const seasonalCompliance = allLoggedFoods.length > 0
+    ? Math.round((seasonalFoods.length / allLoggedFoods.length) * 100) : 0;
+
+  // 11. 7-day daily calorie trend for chart
+  const calByDate: Record<string, number> = {};
+  const calRows = await c.env.DB.prepare(
+    `SELECT ml.logged_date, SUM(i.calories_per_100g * ml.amount_g / 100.0) as cal
+     FROM meal_logs ml JOIN items i ON i.id = ml.item_id
+     WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+     GROUP BY ml.logged_date ORDER BY ml.logged_date ASC`
+  ).bind(profileId).all();
+  for (const r of calRows.results as any[]) calByDate[r.logged_date] = Math.round(r.cal);
+
+  return c.json({
+    score,
+    has_data: true,
+    nutrient_averages: nutrientAverages,
+    breakdown,
+    deficiencies,
+    streak,
+    seasonal_compliance: seasonalCompliance,
+    current_season: currentSeason,
+    days_logged: numDays,
+    calorie_by_date: calByDate,
+    logged_foods: allLoggedFoods.map(f => f.name),
+  });
+});
+
 // ── Main agent endpoint ───────────────────────────────────────────────────────
 
 app.post("/agent/message", async (c) => {
@@ -1474,7 +2001,9 @@ app.post("/agent/message", async (c) => {
     current_season: context.current_season ?? "all",
   };
 
-  await getOrCreateSession(c.env.DB, c.env.SESSIONS, sessionId);
+  // Extract profileId early so we can pass it to getOrCreateSession for pruning
+  const earlyProfileId = (context as any).profile_id || sessionId;
+  await getOrCreateSession(c.env.DB, c.env.SESSIONS, sessionId, earlyProfileId);
 
   // Load conversation history
   const historyResult = await c.env.DB.prepare(
@@ -1491,7 +2020,9 @@ app.post("/agent/message", async (c) => {
   const profileId = (context as any).profile_id || sessionId;
   let stored: string[] = [];
   try {
-    stored = await extractAndStoreFacts(message, profileId, c.env.DB);
+    // Pass alias-normalised message so "panner" stores as "paneer" etc.
+    const msgForFacts = applyFoodAlias(message.toLowerCase().trim());
+    stored = await extractAndStoreFacts(msgForFacts, profileId, c.env.DB);
   } catch (factErr) {
     console.error("extractAndStoreFacts failed (non-fatal):", factErr);
   }
@@ -1509,7 +2040,10 @@ app.post("/agent/message", async (c) => {
   const userFacts = await loadUserFacts(profileId, c.env.DB);
 
   // ── Pre-flight: instant responses ─────────────────────────────────────────
-  const msgLower = message.toLowerCase().trim();
+  // ── Apply the single module-level alias map (MASTER_FOOD_ALIAS) ───────────
+  // applyFoodAlias handles all food name variants, typos, and Hindi names.
+  // One source of truth — add new variants to MASTER_FOOD_ALIAS above.
+  const msgLower = applyFoodAlias(message.toLowerCase().trim());
   const msgClean = msgLower.replace(/[!?.]+$/, "").trim();
 
   const GREETINGS    = ["hi", "hello", "hey", "hola", "namaste", "howdy", "sup", "yo", "hai"];
@@ -1567,8 +2101,12 @@ app.post("/agent/message", async (c) => {
   const hasDietIntent = msgClean.includes("diet") || msgClean.includes("plan") || msgClean.includes("what to eat");
   const isMemory   = !hasDietIntent && MEMORY_PHRASES.some(p => msgClean.includes(p));
   // Memory update: "remove X from likes" / "delete X from dislikes"
-  const isMemoryUpdate = /(?:remove|delete|forget) .{1,30} from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i.test(message)
-    || /(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) .{1,30}/i.test(message);
+  // isMemoryUpdate: with or without "from likes/dislikes" suffix
+  const isMemoryUpdate =
+    /(?:remove|delete|forget) .{1,30} from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i.test(msgClean)
+    || /(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) .{1,30}/i.test(msgClean)
+    // "remove X" alone when X is a food the user mentions
+    || (/^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean) && !!foodInMsg);
 
   const VAGUE = ["this","this one","tell me about this","what is this",
                  "what about this","this food","should i eat this","is it good","is this good","this item",
@@ -1681,8 +2219,9 @@ For general guidance I'm highly reliable. For medical nutrition therapy (e.g. pr
   // Memory update handler — "remove panner from likes", "forget that I dislike soybean"
   if (isMemoryUpdate) {
     // Extract the food name and operation from the message
-    const removeMatch = message.match(/(?:remove|delete|forget) (.{1,30}?) from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i);
-    const noLongerMatch = message.match(/(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) (.{1,30})/i);
+    // Use msgClean (normalised) so "remove panner" correctly deletes "paneer"
+    const removeMatch = msgClean.match(/(?:remove|delete|forget) (.{1,30}?) from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i);
+    const noLongerMatch = msgClean.match(/(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) (.{1,30})/i);
     const itemToRemove = (removeMatch?.[1] || noLongerMatch?.[1] || "").trim().toLowerCase();
     const isFromLikes = /likes|preference/i.test(message);
     const isFromDislikes = /dislikes|hate/i.test(message);
@@ -1870,6 +2409,9 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     /should i add .{1,30} (?:to|in) my (?:diet|plan)/i.test(m) ||
     /include .{1,30} in my (?:diet|plan)/i.test(m)
   );
+  // PDF intent — "give me as a pdf" / "week plan as a pdf" / "download the plan"
+  const wantsPDF = m.includes("pdf") || m.includes("download") && m.includes("plan");
+
   // "build me a seasonal diet plan" / "diet plan for monsoon" = wantsDiet, NOT wantsSeason
   const isSeasonalDietPlan = (
     (m.includes("build") || m.includes("make") || m.includes("create") || m.includes("give")) &&
@@ -1880,7 +2422,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     m.includes("seasonal") && (m.includes("diet") || m.includes("plan"))
   );
   const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && !isVagueEatNow && !isAddToDietQuestion && (
-    isSeasonalDietPlan ||
+    isSeasonalDietPlan || wantsPDF ||
     m.includes("diet") || m.includes("meal plan") || m.includes("day plan") ||
     m.includes("week plan") || m.includes("what to eat") || (m.includes("build") && m.includes("plan")) ||
     (m.includes("make") && m.includes("plan")) || (m.includes("create") && m.includes("plan"))
@@ -1997,8 +2539,39 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       }
     }
 
-    // Route 3: Food lookup + "add to diet" advisor
-    else if (wantsFoodInfo || wantsHealth || isAddToDietQuestion || (foodInMsg && !wantsDiet && !wantsIntake)) {
+    // Route 3a: "add X to my diet / can I eat X / should I eat X" — direct verdict FIRST
+    // Must come before generic food lookup so we give yes/no, not just nutrients.
+    else if (isAddToDietQuestion && foodInMsg) {
+      const result = await toolFoodLookup(c.env.DB, foodInMsg.name);
+      if (result.found) {
+        const isDisliked = userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()));
+        const goal = userFacts.goal || profile?.goal || "balanced";
+        const cal = result.calories_per_100g ?? 0;
+        if (isDisliked) {
+          finalResponse = `You've told me you don't like **${result.name}** — I'd skip it and suggest alternatives. Ask me for foods that are similar in nutrition if you want.`;
+        } else {
+          const verdict = (goal.includes("lose") && cal > 300) ? "⚠️ In moderation" :
+                          (goal.includes("gain") && cal < 50) ? "⚠️ Pair with higher-calorie foods" : "✅ Yes, include it";
+          const reason = goal.includes("lose") && cal > 300
+            ? `It's calorie-dense at ${cal} kcal/100g — keep portions small.`
+            : goal.includes("gain") && cal < 50
+            ? `It's light at ${cal} kcal/100g — pair it with grains or nuts for calorie density.`
+            : `At ${cal} kcal/100g it fits your ${goal || "balanced"} goal well.`;
+          // Health condition flags
+          const diabetesNote = userFacts.health_notes.some(n => n.includes("diabet"))
+            ? ` Good for blood sugar control.` : "";
+          const bpNote = userFacts.health_notes.some(n => n.includes("blood pressure") || n.includes("bp"))
+            ? ` Watch sodium intake alongside.` : "";
+          finalResponse = `${verdict} — **${result.name}** is a great addition to your plan. ${reason}${diabetesNote}${bpNote}\n\nJust ask me to **build a diet plan** and it will be included.`;
+        }
+      } else {
+        finalResponse = `I don't have **${foodInMsg.name}** in my database yet. Try asking about a similar food I know.`;
+      }
+      taskType = "diet_advice"; toolsUsed = ["food_lookup"];
+    }
+
+    // Route 3: Food lookup (nutrients / health question about a specific food)
+    else if (wantsFoodInfo || wantsHealth || (foodInMsg && !wantsDiet && !wantsIntake)) {
       const result = await toolFoodLookup(c.env.DB, foodInMsg!.name);
       finalResponse = buildDirectResponse("food_lookup", result, message);
       if (result.found) {
@@ -2168,7 +2741,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         m.includes("lose") || m.includes("weight loss")      ? "lose weight" :
         m.includes("maintain")                                ? "maintain weight" :
         m.includes("gym") || m.includes("muscle")            ? "muscle gain" : undefined;
-      const days = (m.includes("week") || m.includes("7 day") || m.includes("7-day") || m.includes("whole week") || m.includes("entire week")) ? 7 : 1;
+      const days = (wantsPDF || m.includes("week") || m.includes("7 day") || m.includes("7-day") || m.includes("whole week") || m.includes("entire week")) ? 7 : 1;
 
       // PHASE 1: pass user's dislikes AND dietary preference from learned facts
       // Merge profile dietary_preference with learned facts dietary
@@ -2182,24 +2755,57 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       );
       finalResponse = buildDirectResponse("build_diet_plan", result, message);
       if (profile?.goal && !spokenGoal) finalResponse += `\n\nThis plan takes your profile goal into account: **${profile.goal}**.`;
+      // Signal frontend to show PDF download button when user asked for PDF
+      if (wantsPDF && result.days?.length === 7) {
+        finalResponse += "\n\n📄 Your 7-day PDF is ready to download.";
+      }
       taskType = "build_diet_plan"; toolsUsed = ["build_diet_plan"];
+      // Attach structured plan data so frontend can render PDF without re-fetching
+      (c as any).__planData = result;
+      (c as any).__wantsPDF = wantsPDF && result.days?.length === 7;
     }
 
     // Route 7: Intake analysis + PHASE 1 meal logging
     else if (wantsIntake) {
-      const allFoods = await extractFoodsFromText(m, c.env.DB);
-      if (allFoods.length === 0) {
-        finalResponse = "I couldn't identify specific foods in your message. Try: 'I ate banana, oats, and milk today'.";
+      // Use extractFoodsWithAmounts so '3 eggs' parses as 165g, '2 glass milk' as 480g
+      const foodsWithAmt = await extractFoodsWithAmounts(m, c.env.DB);
+      if (foodsWithAmt.length === 0) {
+        finalResponse = "I couldn't identify specific foods in your message. Try: 'I ate 2 eggs, oats, and a glass of milk for breakfast'.";
         taskType = "clarification";
       } else {
-        // Analyse nutrition
-        const result = await toolAnalyzeIntake(c.env.DB, allFoods, profile);
+        const allFoods  = foodsWithAmt.map(f => f.name);
+        const allAmts   = foodsWithAmt.map(f => f.amount_g);
+
+        // Analyse nutrition scaled by actual amounts
+        const result = await toolAnalyzeIntake(c.env.DB, allFoods, profile, allAmts);
         finalResponse = buildDirectResponse("analyze_intake", result, message);
 
-        // PHASE 1: Also log the meal to D1
-        const { logged, notFound } = await logMealFromMessage(message, profileId, c.env.DB);
-        if (logged.length > 0) {
-          finalResponse += `\n\n✅ Logged to your meal diary: ${logged.join(", ")}.`;
+        // Show portion summary so user knows what was understood
+        const portionSummary = foodsWithAmt
+          .map(f => `${f.name} (${f.amount_g}g)`).join(", ");
+        finalResponse = finalResponse.replace(
+          "Analysed:",
+          `Portions understood: ${portionSummary}.\n\nAnalysed:`
+        );
+
+        // Log to D1 with actual amounts
+        const mealSlot = detectMealSlot(message);
+        const today = new Date().toISOString().split("T")[0];
+        const loggedNames: string[] = [];
+        for (const { name: fn, amount_g } of foodsWithAmt) {
+          const item = await c.env.DB.prepare(
+            `SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`
+          ).bind(`%${fn}%`).first<any>();
+          if (item) {
+            await c.env.DB.prepare(
+              `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
+               VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+            ).bind(profileId, today, item.id, amount_g, mealSlot).run();
+            loggedNames.push(`${fn} (${amount_g}g)`);
+          }
+        }
+        if (loggedNames.length > 0) {
+          finalResponse += `\n\n✅ Logged to your meal diary: ${loggedNames.join(", ")}.`;
         }
 
         taskType = "analyze_intake"; toolsUsed = ["analyze_intake"];
@@ -2332,7 +2938,7 @@ Good options for your next meal: ${suggestions}.` : ""}`;
       return ["Which has more protein?", "Build my diet plan", seasonLabel ? `What should I eat in ${seasonLabel}?` : "What should I eat today?"];
     }
     if (task === "build_diet_plan") {
-      return ["Give me a full week plan", "What do you know about me?", seasonLabel ? `Tell me about ${seasonLabel}` : "Tell me about the current season"];
+      return ["Give me a full week plan as a PDF", "What do you know about me?", seasonLabel ? `Tell me about ${seasonLabel}` : "Tell me about the current season"];
     }
     if (task === "analyze_intake") {
       return ["What should I eat next?", dietGoal ? `How is this for my ${dietGoal} goal?` : "How does this fit my goal?", "Log my dinner too"];
@@ -2362,6 +2968,8 @@ Good options for your next meal: ${suggestions}.` : ""}`;
     agent_state: "complete", used_profile: !!profile, used_selected_item: !!currentItem,
     selected_item: currentItem, next_actions: smartNextActions, cards: [],
     citations: toolsUsed.length > 0 ? ["NutriMentor food database (ICMR-NIN)"] : [],
+    plan_data: (c as any).__planData ?? null,
+    wants_pdf: (c as any).__wantsPDF ?? false,
   });
 });
 

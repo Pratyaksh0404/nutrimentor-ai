@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, PenSquare, Send, UserRound, X } from "lucide-react";
+import { ChevronDown, ChevronUp, FileDown, PenSquare, Send, UserRound, X } from "lucide-react";
 import { useChat } from "../../hooks/useChat";
 import FeedbackModal from "../footer/FeedbackModal";
 import type { AgentPanelProps, AgentProfile } from "../../types/chat";
+import { generateDietPDF } from "../../utils/generateDietPDF";
 
 const PKEY = "nutrimentor-agent-profile";
 const DEF: AgentProfile = { allergies: [], health_cautions: [] };
@@ -63,7 +64,8 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
   const [input,    setInput]    = useState("");
   const [profile,  setProfile]  = useState<AgentProfile>(loadProfile);
   const [showProf, setShowProf] = useState(false);
-  const [showSess, setShowSess] = useState(false);
+  const [showSess,     setShowSess]     = useState(false);
+  const [pdfLoading,   setPdfLoading]   = useState<string | null>(null); // msg id being downloaded
   const [showTask, setShowTask] = useState(false);
   const [showFeedback, setShowFeedback] = useState(false);
   const msgRef  = useRef<HTMLDivElement>(null);
@@ -204,7 +206,7 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
             </button>
             {sessions.length === 0
               ? <p className="nm-empty-sessions">No previous sessions</p>
-              : sessions.slice(0,5).map(s => {
+              : <div className="nm-session-scroll">{sessions.map(s => {
                   const active = s.session_id === sessionId;
                   const preview = (s as any).first_message || s.title || "Chat session";
                   return (
@@ -218,7 +220,7 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
                       </div>
                     </button>
                   );
-                })
+                })}</div>
             }
           </div>
         )}
@@ -274,6 +276,43 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
                   ))}
                 </div>
               )}
+              {msg.wantsPdf && msg.planData && (
+                <div className="nm-pdf-btn-row">
+                  <button type="button" className="nm-pdf-btn"
+                    disabled={pdfLoading === msg.id}
+                    onClick={async () => {
+                      setPdfLoading(msg.id);
+                      try {
+                        await generateDietPDF({
+                          ...msg.planData,
+                          season: msg.planData.season ?? "all",
+                          season_label: msg.planData.season_label ?? "All Seasons",
+                          goal: msg.planData.goal ?? profile.goal ?? "balanced",
+                          calorie_target: msg.planData.calorie_target ?? 1600,
+                          vegetarian: msg.planData.vegetarian ?? (profile.dietary_preference === "vegetarian"),
+                          excluded_foods: msg.planData.excluded_foods ?? [],
+                          days: (msg.planData.days ?? []).map((d: any, i: number) => ({
+                            day: i + 1,
+                            day_label: d.day_label ?? ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][i] ?? `Day ${i+1}`,
+                            calorie_target: d.calorie_estimate ?? msg.planData.calorie_target ?? 1600,
+                            meals: {
+                              breakfast:   { foods: d.meals?.breakfast?.foods  ?? [], note: "" },
+                              mid_morning: { foods: d.meals?.mid_morning?.foods ?? [], note: "" },
+                              lunch:       { foods: d.meals?.lunch?.foods      ?? [], note: "" },
+                              evening:     { foods: d.meals?.evening?.foods    ?? [], note: "" },
+                              dinner:      { foods: d.meals?.dinner?.foods     ?? [], note: "" },
+                            },
+                          })),
+                        });
+                      } finally { setPdfLoading(null); }
+                    }}>
+                    {pdfLoading === msg.id
+                      ? <><span style={{ animation:"spin 1s linear infinite", display:"inline-block" }}>⏳</span> Generating PDF…</>
+                      : <><FileDown size={13} style={{ marginRight:4 }} /> Download 7-day PDF</>
+                    }
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         ))}
@@ -302,7 +341,7 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
       <div className="nm-footer">
         <span className="nm-footer-copy">Built by Pratyaksh Agrawal</span>
         <div className="nm-footer-links">
-          <a href="https://www.linkedin.com/in/pratyaksh-agrawal-59b82928a/" target="_blank"
+          <a href="https://www.linkedin.com/in/pratyaksh-agrawal/" target="_blank"
             rel="noopener noreferrer" className="nm-footer-link">LinkedIn</a>
           <a href="#" title="Portfolio coming soon" target="_blank"
             rel="noopener noreferrer" className="nm-footer-link">Portfolio</a>
