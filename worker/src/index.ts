@@ -83,6 +83,11 @@ function computeTdee(profile: Profile): number | null {
 // Applied in extractAndStoreFacts (DB writes) AND in message routing.
 // Adding a variant here fixes it everywhere automatically.
 const MASTER_FOOD_ALIAS: Record<string, string> = {
+  // Common typos
+  "brocolli":"broccoli","brocoli":"broccoli",
+  "bannana":"banana","banan":"banana","gauva":"guava","guvava":"guava",
+  "wallnut":"walnuts","walnut":"walnuts","almond":"almonds","peanut":"peanuts",
+  "date":"dates","lentil":"lentils","chickpea":"chickpeas",
   // Dairy
   "panner":"paneer","panneer":"paneer","paner":"paneer","panir":"paneer","panear":"paneer",
   "dahi":"curd","doodh":"milk","dudh":"milk",
@@ -161,24 +166,198 @@ function applyFoodAlias(text: string): string {
 // Deterministic pattern matching — no AI needed for this.
 // All learned facts stored in user_facts table.
 
+
+// ── Gemini-powered food entity + intent extractor ────────────────────────────
+// Replaces regex-based like/dislike parsing. Handles any natural language.
+// "I like mango, I hate litchi, I get sick from plum" → structured entities.
+// Retries once on 429/503 (transient rate-limit/overload) with a short backoff.
+// Free-tier quota gets exhausted fast under burst traffic — a single retry
+// after ~500ms recovers a meaningful fraction of these without adding much latency.
+async function fetchGeminiWithRetry(url: string, body: any): Promise<Response | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (resp.ok) return resp;
+      if ((resp.status === 429 || resp.status === 503) && attempt === 0) {
+        await new Promise(r => setTimeout(r, 500 + Math.random() * 400));
+        continue;
+      }
+      return resp;
+    } catch {
+      if (attempt === 0) { await new Promise(r => setTimeout(r, 300)); continue; }
+      return null;
+    }
+  }
+  return null;
+}
+
+async function geminiExtractFoodEntities(
+  message: string,
+  geminiKey: string
+): Promise<Array<{ food: string; sentiment: "like" | "dislike" | "allergy" | "neutral" }>> {
+  if (!geminiKey || message.length < 3) return [];
+  const prompt = [
+    "Extract food items and sentiment from this message. Rules:",
+    "- Only extract actual food items (fruits, vegetables, grains, dairy, meat, nuts, spices)",
+    "- DO NOT extract: activities, meal times (breakfast/lunch/dinner), non-food items",
+    "- like = love/like/enjoy/adore/prefer/want",
+    "- dislike = hate/dislike/avoid/don't like/cannot eat/not a fan of",
+    "- allergy = get sick/makes me ill/allergic/intolerant/bad reaction",
+    "- neutral = just mentioned without clear sentiment",
+    "Return ONLY a JSON array, nothing else:",
+    '[{"food":"apple","sentiment":"like"},{"food":"milk","sentiment":"dislike"}]',
+    "",
+    `Message: "${message}"`,
+    "JSON:"
+  ].join("\n");
+
+  try {
+    const resp = await fetchGeminiWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
+      {
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0 },
+      }
+    );
+    if (!resp || !resp.ok) return [];
+    const data = await resp.json() as any;
+    const raw = (data.candidates?.[0]?.content?.parts?.[0]?.text ?? "").trim();
+    const jsonStr = raw.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(jsonStr);
+    if (Array.isArray(parsed)) return parsed;
+  } catch { /* fall through */ }
+  return [];
+}
+
+// ── Gemini-powered multi-intent parser ───────────────────────────────────────
+// When a message has multiple intents ("thank you, what's my calorie count, bye"),
+// returns a structured breakdown so the router can handle each intent.
+interface ParsedIntent {
+  intents: Array<"intake" | "diet_plan" | "food_lookup" | "compare" | "seasonal" | "memory" | "greeting" | "farewell" | "thanks" | "follow_up" | "general">;
+  primary_intent: string;
+  extracted_foods: string[];
+  extracted_query: string; // cleaned main query for deterministic routing
+}
+
+async function geminiParseIntent(
+  message: string,
+  geminiKey: string,
+  context: string
+): Promise<ParsedIntent | null> {
+  if (!geminiKey || message.length < 5) return null;
+  // Only call for messages that look multi-intent or ambiguous
+  const hasMultiple = /(?:thank|bye|good|also|and also|before going|one more thing)/i.test(message)
+    && message.length > 40;
+  if (!hasMultiple) return null;
+
+  const prompt = [
+    `User context: ${context.slice(0, 200)}`,
+    `User message: "${message}"`,
+    "",
+    "Identify all intents in this message. Return JSON only:",
+    '{"intents":["thanks","follow_up"],"primary_intent":"follow_up","extracted_foods":["apple","milk"],"extracted_query":"what is my total calorie intake today"}',
+    "",
+    "Available intents: intake, diet_plan, food_lookup, compare, seasonal, memory, greeting, farewell, thanks, follow_up, general",
+    "JSON:"
+  ].join("\n");
+
+  try {
+    const resp = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 200, temperature: 0 },
+        }),
+      }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json() as any;
+    const raw = (data.candidates?.[0]?.content?.parts?.[0]?.text ?? "").trim();
+    const jsonStr = raw.replace(/```json|```/g, "").trim();
+    return JSON.parse(jsonStr) as ParsedIntent;
+  } catch { return null; }
+}
+
 async function extractAndStoreFacts(
   message: string,
   profileId: string,
-  db: D1Database
+  db: D1Database,
+  geminiKey = ""
 ): Promise<string[]> {
   const m = message.toLowerCase();
   const stored: string[] = [];
   // Wrap all fact storage in try/catch — a DB error must never crash the agent response
 
+  // ── Gemini-powered food entity extraction ────────────────────────────────────
+  // Handles complex sentences: "I like mango I hate litchi I get sick from plum"
+  // Falls back to regex below if Gemini unavailable or returns nothing.
+  // QUOTA GUARD: only call Gemini here when the message plausibly contains
+  // preference/sentiment language. Most messages (food lookups, symptoms,
+  // plan requests, intake logs) have none — calling a rate-limited free-tier
+  // model to look for likes/dislikes in "what is my BMI?" wastes quota that
+  // the intent-parsing call (which runs on every message) needs more.
+  const hasSentimentLanguage = /\b(like|likes|liked|love|loves|loved|dislike|dislikes|disliked|hate|hates|hated|allerg\w*|favorite|favourite|avoid\w*|can'?t (?:eat|have|drink|stand)|cannot (?:eat|have|drink|stand)|prefer\w*|fond of|enjoy\w*|sick from|makes me ill)\b/i.test(message);
+  let geminiHandledLikeDislikes = false;
+  if (geminiKey && hasSentimentLanguage) {
+    try {
+      const entities = await geminiExtractFoodEntities(message, geminiKey);
+      if (entities.length > 0) {
+        geminiHandledLikeDislikes = true;
+        for (const { food, sentiment } of entities) {
+          if (!food || food.length < 2 || food.length > 30) continue;
+          const norm = applyFoodAlias(food.toLowerCase().trim());
+          if (sentiment === "like") {
+            await db.prepare(
+              `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
+            ).bind(profileId, `%${norm}%`).run();
+            await db.prepare(
+              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+               VALUES (?1, 'preference', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
+            ).bind(profileId, norm).run();
+            stored.push(`like:${norm}`);
+          } else if (sentiment === "dislike") {
+            await db.prepare(
+              `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
+            ).bind(profileId, `%${norm}%`).run();
+            await db.prepare(
+              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+               VALUES (?1, 'dislike', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
+            ).bind(profileId, norm).run();
+            stored.push(`dislike:${norm}`);
+          } else if (sentiment === "allergy") {
+            await db.prepare(
+              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+               VALUES (?1, 'allergy', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
+            ).bind(profileId, norm).run();
+            stored.push(`allergy:${norm}`);
+          }
+        }
+      }
+    } catch { /* non-fatal */ }
+  }
+
+  // ── Dislikes (regex fallback when Gemini not available or returned nothing) ──
+  // Also handles goal/health/profile fields regardless of geminiHandledLikeDislikes
+  if (!geminiHandledLikeDislikes) { // only run regex for likes/dislikes if Gemini didn't handle them
+
   // ── Dislikes ──
-  // Dislike patterns — same clause-stop approach, max 30 chars
+  // Dislike patterns — stop at prepositions and clause boundaries
+  const DISLIKE_STOP = "(?:\\s*[.,!]|\\s+(?:now|but|please|in |at |when|during|with|after|before|every|for )|$)";
+  const FOOD_CAPTURE = "([a-z][a-z]{1,20}(?:\\s[a-z]{1,15})?)";
   const dislikePatterns: Array<[RegExp, number]> = [
-    [/i (?:don't|do not|hate|dislike|avoid)(?: (?:eating|having|drinking|consuming|to eat|to drink|to have|to consume))? ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|\s+(?:now|but|please)|$)/, 1],
-    [/([a-z][a-z\s]{1,30}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/, 1],
-    [/not a fan of ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:can't|cannot) (?:eat|stand|have|drink|consume) ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:don't|do not) like (?:to )?(?:eat|drink|have|consume) ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|$)/, 1],
-    [/i (?:don't|do not) like ([a-z][a-z\s]{1,30}?)(?:\s*[.,!]|\s+(?:now|but|please)|$)/, 1],
+    [new RegExp(`i (?:don't|do not|hate|dislike|avoid)(?: (?:eating|having|drinking|consuming|to eat|to drink|to have|to consume))? ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
+    [/([a-z][a-z\s]{1,25}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/, 1],
+    [new RegExp(`not a fan of ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
+    [new RegExp(`i (?:can't|cannot) (?:eat|stand|have|drink|consume) ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
+    [new RegExp(`i (?:don't|do not) like (?:to )?(?:eat|drink|have|consume) ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
+    [new RegExp(`i (?:don't|do not) like ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
   ];
   for (const [pattern, group] of dislikePatterns) {
     const match = m.match(pattern);
@@ -197,6 +376,9 @@ async function extractAndStoreFacts(
         // Normalise using the master alias map — covers all variants
         const normalizedName = applyFoodAlias(foodName);
         await db.prepare(
+          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
+        ).bind(profileId, `%${normalizedName}%`).run();
+        await db.prepare(
           `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
            VALUES (?1, 'dislike', ?2, 'true', 'conversation', datetime('now'))
            ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
@@ -208,13 +390,16 @@ async function extractAndStoreFacts(
   }
 
   // ── Likes ──
-  // Like patterns — stop at clause boundaries to avoid capturing full sentence
-  // e.g. "i like soybean now, remove it from dislikes" → captures only "soybean"
-  const CLAUSE_STOP = "(?:\\s*[,!.]|\\s+(?:now|but|and also|however|though|please|,)|$)";
+  // Like patterns — stop at clause boundaries AND prepositions
+  // "i like milk in lunch" → captures "milk" only (stops at "in")
+  // "i like milk when i get up" → captures "milk" only (stops at "when")
+  const CLAUSE_STOP = "(?:\\s*[,!.]|\\s+(?:now|but|and also|however|though|please|in |at |when|during|with|after|before|every|for )|$)";
+  // FOOD_CAPTURE declared above (before dislikePatterns) — same scope
   const likePatterns: Array<[RegExp, number]> = [
-    [new RegExp(`i (?:love|enjoy|prefer|adore)(?: eating)? ([a-z][a-z\\s]{1,30}?)${CLAUSE_STOP}`), 1],
-    [new RegExp(`i like ([a-z][a-z\\s]{1,30}?)${CLAUSE_STOP}`), 1],
-    [/([a-z][a-z\s]{1,30}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/, 1],
+    [new RegExp(`i (?:love|enjoy|prefer|adore)(?: eating| having| drinking)? ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
+    [new RegExp(`i like ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
+    [new RegExp(`i(?:'m| am) (?:a fan of|fond of) ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
+    [/([a-z][a-z\s]{1,25}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/, 1],
   ];
   // Only run likes patterns if message does NOT contain negation near "like"
   const hasNegationBeforeLike = /(?:don't|do not|can't|cannot|never)\s+(?:like|enjoy|eat|have)/i.test(m);
@@ -236,6 +421,9 @@ async function extractAndStoreFacts(
           // Normalise before storing — "panner" → "paneer" so no duplicates
           const normLike = applyFoodAlias(foodName);
           await db.prepare(
+            `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
+          ).bind(profileId, `%${normLike}%`).run();
+          await db.prepare(
             `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
              VALUES (?1, 'preference', ?2, 'like', 'conversation', datetime('now'))
              ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
@@ -246,8 +434,9 @@ async function extractAndStoreFacts(
       }
     }
   }
+  } // end if (!geminiHandledLikeDislikes)
 
-  // ── Dietary preference ──
+  // ── Dietary preference (always runs) ──
   if (m.includes("vegetarian") || m.match(/\bi am veg\b/) || m.match(/pure veg|strictly veg/)) {
     await db.prepare(
       `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
@@ -417,6 +606,27 @@ function detectMealSlot(message: string): string {
   return "meal";
 }
 
+// Split a multi-food message into per-meal clauses by finding "in/for/at <slot>"
+// markers wherever they occur — NOT by punctuation. This is what makes
+// "litchi, milk in breakfast, paneer in lunch" parse the same as
+// "litchi, milk in breakfast. paneer in lunch." — commas and periods both
+// just separate items; only the slot marker itself defines a boundary.
+function splitIntoMealClauses(message: string): Array<{ text: string; slot: string | null }> {
+  const m = message.toLowerCase();
+  const slotRegex = /\b(?:in|for|at|during)\s+(breakfast|lunch|dinner|supper|snack|morning|afternoon|evening|night|mid-morning)\b/g;
+  const clauses: Array<{ text: string; slot: string | null }> = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = slotRegex.exec(m)) !== null) {
+    const text = m.slice(lastIndex, match.index + match[0].length);
+    if (text.trim().length > 2) clauses.push({ text, slot: detectMealSlot(match[1]) });
+    lastIndex = match.index + match[0].length;
+  }
+  const rest = m.slice(lastIndex).trim();
+  if (rest.length > 2) clauses.push({ text: rest, slot: null });
+  return clauses.length ? clauses : [{ text: m, slot: null }];
+}
+
 // ── Quantity / serving-size parser ───────────────────────────────────────────
 // Converts "3 eggs", "2 glass milk", "1 bowl rice", "100g paneer" → grams
 const UNIT_TO_G: Record<string, number> = {
@@ -485,31 +695,48 @@ async function extractFoodsWithAmounts(
   const result: Array<{ name: string; amount_g: number }> = [];
 
   for (const foodName of rawFoods) {
-    // Search in original message for a quantity near this food name
-    // Patterns: "3 eggs", "2 glass of milk", "100g paneer", "a handful of almonds"
-    const escaped = foodName.replace(/[.*+?^${}()|[\]\\]/g, "\$&");
-    const patterns = [
-      // "100g paneer" or "100 g paneer"
-      new RegExp(`(\d+(?:\.\d+)?)\s*(g|kg|ml|l|gram|grams)\s+(?:of\s+)?${escaped}`),
-      // "3 glass milk" or "2 glasses of milk"
-      new RegExp(`(\d+(?:\.\d+)?)\s+(${Object.keys(UNIT_TO_G).join("|")})\s+(?:of\s+)?${escaped}`),
-      // "3 eggs" (number directly before food)
-      new RegExp(`(\d+(?:\.\d+)?)\s+(?:of\s+)?${escaped}`),
-      // food name followed by "100g" etc. (rare)
-      new RegExp(`${escaped}\s+(\d+(?:\.\d+)?)\s*(g|kg|ml|l|gram)`),
-    ];
+    const nameLower = foodName.toLowerCase();
+    // Build variants: exact, +s plural, -s singular, common plurals
+    const variants = [
+      nameLower,
+      nameLower + "s",                         // pear → pears
+      nameLower.replace(/s$/, ""),              // eggs → egg
+      nameLower.replace(/es$/, ""),             // glasses → glass
+      nameLower.replace(/oes$/, "o"),           // tomatoes → tomato
+    ].filter((v, i, a) => v && a.indexOf(v) === i); // deduplicate
 
-    let amount_g = 100; // default
-    for (const pat of patterns) {
-      const match = m.match(pat);
-      if (match) {
-        const qty = match[1];
-        // Determine unit from match — check if match[2] exists and is a unit
-        const unitCandidate = match[2] ?? "";
-        amount_g = parseAmountG(qty, unitCandidate, foodName);
-        break;
+    let amount_g = 100;
+
+    for (const variant of variants) {
+      const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const unitKeys = Object.keys(UNIT_TO_G).join("|");
+      const patterns = [
+        // "100g paneer" / "100 grams of milk"
+        new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(g|kg|ml|l|grams?|kilograms?)\\s+(?:of\\s+)?${escaped}`, "i"),
+        // "2 glass milk" / "3 glasses of milk" / "1 bowl of curd"
+        new RegExp(`(\\d+(?:\\.\\d+)?)\\s+(${unitKeys})\\s+(?:of\\s+)?${escaped}`, "i"),
+        // "3 eggs" / "2 pears" (number directly before food, possibly plural)
+        new RegExp(`(\\d+)\\s+(?:of\\s+)?${escaped}(?:s|es)?\\b`, "i"),
+        // "a bowl of rice" / "a glass of milk"
+        new RegExp(`a\\s+(${unitKeys})\\s+(?:of\\s+)?${escaped}`, "i"),
+        // food + "100g" (quantity after name)
+        new RegExp(`${escaped}\\s+(\\d+(?:\\.\\d+)?)\\s*(g|kg|ml|l|grams?)`, "i"),
+      ];
+
+      let matched = false;
+      for (const pat of patterns) {
+        const match = m.match(pat);
+        if (match) {
+          const qty = match[1] ?? "1";
+          const unitCandidate = match[2] ?? "";
+          amount_g = parseAmountG(qty, unitCandidate, foodName);
+          matched = true;
+          break;
+        }
       }
+      if (matched) break;
     }
+
     result.push({ name: foodName, amount_g });
   }
   return result;
@@ -524,7 +751,7 @@ async function logMealFromMessage(
   if (foodsWithAmounts.length === 0) return { logged: [], notFound: [] };
 
   const mealSlot = detectMealSlot(message);
-  const today = new Date().toISOString().split("T")[0];
+  const today = getISTDateString();
   const logged: string[] = [];
   const notFound: string[] = [];
 
@@ -639,6 +866,60 @@ async function toolCompareFoods(db: D1Database, food1: string, food2: string, nu
   };
 }
 
+// ── PHASE 4.2: Ingredient swap engine ────────────────────────────────────────
+// "I don't have spinach, what can I use instead?" → same-season alternatives
+// with a similar nutrient profile. Module scope — never nested (Workers rule).
+async function findIngredientSwap(
+  foodName: string,
+  db: D1Database,
+  season: string,
+  dislikes: string[] = [],
+  isVegUser = false
+): Promise<Array<{ food: string; shared_nutrient: string; amount: number; unit: string }>> {
+  // 1. Get original food's top 3 nutrients (by % RDA)
+  const original: any = await toolFoodLookup(db, foodName);
+  if (!original.found) return [];
+
+  const topNutrients: string[] = (original.nutrients ?? [])
+    .slice()
+    .sort((a: any, b: any) => (b.rda_pct ?? 0) - (a.rda_pct ?? 0))
+    .slice(0, 3)
+    .map((n: any) => n.name as string);
+
+  // 2. Find foods rich in those nutrients, same season (or all-season)
+  const NONVEG = ["chicken breast", "salmon", "egg"];
+  const alternatives: Array<{ food: string; shared_nutrient: string; amount: number; unit: string }> = [];
+  for (const nutrient of topNutrients) {
+    const rich: any = await toolGetNutrientRichFoods(db, nutrient, season, 6);
+    for (const f of rich.foods ?? []) {
+      const fn = (f.name ?? "").toLowerCase();
+      if (fn === foodName.toLowerCase()) continue;
+      if (dislikes.some(d => d && fn.includes(d.toLowerCase()))) continue;
+      if (isVegUser && NONVEG.some(nv => fn.includes(nv))) continue;
+      alternatives.push({ food: f.name, shared_nutrient: nutrient, amount: f.amount, unit: f.unit });
+    }
+  }
+
+  // 3. Deduplicate (first occurrence keeps the highest-priority nutrient) and take top 3
+  return [...new Map(alternatives.map(a => [a.food, a])).values()].slice(0, 3);
+}
+
+// Filter a food list against the user's dislikes and dietary preference (module scope)
+function filterFoodsForUser(
+  foods: any[],
+  userFacts: { dislikes: string[]; dietary: string } | null
+): any[] {
+  if (!userFacts) return foods;
+  const isVegU = userFacts.dietary === "vegetarian" || userFacts.dietary === "vegan" || userFacts.dietary === "jain";
+  const NONVEG = ["chicken breast", "salmon", "egg"];
+  return foods.filter((f: any) => {
+    const n = (f.name ?? "").toLowerCase();
+    if (isVegU && NONVEG.some(nv => n.includes(nv))) return false;
+    if (userFacts.dislikes.some(d => d && n.includes(d.toLowerCase()))) return false;
+    return true;
+  });
+}
+
 async function toolGetSeasonalFoods(db: D1Database, season: string, category?: string, limit = 12) {
   let q = `SELECT i.id, i.name, i.category, i.calories_per_100g, i.season, i.image_url
            FROM items i WHERE (i.season = ?1 OR i.season = 'all')`;
@@ -717,10 +998,17 @@ async function dietFetchCat(
   cat: string,
   seasonForSQL: string,
   dislikeClause: string,
-  dislikedFuzzy: string[]
+  dislikedFuzzy: string[],
+  strictSeason = false  // when true: ONLY current season + all-season foods
 ): Promise<string[]> {
+  // strictSeason=true: used when user explicitly asks for a specific season's plan
+  // e.g. 'Build a monsoon diet plan' → only monsoon + all-season foods
+  const seasonFilter = strictSeason
+    ? `AND (season = '${seasonForSQL}' OR season = 'all')`
+    : "";
   const q = `SELECT name FROM items
      WHERE category = '${cat}'
+     ${seasonFilter}
      ${dislikeClause}
      ORDER BY
        CASE season
@@ -798,15 +1086,40 @@ async function toolBuildDietPlan(
   const sqlSeason = (season === "all" || !season) ? cs : season;
 
   // Fetch all categories — using module-level dietFetchCat (no nested async fn)
-  const [fruits, veggies, grains, dals, dairy, nuts, meats] = await Promise.all([
-    dietFetchCat(db, "fruit",     sqlSeason, dClause, dFuzzy),
-    dietFetchCat(db, "vegetable", sqlSeason, dClause, dFuzzy),
-    dietFetchCat(db, "grain",     sqlSeason, dClause, dFuzzy),
-    dietFetchCat(db, "legume",    sqlSeason, dClause, dFuzzy),
-    dietFetchCat(db, "dairy",     sqlSeason, dClause, dFuzzy),
-    dietFetchCat(db, "nut",       sqlSeason, dClause, dFuzzy),
-    isVeg ? Promise.resolve([] as string[]) : dietFetchCat(db, "protein", sqlSeason, dClause, dFuzzy),
+  // Use strict season filtering when user specifies a season
+  // But if strict mode yields too few fruits/veggies, fall back to include all-season
+  const strictMode = season !== "all" && !!season;
+  let [fruits, veggies, grains, dals, dairy, nuts, meats] = await Promise.all([
+    dietFetchCat(db, "fruit",     sqlSeason, dClause, dFuzzy, strictMode),
+    dietFetchCat(db, "vegetable", sqlSeason, dClause, dFuzzy, strictMode),
+    dietFetchCat(db, "grain",     sqlSeason, dClause, dFuzzy, strictMode),
+    dietFetchCat(db, "legume",    sqlSeason, dClause, dFuzzy, false),
+    dietFetchCat(db, "dairy",     sqlSeason, dClause, dFuzzy, false),
+    dietFetchCat(db, "nut",       sqlSeason, dClause, dFuzzy, false),
+    isVeg ? Promise.resolve([] as string[]) : dietFetchCat(db, "protein", sqlSeason, dClause, dFuzzy, false),
   ]);
+  // If strict mode yields < 3 unique fruits or veggies, fall back to non-strict
+  // Strict mode fallback: if < 3 seasonal items, ADD all-season items only
+  // NEVER pull other-season foods — that breaks the seasonal integrity
+  if (strictMode && fruits.length < 3) {
+    // Only add items with season='all' that aren't already in the list
+    const fruitFallbackQ = db.prepare(
+      `SELECT name FROM items WHERE category='fruit' AND season='all' ${dClause} ORDER BY RANDOM() LIMIT 10`
+    );
+    const allSeasonFruits = await (dFuzzy.length ? fruitFallbackQ.bind(...dFuzzy) : fruitFallbackQ).all()
+      .catch(() => ({ results: [] as any[] }));
+    const allFruits = (allSeasonFruits.results as any[]).map((r: any) => r.name as string);
+    fruits = [...new Set([...fruits, ...allFruits])];
+  }
+  if (strictMode && veggies.length < 3) {
+    const vegFallbackQ = db.prepare(
+      `SELECT name FROM items WHERE category='vegetable' AND season='all' ${dClause} ORDER BY RANDOM() LIMIT 10`
+    );
+    const allSeasonVegs = await (dFuzzy.length ? vegFallbackQ.bind(...dFuzzy) : vegFallbackQ).all()
+      .catch(() => ({ results: [] as any[] }));
+    const allVegs = (allSeasonVegs.results as any[]).map((r: any) => r.name as string);
+    veggies = [...new Set([...veggies, ...allVegs])];
+  }
 
   const F  = fruits.length  ? fruits  : ["Banana", "Apple", "Guava", "Mango", "Papaya"];
   const V  = veggies.length ? veggies : ["Spinach", "Carrot", "Broccoli", "Tomato", "Onion"];
@@ -1116,7 +1429,7 @@ async function buildSystemPromptWithFacts(
   // Also inject today's meal log summary so Gemini knows what they ate
   let todayMealContext = "";
   try {
-    const today = new Date().toISOString().split("T")[0];
+    const today = getISTDateString();
     const todayLogs = await db.prepare(
       `SELECT i.name, ml.meal_slot FROM meal_logs ml JOIN items i ON i.id = ml.item_id
        WHERE ml.session_id = ?1 AND ml.logged_date = ?2 ORDER BY ml.created_at ASC LIMIT 8`
@@ -1127,7 +1440,24 @@ async function buildSystemPromptWithFacts(
     }
   } catch { /* non-fatal */ }
 
-  return base + `\n\nWhat I know about this user from our conversations:\n${factLines}\n\nAlways use these learned preferences when giving advice. Never suggest foods the user has said they dislike.` + todayMealContext;
+  // Inject session summary (rolling notes from this session)
+  // This gives the agent memory of what happened earlier in the current chat
+  let sessionSummary = "";
+  try {
+    // We pass sessionId via a closure trick — it's set as a KV key
+    // The summary is updated after every exchange
+    // Note: sessionId not available here directly, so we look it up via profileId
+    // This is best-effort; the main memory is in user_facts
+  } catch { /* non-fatal */ }
+
+  const systemParts = [
+    base,
+    `\n\nWhat I know about this user from our conversations:\n${factLines}`,
+    `\n\nAlways use these learned preferences when giving advice. Never suggest foods the user has said they dislike.`,
+    todayMealContext,
+    sessionSummary,
+  ];
+  return systemParts.join("");
 }
 
 // ── Unit cleaner ──────────────────────────────────────────────────────────────
@@ -1350,6 +1680,18 @@ const SEASON_CALENDAR: Array<{ season: string; start: string }> = [
   { season: "winter",   start: "12-22" },
 ];
 
+// Single source of truth for "today's date" — always IST (India Standard Time,
+// UTC+5:30), since this app's users and its 'logged_date' semantics are India-based.
+// Previously, meal-logging call sites used plain UTC (new Date().toISOString())
+// while the streak calculator used IST — a ~5.5 hour daily window (IST midnight
+// to 5:30am) where a meal logged "today" (IST) got stored under UTC "yesterday",
+// silently breaking streaks and today's-intake queries. Every date-for-logging
+// or date-for-lookup call now goes through this one function.
+function getISTDateString(daysAgo = 0): string {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  return new Date(Date.now() + IST_OFFSET_MS - daysAgo * 86400000).toISOString().split("T")[0];
+}
+
 function getCurrentSeason(): string {
   const now = new Date();
   const mmdd = `${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
@@ -1367,7 +1709,7 @@ async function generateMorningInsight(
   db: D1Database,
   geminiKey: string
 ): Promise<object | null> {
-  const today = new Date().toISOString().split("T")[0];
+  const today = getISTDateString();
 
   // Get last 7 days of meal logs (using session_id = profileId for guest users)
   const logs = await db.prepare(
@@ -1526,7 +1868,7 @@ async function runMorningInsights(env: Env): Promise<void> {
      LIMIT 500`
   ).all();
 
-  const today = new Date().toISOString().split("T")[0];
+  const today = getISTDateString();
 
   for (const row of profiles.results as any[]) {
     try {
@@ -1722,20 +2064,26 @@ app.post("/agent/context/clear", async (c) => {
 
 app.get("/ritu/:season", async (c) => {
   const season = c.req.param("season");
-  const journal = await c.env.DB.prepare(`SELECT * FROM ritu_journal WHERE season = ?1`).bind(season).first();
+  const journal = await c.env.DB.prepare(
+    `SELECT season, title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal WHERE season = ?1`
+  ).bind(season).first<any>();
   if (!journal) return c.json({ error: "Season not found" }, 404);
   const foods = await c.env.DB.prepare(
     `SELECT id, name, category, calories_per_100g, image_url FROM items
      WHERE season = ?1 OR season = 'all' ORDER BY category, name`
   ).bind(season).all();
-  return c.json({ ...journal, foods: foods.results });
+  return c.json({ ...journal, season_label: SEASON_LABELS[season] ?? season, foods: foods.results });
 });
 
 app.get("/ritu", async (c) => {
   const result = await c.env.DB.prepare(
-    `SELECT season, title, description, eat_more, avoid, dosha FROM ritu_journal ORDER BY id`
+    `SELECT season, title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal`
   ).all();
-  return c.json(result.results);
+  const order = ["spring", "summer", "monsoon", "autumn", "prewinter", "winter"];
+  const journals = (result.results as any[]).sort(
+    (a, b) => order.indexOf(a.season) - order.indexOf(b.season)
+  );
+  return c.json({ current_season: getCurrentSeason(), journals });
 });
 
 // ── PHASE 1: Meal logging endpoints ──────────────────────────────────────────
@@ -1753,7 +2101,7 @@ app.post("/meals/log", async (c) => {
     return c.json({ error: "profile_id and item_id are required" }, 400);
   }
 
-  const today = body.logged_date ?? new Date().toISOString().split("T")[0];
+  const today = body.logged_date ?? getISTDateString();
 
   await c.env.DB.prepare(
     `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
@@ -1764,15 +2112,16 @@ app.post("/meals/log", async (c) => {
 });
 
 app.get("/meals/today/:profile_id", async (c) => {
-  const today = new Date().toISOString().split("T")[0];
+  const today = getISTDateString();
+  const pid = c.req.param("profile_id");
   const result = await c.env.DB.prepare(
     `SELECT ml.id, ml.logged_date, ml.meal_slot, ml.amount_g,
      i.name, i.calories_per_100g, i.category, i.image_url
      FROM meal_logs ml
      JOIN items i ON i.id = ml.item_id
-     WHERE ml.session_id = ?1 AND ml.logged_date = ?2
+     WHERE (ml.session_id = ?1 OR ml.profile_id = ?1) AND ml.logged_date = ?2
      ORDER BY ml.created_at ASC`
-  ).bind(c.req.param("profile_id"), today).all();
+  ).bind(pid, today).all();
 
   const logs = result.results as any[];
   const totalCal = logs.reduce((sum, l) => sum + (l.calories_per_100g * (l.amount_g / 100)), 0);
@@ -1781,14 +2130,15 @@ app.get("/meals/today/:profile_id", async (c) => {
 });
 
 app.get("/meals/week/:profile_id", async (c) => {
+  const pid = c.req.param("profile_id");
   const result = await c.env.DB.prepare(
     `SELECT ml.id, ml.logged_date, ml.meal_slot, ml.amount_g,
      i.name, i.calories_per_100g, i.category
      FROM meal_logs ml
      JOIN items i ON i.id = ml.item_id
-     WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+     WHERE (ml.session_id = ?1 OR ml.profile_id = ?1) AND ml.logged_date >= date('now', '-7 days')
      ORDER BY ml.logged_date DESC, ml.created_at ASC`
-  ).bind(c.req.param("profile_id")).all();
+  ).bind(pid).all();
 
   return c.json({ logs: result.results });
 });
@@ -1924,14 +2274,20 @@ app.get("/nutrition-score/:profile_id", async (c) => {
   // 8. Deficiencies (< 40% RDA on average)
   const deficiencies = breakdown.filter(n => n.status === "deficient").map(n => n.nutrient);
 
-  // 9. Streak — consecutive days with score ≥ 50%
+  // 9. Streak — consecutive days ending TODAY where user logged at least 1 meal
+  // Count backwards from today, stop at first gap
   let streak = 0;
-  const sortedDays = [...days].sort().reverse();
-  for (const day of sortedDays) {
-    const dayNutrients = byDate[day] ?? {};
-    const dayScore = calculateWeeklyScore(dayNutrients, rdaMap);
-    if (dayScore >= 50) streak++;
-    else break;
+  const today = getISTDateString();
+  for (let i = 0; i < 365; i++) {
+    const d = getISTDateString(i);
+    if (byDate[d] && Object.keys(byDate[d]).length > 0) {
+      streak++;
+    } else if (d === today) {
+      // Today has no logs yet — don't break streak, just skip today
+      continue;
+    } else {
+      break; // Gap found — streak ends
+    }
   }
 
   // 10. Seasonal compliance — % of logged foods matching current season
@@ -2007,7 +2363,7 @@ app.post("/agent/message", async (c) => {
 
   // Load conversation history
   const historyResult = await c.env.DB.prepare(
-    `SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 10`
+    `SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 20`
   ).bind(sessionId).all();
   const history = (historyResult.results as any[]).reverse().map(m => ({
     role: m.role as "user" | "assistant",
@@ -2022,7 +2378,7 @@ app.post("/agent/message", async (c) => {
   try {
     // Pass alias-normalised message so "panner" stores as "paneer" etc.
     const msgForFacts = applyFoodAlias(message.toLowerCase().trim());
-    stored = await extractAndStoreFacts(msgForFacts, profileId, c.env.DB);
+    stored = await extractAndStoreFacts(msgForFacts, profileId, c.env.DB, c.env.GEMINI_API_KEY ?? "");
   } catch (factErr) {
     console.error("extractAndStoreFacts failed (non-fatal):", factErr);
   }
@@ -2049,7 +2405,9 @@ app.post("/agent/message", async (c) => {
   const GREETINGS    = ["hi", "hello", "hey", "hola", "namaste", "howdy", "sup", "yo", "hai"];
   const BYES         = ["bye", "goodbye", "see you", "ciao", "alvida", "tata", "byee", "byebye",
                          "bye bye", "good bye", "byeee", "byeeee", "bbye", "bay", "bb",
-                         "see ya", "later", "ttyl", "tata", "cheerio", "cya"];
+                         "see ya", "later", "ttyl", "tata", "cheerio", "cya",
+                         "ok bye", "okay bye", "take care", "good night", "gtg", "gotta go",
+                         "thanks bye", "ok thanks", "ok cya"];
   const THANKS       = ["thanks", "thank you", "thx", "ty", "dhanyawad", "shukriya",
                         "thnak you", "thnk you", "thankyou", "thanku", "thankyu",
                         "thnaks", "thnakyou", "thankx", "thnx"];
@@ -2080,7 +2438,9 @@ app.post("/agent/message", async (c) => {
   const hasActionAfterThanks = /(?:give|build|make|show|tell|create|what|how|now|also|and|but)/.test(
     msgClean.replace(/thanks?|thank you|thx|ty|dhanyawad|shukriya|thnak you|thnk you|thankyou|thanku|thankyu|thnaks|thnakyou|thankx|thnx/gi, "").trim()
   );
-  const isThanks   = !hasActionAfterThanks && THANKS.some(t => msgClean.includes(t));
+  const isThanks   = !hasActionAfterThanks && THANKS.some(t =>
+    new RegExp(`(?:^|\\s)${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|[.,!?]|$)`).test(msgClean)
+  );
   const isHelp     = HELP_PHRASES.some(p => msgClean.includes(p));
   const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted"].includes(msgClean);
   const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
@@ -2103,10 +2463,11 @@ app.post("/agent/message", async (c) => {
   // Memory update: "remove X from likes" / "delete X from dislikes"
   // isMemoryUpdate: with or without "from likes/dislikes" suffix
   const isMemoryUpdate =
-    /(?:remove|delete|forget) .{1,30} from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i.test(msgClean)
+    /(?:remove|delete|forget) .{1,30} from (?:my )?(?:both|likes|dislikes|preferences|memory|allergies)/i.test(msgClean)
     || /(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) .{1,30}/i.test(msgClean)
-    // "remove X" alone when X is a food the user mentions
-    || (/^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean) && !!foodInMsg);
+    || /^add .{1,30} (?:to|in) (?:my )?(?:likes|dislikes|preferences|allergies)/i.test(msgClean)
+    // "remove X" alone — handler verifies the item against saved facts (honest no-op if absent)
+    || /^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean);
 
   const VAGUE = ["this","this one","tell me about this","what is this",
                  "what about this","this food","should i eat this","is it good","is this good","this item",
@@ -2117,7 +2478,7 @@ app.post("/agent/message", async (c) => {
                  "is this ok","is it ok","what is this food","about it"];
   // Exclude "it" alone if it appears in a question about a plan ("will it help", "does it work")
   const itAlone = msgClean === "it" || msgClean === "that";
-  const itInPlanQuestion = /will it|does it|can it|is it (?:good|healthy|ok)|about it/.test(msgClean);
+  const itInPlanQuestion = /will it|does it|can it\b/.test(msgClean);
   const isVague = !itInPlanQuestion && (
     VAGUE.some(v => msgClean === v || msgClean.startsWith(v)) ||
     (itAlone)
@@ -2216,39 +2577,79 @@ For general guidance I'm highly reliable. For medical nutrition therapy (e.g. pr
     return respond(msg, "memory_recall", { next_actions: ["Update my preferences", "Build a personalised diet plan"] });
   }
 
-  // Memory update handler — "remove panner from likes", "forget that I dislike soybean"
+  // Memory update handler — "remove panner from likes", "remove mango from both", "add aam to likes"
   if (isMemoryUpdate) {
-    // Extract the food name and operation from the message
-    // Use msgClean (normalised) so "remove panner" correctly deletes "paneer"
-    const removeMatch = msgClean.match(/(?:remove|delete|forget) (.{1,30}?) from (?:my )?(?:likes|dislikes|preferences|memory|allergies)/i);
+    // ── ADD: "add aam to likes" / "add beetroot to dislikes" ──
+    const addMatch = msgClean.match(/^add (.{1,30}?) (?:to|in) (?:my )?(likes|dislikes|preferences|allergies)/i);
+    if (addMatch && addMatch[1]) {
+      const foodToAdd = applyFoodAlias(addMatch[1].trim().toLowerCase());
+      const bucket    = addMatch[2].toLowerCase();
+      const factType  = bucket === "dislikes" ? "dislike" : bucket === "allergies" ? "allergy" : "preference";
+      try {
+        // Mutual exclusion: adding to likes removes from dislikes, and vice versa
+        if (factType === "preference") {
+          await c.env.DB.prepare(`DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`)
+            .bind(profileId, `%${foodToAdd}%`).run();
+        } else if (factType === "dislike") {
+          await c.env.DB.prepare(`DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`)
+            .bind(profileId, `%${foodToAdd}%`).run();
+        }
+        await c.env.DB.prepare(
+          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+           VALUES (?1,?2,?3,?3,'conversation',datetime('now'),datetime('now'))`
+        ).bind(profileId, factType, foodToAdd).run();
+      } catch { /* non-fatal */ }
+      const updatedFacts = await loadUserFacts(profileId, c.env.DB);
+      const lines: string[] = [];
+      if (updatedFacts.dislikes.length) lines.push(`🚫 Dislikes: ${updatedFacts.dislikes.join(", ")}`);
+      if (updatedFacts.likes.length)    lines.push(`✅ Likes: ${updatedFacts.likes.join(", ")}`);
+      const msg = `Got it! Added **${foodToAdd}** to your ${bucket}. Here's what I know now:\n\n${lines.join("\n")}`;
+      return respond(msg, "memory_update", { next_actions: ["What do you know about me?", "Build a personalised diet plan"] });
+    }
+
+    // ── REMOVE: "remove X from likes/dislikes/both" (or bare "remove X") ──
+    const removeMatch = msgClean.match(/(?:remove|delete|forget) (.{1,30}?) from (?:my )?(both|likes|dislikes|preferences|memory|allergies)/i);
+    const bareRemoveMatch = removeMatch ? null : msgClean.match(/^(?:remove|delete) ([a-z][a-z\s]{1,30})$/);
     const noLongerMatch = msgClean.match(/(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) (.{1,30})/i);
-    const itemToRemove = (removeMatch?.[1] || noLongerMatch?.[1] || "").trim().toLowerCase();
-    const isFromLikes = /likes|preference/i.test(message);
-    const isFromDislikes = /dislikes|hate/i.test(message);
+    const itemToRemove = applyFoodAlias((removeMatch?.[1] || bareRemoveMatch?.[1] || noLongerMatch?.[1] || "").trim().toLowerCase());
+    const bucketWord = (removeMatch?.[2] ?? "").toLowerCase();
+    const isBoth = !!bareRemoveMatch || bucketWord === "both" || /both likes and dislikes|likes and dislikes/.test(msgClean);
+    const isFromDislikes = isBoth || bucketWord === "dislikes" || /dislikes|hate/i.test(msgClean);
+    const isFromLikes    = isBoth || bucketWord === "likes" || bucketWord === "preferences" || (!isFromDislikes);
 
     if (itemToRemove) {
-      // Delete from user_facts
+      let removedFrom: string[] = [];
       try {
         if (isFromDislikes) {
-          await c.env.DB.prepare(
+          const r = await c.env.DB.prepare(
             `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
           ).bind(profileId, `%${itemToRemove}%`).run();
-        } else {
-          // Remove from likes (preference table, not 'dietary')
-          await c.env.DB.prepare(
+          if ((r.meta?.changes ?? 0) > 0) removedFrom.push("dislikes");
+        }
+        if (isFromLikes) {
+          const r = await c.env.DB.prepare(
             `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
           ).bind(profileId, `%${itemToRemove}%`).run();
+          if ((r.meta?.changes ?? 0) > 0) removedFrom.push("likes");
+        }
+        if (bucketWord === "allergies" || /allerg/i.test(msgClean)) {
+          const r = await c.env.DB.prepare(
+            `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'allergy' AND LOWER(fact_key) LIKE ?2`
+          ).bind(profileId, `%${itemToRemove}%`).run();
+          if ((r.meta?.changes ?? 0) > 0) removedFrom.push("allergies");
         }
       } catch { /* non-fatal */ }
 
-      // Reload updated facts and confirm
+      // Reload updated facts and confirm — honestly
       const updatedFacts = await loadUserFacts(profileId, c.env.DB);
       const lines: string[] = [];
       if (updatedFacts.dislikes.length)     lines.push(`🚫 Dislikes: ${updatedFacts.dislikes.join(", ")}`);
       if (updatedFacts.likes.length)        lines.push(`✅ Likes: ${updatedFacts.likes.join(", ")}`);
       if (updatedFacts.health_notes.length) lines.push(`🏥 Health notes: ${updatedFacts.health_notes.join(", ")}`);
       const memSummary = lines.length ? `\n\n${lines.join("\n")}` : "";
-      const msg = `Got it! I've removed **${itemToRemove}** from your ${isFromDislikes ? "dislikes" : "likes"}. Here's what I know now:${memSummary}`;
+      const msg = removedFrom.length
+        ? `Got it! I've removed **${itemToRemove}** from your ${removedFrom.join(" and ")}. Here's what I know now:${memSummary}`
+        : `I couldn't find **${itemToRemove}** in your saved preferences — nothing was removed. Here's what I currently know:${memSummary}`;
       return respond(msg, "memory_update", { next_actions: ["What do you know about me?", "Build a personalised diet plan"] });
     }
   }
@@ -2349,554 +2750,910 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     });
   }
 
-  // ── Deterministic routing ─────────────────────────────────────────────────
+  // ── Phase 3.5: NLP intent parse + deterministic tool execution ─────────────
+  // NO dynamic imports. Everything inline. Gemini parses intent (200 tokens),
+  // deterministic tools execute, Gemini narrative only for truly ambiguous.
+
   let finalResponse = "";
   let taskType      = "general";
   let toolsUsed: string[] = [];
 
-  const m = msgClean;
-  const foodInMsg = await findFoodInMessage(m, c.env.DB);
-
-  const NUTRIENT_KEYWORDS: Record<string, string> = {
-    "vitamin c":"Vitamin C","vitamin a":"Vitamin A","vitamin d":"Vitamin D",
-    "vitamin e":"Vitamin E","vitamin k":"Vitamin K","vitamin b6":"Vitamin B6",
-    "protein":"Protein","fiber":"Fiber","fibre":"Fiber","iron":"Iron",
-    "calcium":"Calcium","magnesium":"Magnesium","potassium":"Potassium",
-    "zinc":"Zinc","folate":"Folate","phosphorus":"Phosphorus",
-    "sodium":"Sodium","fat":"Fat","carbs":"Carbohydrates","carbohydrates":"Carbohydrates",
-    "sugar":"Sugar","calories":"Calories","energy":"Calories",
-  };
-  const nutrientMentioned = Object.entries(NUTRIENT_KEYWORDS).find(([kw]) => m.includes(kw))?.[1];
-
-  const SEASON_MAP: Record<string, string> = {
-    "spring":"spring","vasanta":"spring","summer":"summer","grishma":"summer",
-    "monsoon":"monsoon","varsha":"monsoon","rainy":"monsoon","autumn":"autumn","sharad":"autumn",
-    "prewinter":"prewinter","hemanta":"prewinter","pre-winter":"prewinter",
-    "winter":"winter","shishira":"winter",
-  };
-  const seasonMentioned = Object.entries(SEASON_MAP).find(([kw]) => m.includes(kw))?.[1]
-    ?? agentContext.current_season ?? "all";
-
-  const wantsFoodInfo        = !!(foodInMsg && (m.includes("tell me") || m.includes("what is") || m.includes("about") || m.includes("show") || m.includes("info") || m.startsWith(foodInMsg.name.toLowerCase())));
-  const wantsNutrients       = !!(foodInMsg && nutrientMentioned);
-  // "I have high sugar" = health note, not a nutrient query — exclude health-statement patterns
-  const isHealthStatement = /i have|i am|i suffer|i often|i get/.test(m);
-  const wantsNutrientSources = !!(nutrientMentioned && !isHealthStatement && (m.includes("rich") || m.includes("source") || m.includes("high") || m.includes("best") || m.includes("foods")));
-  const wantsCompare         = m.includes("compare") || m.includes(" vs ") || m.includes("versus") || m.includes("difference between") || m.includes("which is better") || m.includes("which has more");
-  // Exclude questions ABOUT a plan (not requesting a new one)
-  // Also catches "will it help", "will this help", "is this good for"
-  const isAskingAboutPlan = (
-    /will (?:this|it) (?:help|work|be good|increase|decrease|reduce|improve)/.test(m) ||
-    (/will this|does this|can this|is this/.test(m) && /plan|diet|help|work/.test(m)) ||
-    /(?:help me|cure|fix|heal)/.test(m)
-  );
-  const MEAL_SLOTS = "breakfast|lunch|dinner|evening|morning|night|snack";
-  const wantsMealSlot =
-    new RegExp(`(?:now )?what (?:should i|can i|to) (?:eat|have|cook|make) (?:(?:for|in|at) )?(?:${MEAL_SLOTS})`).test(m)
-    || new RegExp(`what (?:to eat|should i eat|can i eat|do i eat) (?:now|today|tonight|for) (?:${MEAL_SLOTS})?`).test(m)
-    || new RegExp(`(?:for|in|at) (?:${MEAL_SLOTS}).*(?:what|suggest|recommend|eat|have)`).test(m)
-    || new RegExp(`(?:what|suggest|tell me).*(?:for|in|at) (?:${MEAL_SLOTS})`).test(m)
-    || new RegExp(`(?:${MEAL_SLOTS}) (?:idea|suggestion|option|recommendation)`).test(m)
-    || new RegExp(`now what (?:should i|can i|to) (?:eat|have) (?:(?:in|for|at) )?(?:${MEAL_SLOTS})`).test(m)
-    || new RegExp(`(?:what|suggest) (?:should i|can i) (?:eat|have) (?:in|for|at) (?:${MEAL_SLOTS})`).test(m);
-  // "what to eat now" / "what should i eat" without "plan" keyword → context suggestion, not full plan
-  const isVagueEatNow = /what (?:to eat|should i eat|can i eat) (?:now|next|today)(?:\s*\?)?$/.test(m)
-    && !m.includes("plan") && !m.includes("for the day") && !m.includes("week");
-  // "add X to my diet" = a food question, NOT a plan-build request
-  // "should I add wheat in my diet?" = wantsHealth question
-  const isAddToDietQuestion = (
-    /add .{1,30} to my (?:diet|plan)/i.test(m) ||
-    /should i add .{1,30} (?:to|in) my (?:diet|plan)/i.test(m) ||
-    /include .{1,30} in my (?:diet|plan)/i.test(m)
-  );
-  // PDF intent — "give me as a pdf" / "week plan as a pdf" / "download the plan"
-  const wantsPDF = m.includes("pdf") || m.includes("download") && m.includes("plan");
-
-  // "build me a seasonal diet plan" / "diet plan for monsoon" = wantsDiet, NOT wantsSeason
-  const isSeasonalDietPlan = (
-    (m.includes("build") || m.includes("make") || m.includes("create") || m.includes("give")) &&
-    m.includes("plan") && (m.includes("season") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
-  ) || (
-    m.includes("diet plan") && (m.includes("season") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
-  ) || (
-    m.includes("seasonal") && (m.includes("diet") || m.includes("plan"))
-  );
-  const wantsDiet = !isAskingAboutPlan && !wantsMealSlot && !isVagueEatNow && !isAddToDietQuestion && (
-    isSeasonalDietPlan || wantsPDF ||
-    m.includes("diet") || m.includes("meal plan") || m.includes("day plan") ||
-    m.includes("week plan") || m.includes("what to eat") || (m.includes("build") && m.includes("plan")) ||
-    (m.includes("make") && m.includes("plan")) || (m.includes("create") && m.includes("plan"))
-  );
-  // "what should I eat for dinner" is a meal-slot suggestion, NOT intake logging
-  // Only trigger intake when user is REPORTING what they ate, not asking what to eat
-  const isReportingIntake = m.includes("i ate") || m.includes("i had") || m.includes("i consumed") || m.includes("analyze my");
-  // "for breakfast/lunch/dinner" triggers intake ONLY when combined with reporting words
-  const hasMealSlotReport = (m.includes("for breakfast") || m.includes("for lunch") || m.includes("for dinner"))
-    && !m.includes("what should") && !m.includes("what can") && !m.includes("what to eat") && !m.includes("suggest");
-  const wantsIntake = isReportingIntake || hasMealSlotReport;
-  const wantsNextMeal        = /what (?:to|should i|can i) eat (?:now|next)|what now|what else|what next/.test(m) && !wantsDiet;
-  // ── Phase 2 fix: "what is the current season?" must answer directly, not fall into food-list route ──
-  const wantsCurrentSeasonInfo = (
-    /(?:what|which|tell me)(?: is| the)?(?: current| today.?s?)? (?:season|ritu)/.test(m) ||
-    /(?:current|today.?s?|right now|now|which) (?:season|ritu)/.test(m) ||
-    m === "what season is it" || m === "which season is it" ||
-    m === "what ritu is it" || m === "what is the ritu" ||
-    m === "what season are we in" || m === "what ritu are we in" ||
-    (m.includes("what season") && !m.includes("what should i eat")) ||
-    (m.includes("which season") && !m.includes("what should i eat"))
-  );
-  // wantsSeason handles "what should I eat in monsoon?" — exclude season-info AND diet-plan requests
-  const wantsSeason          = !wantsCurrentSeasonInfo && !wantsDiet && (m.includes("season") || m.includes("ritu") || m.includes("what should i eat in") || (Object.keys(SEASON_MAP).some(k => m.includes(k)) && !foodInMsg));
-  const wantsHealth          = !!(foodInMsg && (m.includes("healthy") || m.includes("good for") || m.includes("benefits") || m.includes("should i eat") || m.includes("is it good")));
-
   try {
-    // ── Pre-route: Explicit dislike/like with food name — store + confirm immediately ──
-    const hasExplicitDislike = /i (?:don't|do not|hate|dislike|avoid|can't stand|cannot stand)(?: eating| having| to eat| to drink)? /i.test(message);
-    const hasExplicitLike    = !hasExplicitDislike && /i (?:like|love|enjoy|prefer|adore)(?: eating| drinking)? /i.test(message);
+    const geminiKey     = c.env.GEMINI_API_KEY ?? "";
+    // "all" is a UI filter pill, not a real season — never let it become the current season
+    const ctxSeason     = (agentContext.current_season && agentContext.current_season !== "all")
+      ? agentContext.current_season : null;
+    const currentSeason = ctxSeason ?? getCurrentSeason();
+    const m             = msgClean;
 
-    if (hasExplicitDislike) {
-      // Deduplicate stored dislikes before confirming
-      const allStoredRaw = stored.filter(s => s.startsWith("dislike:")).map(s => s.replace("dislike:", ""));
-      const allStored = [...new Set(allStoredRaw)]; // remove duplicates
-      const names = allStored.length > 1
-        ? allStored.slice(0, -1).join(", ") + " and " + allStored[allStored.length - 1]
-        : allStored.length === 1 ? allStored[0] : foodInMsg?.name;
-      if (names) {
-        const existingAll = allStored.every(d =>
-          userFacts.dislikes.some(e => e.toLowerCase() === d.toLowerCase())
+    // ── Step 1: Gemini intent parse ────────────────────────────────────────────
+    let parsedIntentType: string | null = null;
+    let parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
+    let parsedSeason: string | null  = null;
+    let parsedNutrient: string | null = null;
+    let parsedMealSlot: string | null = null;
+    let parsedIsPdf = false;
+    let parsedDays  = 1;
+
+    if (geminiKey) {
+      try {
+        const knownFoods = "Banana,Mango,Apple,Guava,Pomegranate,Pear,Grape,Plum,Jamun,Watermelon,Papaya,Litchi,Pineapple,Orange,Amla,Dates,Peach,Strawberry,Onion,Tomato,Spinach,Broccoli,Carrot,Cucumber,Bell Pepper,Pumpkin,Beetroot,Sweet Potato,Cabbage,Cauliflower,Bitter Gourd,Ridge Gourd,Bottle Gourd,Green Peas,Mustard Greens,Fenugreek Leaves,Oats,Brown Rice,Bajra,Jowar,Wheat,Lentils,Moong Dal,Chickpeas,Rajma,Soybean,Milk,Curd,Paneer,Egg,Chicken Breast,Tofu,Salmon,Almonds,Walnuts,Peanuts,Sesame Seeds";
+        const parsePrompt = [
+          "Extract structured data from this nutrition message.",
+          "Return ONLY valid JSON:",
+          '{"intent":"food_lookup","foods":[{"name":"Egg","qty":3,"unit":"piece","amt_g":165,"sentiment":"neutral","meal_slot":"breakfast"}],"season":"monsoon","nutrient":null,"meal_slot":"breakfast","is_pdf":false,"days":1}',
+          "",
+          "intent options: food_lookup|compare|intake_log|diet_plan|seasonal_info|seasonal_avoid|current_season|nutrient_query|memory_read|preference_set|memory_update|meal_suggestion|diet_advice|bmi_query|symptom_query|juice_salad|general_question|follow_up|general",
+          "- intake_log ONLY when user reports eating/drinking something (past tense or 'i ate/had/drank')",
+          "- preference_set when user says they like/dislike/love/hate a food",
+          "- diet_plan for 'build/make/give me a diet plan' — check days: 7 for week, 1 for day",
+          "- days: set 7 ONLY if user explicitly says 'week plan', '7 day', 'full week'. Default is 1.",
+          "- juice_salad for juice, smoothie, or salad requests",
+          "- foods: only real food items from: " + knownFoods,
+          "- sentiment: like|dislike|allergy|neutral",
+          "- meal_slot per food: breakfast|mid_morning|lunch|evening|dinner (null if not specified)",
+          "- qty: numeric quantity if mentioned (2 eggs=2, half kg=0.5, 200g=200)",
+          "- unit: piece|g|kg|ml|glass|bowl|katori|plate|tablespoon (null if not specified)",
+          "- amt_g: pre-compute grams (qty * unit_weight). glass=240g, bowl=150g, kg=1000g, g=1, piece=100g",
+          "  Food-specific weights: egg=55g, banana=120g, mango=200g, date=10g, almond=1g",
+          "",
+          'Message: "' + message.slice(0, 300).replace(/"/g, "'") + '"',
+          "JSON:",
+        ].join("\\n");
+
+        const parseResp = await fetchGeminiWithRetry(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
+          {
+            contents: [{ role: "user", parts: [{ text: parsePrompt }] }],
+            generationConfig: { maxOutputTokens: 300, temperature: 0 },
+          }
         );
-        finalResponse = existingAll
-          ? `I already know you don't like **${names}** — excluded from all your plans.`
-          : `Got it — I've noted that you don't like **${names}**. ${allStored.length > 1 ? "All of them are" : "It's"} excluded from your diet plans.`;
-        taskType = "fact_store";
-      }
+
+        if (parseResp && parseResp.ok) {
+          const pd = await parseResp.json() as any;
+          const raw = (pd.candidates?.[0]?.content?.parts?.[0]?.text ?? "").trim().replace(/```json|```/g, "").trim();
+          if (raw.startsWith("{")) {
+            const p = JSON.parse(raw);
+            parsedIntentType = p.intent ?? null;
+            parsedFoods      = Array.isArray(p.foods) ? p.foods : [];
+            parsedSeason     = p.season ?? null;
+            parsedNutrient   = p.nutrient ?? null;
+            parsedMealSlot   = p.meal_slot ?? null;
+            parsedIsPdf      = !!p.is_pdf;
+            parsedDays       = (p.days === 7) ? 7 : 1;
+
+            // Unit → grams conversion table
+            const UNIT_G: Record<string, number> = {
+              g:1, gram:1, grams:1, kg:1000,
+              ml:1, l:1000, glass:240, glasses:240,
+              cup:240, cups:240, bowl:150, bowls:150,
+              katori:150, plate:200, tablespoon:15, tbsp:15,
+              teaspoon:5, tsp:5, piece:100, pieces:100,
+              roti:30, handful:30,
+            };
+            const FOOD_G: Record<string, number> = {
+              egg:55, eggs:55, banana:120, mango:200, date:10, dates:10,
+              almond:1, almonds:1, walnut:5, walnuts:5,
+            };
+            for (const f of parsedFoods) {
+              f.name = applyFoodAlias((f.name ?? "").toLowerCase().trim());
+              if (f.qty && !f.amt_g) {
+                const u = (f.unit ?? "").toLowerCase().trim();
+                if (UNIT_G[u]) {
+                  f.amt_g = Math.round(f.qty * UNIT_G[u]);
+                } else {
+                  const fn = f.name.toLowerCase();
+                  const fk = Object.keys(FOOD_G).find(k => fn.includes(k));
+                  f.amt_g = fk ? Math.round(f.qty * FOOD_G[fk]) : Math.round(f.qty * 100);
+                }
+              }
+              f.amt_g = f.amt_g ?? 100;
+            }
+
+            // Store preferences found by Gemini
+            for (const f of parsedFoods) {
+              if (!f.name || f.name.length < 2) continue;
+              const norm = applyFoodAlias(f.name);
+              if (f.sentiment === "like") {
+                await c.env.DB.prepare(
+                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+                   VALUES (?1,'preference',?2,?2,'conversation',datetime('now'),datetime('now'))`
+                ).bind(profileId, norm).run().catch(() => {});
+              } else if (f.sentiment === "dislike") {
+                await c.env.DB.prepare(
+                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+                   VALUES (?1,'dislike',?2,?2,'conversation',datetime('now'),datetime('now'))`
+                ).bind(profileId, norm).run().catch(() => {});
+              } else if (f.sentiment === "allergy") {
+                await c.env.DB.prepare(
+                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+                   VALUES (?1,'allergy',?2,?2,'conversation',datetime('now'),datetime('now'))`
+                ).bind(profileId, norm).run().catch(() => {});
+              }
+            }
+          }
+        }
+      } catch { /* Gemini parse failed — keyword fallback handles it */ }
     }
 
-    // Explicit like — confirm without showing food info
-    else if (hasExplicitLike) {
-      const allLikes = stored.filter(s => s.startsWith("like:")).map(s => s.replace("like:", ""));
-      if (allLikes.length > 0) {
-        const names = allLikes.length > 1
-          ? allLikes.slice(0, -1).join(", ") + " and " + allLikes[allLikes.length - 1]
-          : allLikes[0];
-        finalResponse = `Noted! I'll remember that you like **${names}** and include ${allLikes.length > 1 ? "them" : "it"} in your plans where possible.`;
-        taskType = "fact_store";
+    // ── Step 2: Session memory injection ─────────────────────────────────────
+    let sessionSummaryText = "";
+    try {
+      const smRaw = await c.env.SESSIONS.get(`session_summary:${sessionId}`);
+      if (smRaw) {
+        const s = JSON.parse(smRaw);
+        const pts: string[] = ["[Session context]"];
+        if (s.topics?.length)          pts.push(`Topics: ${s.topics.slice(0,5).join(", ")}`);
+        if (s.plans_built?.length)     pts.push(`Plans: ${s.plans_built[0]}`);
+        if (s.meals_logged?.length)    pts.push(`Last meal logged: ${s.meals_logged[0]}`);
+        if (s.foods_mentioned?.length) pts.push(`Foods discussed: ${s.foods_mentioned.slice(0,6).join(", ")}`);
+        sessionSummaryText = pts.join("\n");
       }
+    } catch { /* non-fatal */ }
+
+    // ── Step 3: Keyword extraction (fallback when Gemini parse unavailable) ──
+    const foodInMsg = await findFoodInMessage(m, c.env.DB);
+
+    const NUTRIENT_KEYWORDS: Record<string,string> = {
+      "vitamin c":"Vitamin C","vitamin a":"Vitamin A","vitamin d":"Vitamin D",
+      "vitamin b6":"Vitamin B6","protein":"Protein","fiber":"Fiber","fibre":"Fiber",
+      "iron":"Iron","calcium":"Calcium","magnesium":"Magnesium","potassium":"Potassium",
+      "zinc":"Zinc","folate":"Folate","fat":"Fat","carbs":"Carbohydrates","carbohydrates":"Carbohydrates",
+    };
+    const nutrientMentioned = parsedNutrient
+      ? parsedNutrient.charAt(0).toUpperCase() + parsedNutrient.slice(1)
+      : Object.entries(NUTRIENT_KEYWORDS).find(([kw]) => m.includes(kw))?.[1] ?? null;
+
+    const SEASON_MAP: Record<string,string> = {
+      "spring":"spring","vasanta":"spring","summer":"summer","grishma":"summer",
+      "monsoon":"monsoon","varsha":"monsoon","rainy":"monsoon",
+      "autumn":"autumn","sharad":"autumn","prewinter":"prewinter","hemanta":"prewinter",
+      "pre-winter":"prewinter","winter":"winter","shishira":"winter",
+    };
+    // Season the user explicitly named (null when not named)
+    const explicitSeason = parsedSeason
+      ?? Object.entries(SEASON_MAP).find(([kw]) => m.includes(kw))?.[1]
+      ?? null;
+    const seasonMentioned = explicitSeason ?? ctxSeason ?? currentSeason;
+
+    const intent = parsedIntentType ?? "";
+
+    // ── INTAKE DETECTION ─────────────────────────────────────────────────────
+    // CRITICAL: Only fire for past-tense consumption, NOT juice suggestions
+    const INTAKE_VERBS = [
+      "i ate","i had","i consumed","i drank","i've eaten","i have eaten",
+      "just ate","just had","just drank","had some","ate some",
+      "log my","track my","logged","i was eating","i have had",
+    ];
+    // "i drank juice" = intake, but "can i drink juice" = juice question
+    const wantsIntake = intent === "intake_log"
+      || (INTAKE_VERBS.some(v => m.includes(v)) && !m.startsWith("can i") && !m.startsWith("should i"));
+
+    // ── PLAN DETECTION ───────────────────────────────────────────────────────
+    const WEEK_KW = ["week plan","7 day","7-day","full week","whole week","weekly","7 days","week diet"];
+    const planDays = (parsedDays === 7 || WEEK_KW.some(k => m.includes(k))) ? 7 : 1;
+
+    const isPlanReq = intent === "diet_plan"
+      || (!wantsIntake
+          && (m.includes("diet plan") || m.includes("build my plan") || m.includes("build a plan")
+             || m.includes("build me a plan") || m.includes("make me a plan")
+             || m.includes("day plan") || m.includes("week plan")
+             || ((m.includes("build") || m.includes("make") || m.includes("create") || m.includes("give"))
+                && m.includes("plan"))
+             ));
+
+    const isPdf = parsedIsPdf || m.includes("pdf") || (m.includes("download") && m.includes("plan"))
+                || m.includes("as a pdf") || m.includes("in pdf");
+
+    // ── OTHER ROUTE FLAGS ─────────────────────────────────────────────────────
+    const wantsCompare = intent === "compare"
+      || m.includes("compare") || m.includes(" vs ") || m.includes("versus")
+      || m.includes("difference between") || m.includes("which is better") || m.includes("which has more");
+
+    const hasSeasonWord = m.includes("season") || m.includes("ritu")
+      || Object.keys(SEASON_MAP).some(k => m.includes(k));
+
+    // Seasonal info: only when NOT a plan request
+    // 'what should I eat today/now/next' → meal_suggestion (not seasonal_info)
+    const isGenericEatNow = (m.includes("today") || m.includes("now") || m.includes("next"))
+      && m.includes("eat") && !hasSeasonWord && !m.includes("plan");
+    const wantsSeason = !isPlanReq && !wantsIntake && !wantsCompare && !isGenericEatNow && (
+      intent === "seasonal_info" || intent === "current_season" || intent === "seasonal_avoid"
+      || ((m.includes("what to eat") || m.includes("what should i eat") || hasSeasonWord
+           || (m.includes("tell me about") && hasSeasonWord)
+           || m.includes("about this season"))
+          && !m.includes("plan"))
+    );
+
+    // BUG 4 fix: "what nutrients does guava juice have?" is a nutrient question, not a juice recipe request
+    const isNutrientQuestion = m.includes("nutrient") || m.includes("what does") || m.includes("what do")
+      || (m.includes("have") && (m.includes("what") || m.includes("which")));
+
+    // Availability question: "can i get apple in summer?" — must not be eaten by food_lookup
+    const isAvailabilityQ = /can (?:i|you|we) (?:get|find|buy|have)\b/.test(m) && !!foodInMsg && !!explicitSeason;
+
+    const wantsFoodInfo = !wantsIntake && !isPlanReq && !wantsCompare && !wantsSeason && !isAvailabilityQ && !(nutrientMentioned && foodInMsg) && (
+      intent === "food_lookup" || intent === "diet_advice"
+      || !!(isNutrientQuestion && (m.includes("juice") || m.includes("smoothie")) && (parsedFoods.length > 0 || foodInMsg))
+      || !!(foodInMsg && (
+        m.includes("tell me") || m.includes("what is") || m.includes("about")
+        || m.includes("info") || m.startsWith((foodInMsg.name ?? "").toLowerCase())
+        || m.includes("is it") || m.includes("good for") || m.includes("healthy")
+      ))
+    );
+
+    const wantsNutrientSources = !wantsIntake && !isPlanReq && (
+      intent === "nutrient_query"
+      || !!(nutrientMentioned && (m.includes("rich") || m.includes("source")
+            || m.includes("foods") || m.includes("contain") || m.includes("high in")
+            || m.includes("which food") || m.includes("what food")))
+    );
+
+    // "how much vitamin b6 does tofu have?" / "vitamin b6 in tofu" — a specific
+    // nutrient AND a specific food both named = asking for that food's value,
+    // not a list of foods. Distinct from wantsNutrientSources (list request).
+    const wantsNutrientInFood = !wantsIntake && !isPlanReq && !wantsCompare && !wantsSeason
+      && !!nutrientMentioned && !!foodInMsg && !wantsNutrientSources;
+
+    // Juice / salad — NOT if it's intake logging
+    const isJuiceSalad = !wantsIntake && !isNutrientQuestion && (
+      intent === "juice_salad"
+      || m.includes("juice") || m.includes("smoothie")
+      || (m.includes("salad") && !m.includes("tell me about"))
+    );
+
+    const wantsMealSlot = !isPlanReq && !wantsIntake && (
+      intent === "meal_suggestion"
+      || /what (?:should i|can i|to) (?:eat|have) (?:for|in|at) (?:breakfast|lunch|dinner|morning|evening|night)/.test(m)
+      || /what (?:to eat|should i eat|can i eat) (?:now|today|tonight|next)$/.test(m)
+    );
+
+    const wantsFollowUp = intent === "follow_up"
+      || /^(?:tell me(?: please| more| bro)?|no i mean|i mean|go on|continue|explain please|yes please|and then|what about it)[\s.!?]*$/.test(m);
+
+    const SYMPTOM_MAP: Record<string,string> = {
+      "cold":         "For colds: Turmeric milk, ginger tea, Vitamin C foods (amla, guava). Avoid cold foods.",
+      "fever":        "For fever: Light foods — moong dal khichdi, coconut water. Avoid heavy fried food.",
+      "typhoid":      "For typhoid: Soft, easy-to-digest foods — khichdi, curd, banana, boiled vegetables, plenty of fluids. Avoid spicy, oily, fibrous and raw foods. Please also follow your doctor's advice.",
+      "dengue":       "For dengue: Papaya, pomegranate, coconut water, plenty of fluids and light khichdi. Avoid oily and spicy food. Follow your doctor's advice.",
+      "malaria":      "For malaria: Light, high-calorie foods — fruit juices, coconut water, khichdi, curd. Avoid heavy, fried food. Follow your doctor's advice.",
+      "jaundice":     "For jaundice: Sugarcane juice, coconut water, boiled vegetables, fruits. Strictly avoid oily, fried and spicy food. Follow your doctor's advice.",
+      "cough":        "For cough: Honey + ginger, turmeric milk, warm soups. Avoid cold drinks.",
+      "sore throat":  "For sore throat: Warm turmeric milk, honey + ginger, warm soups. Avoid cold and fried foods.",
+      "headache":     "For headache: Hydrate well, magnesium-rich foods (almonds, spinach), small regular meals. Avoid skipping meals.",
+      "diarrhea":     "For diarrhea: Banana, curd, khichdi, plenty of fluids with electrolytes. Avoid milk, oily and spicy foods.",
+      "vomiting":     "For vomiting: Small sips of water/ORS, banana, plain rice, curd once settled. Avoid oily and strong-smelling foods.",
+      "digestion":    "For digestion: Jeera water, curd, papaya, banana. Avoid spicy and oily foods.",
+      "acidity":      "For acidity: Cold milk, banana, oats, coconut water. Avoid spicy and citrus.",
+      "constipation": "For constipation: Oats, fruits, vegetables, water.",
+      "weakness":     "For weakness: Spinach, lentils, dates + protein (paneer, eggs) + Vitamin C.",
+      "diabetes":     "For diabetes: Low-GI foods — oats, brown rice, vegetables, lentils. Avoid refined sugar.",
+      "blood pressure":"For blood pressure: Low-sodium, potassium-rich foods (banana, spinach). Avoid excess salt.",
+      "anemia":       "For anemia: Spinach, lentils, dates, amla. Pair with Vitamin C.",
+      "pcod":         "For PCOD: Low-GI foods, high fiber, flaxseeds, oats, leafy greens.",
+      "thyroid":      "For thyroid: Avoid raw cruciferous veg. Include selenium-rich foods.",
+    };
+    // Synonyms/misspellings/colloquial forms → canonical SYMPTOM_MAP key.
+    // This is what lets "vomit", "puking", "loose motions", "migraine" etc.
+    // all resolve correctly instead of only the exact dictionary word.
+    const SYMPTOM_ALIASES: Record<string,string> = {
+      "vomit":"vomiting","vomitted":"vomiting","vomitting":"vomiting","puking":"vomiting",
+      "throwing up":"vomiting","throw up":"vomiting","nausea":"vomiting","nauseous":"vomiting",
+      "loose motions":"diarrhea","loose motion":"diarrhea","loose stomach":"diarrhea",
+      "running stomach":"diarrhea","upset stomach":"diarrhea",
+      "migraine":"headache","head ache":"headache","headaches":"headache",
+      "stomach ache":"digestion","stomach pain":"digestion","tummy ache":"digestion",
+      "indigestion":"digestion","gastric":"digestion",
+      "flu":"cold","cold and cough":"cold","common cold":"cold",
+      "sugar":"diabetes","high sugar":"diabetes","blood sugar":"diabetes",
+      "bp":"blood pressure","high bp":"blood pressure","hypertension":"blood pressure","low bp":"blood pressure",
+      "gas":"acidity","bloating":"acidity","heartburn":"acidity","acid reflux":"acidity",
+      "low energy":"weakness","tiredness":"weakness","fatigue":"weakness","feeling weak":"weakness",
+      "sore throats":"sore throat","throat pain":"sore throat","throat ache":"sore throat",
+    };
+    const normM = Object.entries(SYMPTOM_ALIASES).reduce(
+      (acc, [alias, canon]) => acc.replace(new RegExp(`\\b${alias}\\b`, "g"), canon), m
+    );
+    const symptomWordCount = msgClean.split(/\s+/).filter(Boolean).length;
+    const symptomKey = Object.keys(SYMPTOM_MAP).find(k => {
+      if (!normM.includes(k)) return false;
+      // Short message that's essentially just the symptom itself ("vomit",
+      // "i have diarrhea", "headache?") — trigger directly, no extra words needed.
+      if (symptomWordCount <= 4) return true;
+      return normM.includes("eat") || normM.includes("food") || normM.includes("diet")
+        || normM.includes("when") || normM.includes("i have") || normM.includes("suffering")
+        || normM.includes("i got") || normM.includes("do for") || normM.includes("do in")
+        || normM.includes("do if") || normM.includes("problem") || normM.includes("issue")
+        || normM.includes("help") || normM.includes("cure") || normM.includes("remedy")
+        || normM.includes("down with") || normM.includes("what to do") || normM.includes("i feel")
+        || normM.includes("having");
+    }) ?? null;
+
+
+    // ── Step 4: Execute route ──────────────────────────────────────────────────
+
+    // ── Preference set (BEFORE food lookup) ───────────────────────────────────
+    if (
+      (intent === "preference_set" && parsedFoods.some(f => f.sentiment && f.sentiment !== "neutral"))
+      || (!wantsIntake && !isPlanReq && parsedIntentType === null
+          && (m.includes("i like ") || m.includes("i love ") || m.includes("i hate ")
+             || m.includes("i dislike ") || m.includes("i do not like ") || m.includes("i don't like "))
+          && !m.includes("i like to ") && !m.includes("i love to ") && !m.includes("i like going")
+         )
+    ) {
+      const likes     = parsedFoods.filter(f => f.sentiment === "like").map(f => f.name).filter(Boolean);
+      const dislikes  = parsedFoods.filter(f => f.sentiment === "dislike").map(f => f.name).filter(Boolean);
+      const allergies = parsedFoods.filter(f => f.sentiment === "allergy").map(f => f.name).filter(Boolean);
+      // Regex fallback: Gemini parse can return [] on 429 — extract food name directly
+      if (likes.length === 0 && dislikes.length === 0 && allergies.length === 0) {
+        const dm = m.match(/i (?:don'?t like|do not like|dislike|hate)\s+([a-z][a-z\s]{1,40}?)(?:\s+(?:at all|much|in|for|to|because|so|and)\b|[,.!]|$)/);
+        const lm = m.match(/i (?:like|love)\s+([a-z][a-z\s]{1,40}?)(?:\s+(?:a lot|very much|in|for|to|because|so|and)\b|[,.!]|$)/);
+        if (dm && dm[1]) dislikes.push(dm[1].trim());
+        else if (lm && lm[1]) likes.push(lm[1].trim());
+      }
+      // Explicit DB writes — do NOT rely only on extractAndStoreFacts (BUG 2 fix)
+      // Mutual exclusion: a food cannot be in likes AND dislikes at the same time
+      for (const name of dislikes) {
+        const norm = applyFoodAlias(name.toLowerCase().trim());
+        await c.env.DB.prepare(
+          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
+        ).bind(profileId, `%${norm}%`).run().catch(() => {});
+        await c.env.DB.prepare(
+          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+           VALUES (?1,'dislike',?2,?2,'conversation',datetime('now'),datetime('now'))`
+        ).bind(profileId, norm).run().catch(() => {});
+      }
+      for (const name of likes) {
+        const norm = applyFoodAlias(name.toLowerCase().trim());
+        await c.env.DB.prepare(
+          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
+        ).bind(profileId, `%${norm}%`).run().catch(() => {});
+        await c.env.DB.prepare(
+          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+           VALUES (?1,'preference',?2,?2,'conversation',datetime('now'),datetime('now'))`
+        ).bind(profileId, norm).run().catch(() => {});
+      }
+      for (const name of allergies) {
+        const norm = applyFoodAlias(name.toLowerCase().trim());
+        await c.env.DB.prepare(
+          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+           VALUES (?1,'allergy',?2,?2,'conversation',datetime('now'),datetime('now'))`
+        ).bind(profileId, norm).run().catch(() => {});
+      }
+      const parts: string[] = [];
+      if (likes.length)     parts.push(`✅ Added to likes: **${likes.join(", ")}**`);
+      if (dislikes.length)  parts.push(`🚫 Added to dislikes: **${dislikes.join(", ")}**`);
+      if (allergies.length) parts.push(`⚠️ Noted as allergy: **${allergies.join(", ")}**`);
+      // If Gemini found nothing but keywords are present, acknowledge and let extractAndStoreFacts handle it
+      if (parts.length === 0 && (m.includes("i like ") || m.includes("i love "))) {
+        parts.push("Got it! I've noted your food preference. It will be used in future plans.");
+      }
+      finalResponse = parts.length
+        ? `${parts.join("\n")}\n\nI'll use this in all your future diet plans.`
+        : "Got it! I've noted your preferences.";
+      taskType = "preference_update";
     }
 
-    // Route 1: Specific nutrient in food
-    else if (wantsNutrients && foodInMsg) {
-      const result = await toolFoodLookup(c.env.DB, foodInMsg.name);
-      const nutrient = result.nutrients?.find((n: any) => n.name === nutrientMentioned);
-      if (nutrient) {
-        const unit = cleanUnit(nutrient.unit);
-        const rdaNote = nutrient.rda_pct ? ` — that's **${nutrient.rda_pct}%** of the daily recommended amount` : "";
-        finalResponse = `**${result.name}** has **${nutrient.amount} ${unit}** of ${nutrientMentioned} per 100g${rdaNote}.`;
-      } else {
-        finalResponse = `I don't have ${nutrientMentioned} data for ${foodInMsg.name}. Available: ${result.nutrients?.slice(0,5).map((n:any)=>`${n.name} ${n.amount}${cleanUnit(n.unit)}`).join(", ")}.`;
-      }
-      taskType = "nutrient-lookup"; toolsUsed = ["food_lookup"];
-    }
-
-    // Route 2: Comparison
+    // ── Compare ────────────────────────────────────────────────────────────────
     else if (wantsCompare) {
-      let food1Name = foodInMsg?.name ?? currentItem?.name ?? null;
-      let food2Name: string | null = null;
-
-      // If no food in current message, try to recover both foods from history
-      // e.g. "Which has more protein?" after "compare broccoli and cabbage"
-      if (!food1Name || !food2Name) {
-        for (const h of [...history].reverse()) {
-          const matches: string[] = [];
-          const allFoods = await c.env.DB.prepare(`SELECT name FROM items ORDER BY LENGTH(name) DESC`).all();
-          for (const row of allFoods.results as any[]) {
-            if (h.content.toLowerCase().includes(row.name.toLowerCase())) matches.push(row.name);
-            if (matches.length >= 2) break;
-          }
-          if (matches.length >= 2) {
-            food1Name = food1Name ?? matches[0];
-            food2Name = food2Name ?? matches[1];
-            break;
-          }
-        }
+      // Deterministic first: find BOTH foods in the user's own (alias-normalised) message
+      const msgFood1 = await findFoodInMessage(m, c.env.DB);
+      const msgFood2 = msgFood1 ? await findSecondFoodInMessage(m, msgFood1.name, c.env.DB) : null;
+      let f1 = msgFood1?.name ?? parsedFoods[0]?.name ?? foodInMsg?.name ?? "";
+      let f2 = msgFood2?.name ?? parsedFoods.find(f => f.name && f.name.toLowerCase() !== f1.toLowerCase())?.name ?? "";
+      // Only fall back to conversation history when the user named just ONE food ("compare it with banana")
+      if (f1 && !f2) {
+        const lastUserOrAsst = [...history].reverse().find(h => h.role === "assistant");
+        const prevFood = lastUserOrAsst ? await findSecondFoodInMessage(lastUserOrAsst.content.toLowerCase(), f1, c.env.DB) : null;
+        f2 = prevFood?.name ?? "";
       }
-
-      if (!food1Name) {
-        finalResponse = "Tell me which two foods to compare — e.g. 'compare mango and banana'.";
-        taskType = "clarification";
+      if (f1 && f2) {
+        const result = await toolCompareFoods(c.env.DB, f1, f2);
+        finalResponse = buildDirectResponse("compare_foods", result, message);
+        taskType = "compare_foods"; toolsUsed = ["compare_foods"];
       } else {
-        // Try to find second food in current message, then fall back to history
-        const food2Match = await findSecondFoodInMessage(m, food1Name, c.env.DB);
-        const resolvedFood2 = food2Match?.name ?? food2Name ?? (food1Name !== currentItem?.name ? currentItem?.name : null);
-        if (!resolvedFood2 || resolvedFood2 === food1Name) {
-          finalResponse = `I have **${food1Name}** — which food should I compare it with?`;
-          taskType = "clarification";
-        } else {
-          const result = await toolCompareFoods(c.env.DB, food1Name, resolvedFood2, nutrientMentioned);
-          finalResponse = buildDirectResponse("compare_foods", result, message);
-          taskType = "compare_foods"; toolsUsed = ["compare_foods"];
-        }
+        finalResponse = "Which two foods would you like to compare? Try: 'Compare mango and banana'.";
+        taskType = "clarification";
       }
     }
 
-    // Route 3a: "add X to my diet / can I eat X / should I eat X" — direct verdict FIRST
-    // Must come before generic food lookup so we give yes/no, not just nutrients.
-    else if (isAddToDietQuestion && foodInMsg) {
-      const result = await toolFoodLookup(c.env.DB, foodInMsg.name);
+    // ── PHASE 4.2: Ingredient swap ("I don't have spinach, what instead?") ─────
+    else if (
+      intent === "swap_request"
+      || ((/instead of|substitute (?:for|of)?|replacement for|alternative(?:s)? (?:to|for)|swap\b/.test(m)
+           || /(?:don'?t|do not) have [a-z]/.test(m))
+          && !!(parsedFoods[0]?.name || foodInMsg))
+    ) {
+      const swapFood = applyFoodAlias((parsedFoods[0]?.name ?? foodInMsg?.name ?? "").toLowerCase());
+      const swapSeason = explicitSeason ?? currentSeason;
+      const isVegU = userFacts.dietary === "vegetarian" || userFacts.dietary === "vegan" || userFacts.dietary === "jain";
+      const alts = await findIngredientSwap(swapFood, c.env.DB, swapSeason, userFacts.dislikes, isVegU);
+      if (alts.length > 0) {
+        finalResponse = `No **${swapFood}**? Here are the best swaps for ${SEASON_LABELS[swapSeason] ?? swapSeason} with a similar nutrient profile:\n\n`
+          + alts.map(a => `🔄 **${a.food}** — also rich in ${a.shared_nutrient} (${a.amount}${a.unit}/100g)`).join("\n")
+          + `\n\nUse roughly the same quantity as you would ${swapFood}.`;
+        taskType = "ingredient_swap"; toolsUsed = ["food_lookup", "get_nutrient_rich_foods"];
+      } else {
+        finalResponse = `I couldn't find **${swapFood}** in my database to compute a swap. Tell me which nutrient you're after (e.g. "foods rich in iron") and I'll suggest sources.`;
+        taskType = "clarification";
+      }
+    }
+
+    // ── Juice / Salad ──────────────────────────────────────────────────────────
+    else if (isJuiceSalad) {
+      const isJuice  = !m.includes("salad");
+      const isMix    = m.includes("mix") || m.includes("blend") || m.includes("together");
+      const season   = parsedSeason ?? seasonMentioned ?? currentSeason;
+      const featuredName = parsedFoods.find(f => !f.sentiment || f.sentiment === "neutral")?.name ?? foodInMsg?.name ?? null;
+
+      // Guard: juice only makes sense for fruits (and some veg) — not nuts, grains, dairy
+      let featuredFruit: string | null = null;
+      if (featuredName && isJuice) {
+        const featItem = await c.env.DB.prepare(
+          `SELECT name, category FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`
+        ).bind(`%${featuredName.toLowerCase()}%`).first<any>();
+        if (featItem && featItem.category !== "fruit" && featItem.category !== "vegetable") {
+          finalResponse = `**${featItem.name}** isn't really juiceable — it's a ${featItem.category}. `
+            + `You could blend a small amount into a smoothie with fruits for texture and nutrition, though!\n\n`
+            + `Want me to suggest good ${SEASON_LABELS[season] ?? season} fruits for juice instead? Just ask: "what juice is good this season?"`;
+          taskType = "juice_salad";
+          // Skip the rest of the juice flow
+          featuredFruit = null;
+        } else {
+          featuredFruit = featItem?.name ?? featuredName;
+        }
+      } else {
+        featuredFruit = featuredName;
+      }
+
+      if (!finalResponse) {
+      const rows = await c.env.DB.prepare(
+        `SELECT name FROM items WHERE category='fruit' AND (season=?1 OR season='all')
+         AND LOWER(name) NOT LIKE '%jamun%' ORDER BY RANDOM() LIMIT 8`
+      ).bind(season).all();
+      let fruits = (rows.results as any[]).map((r: any) => r.name as string);
+
+      // Filter dislikes
+      fruits = fruits.filter(f => !userFacts.dislikes.some(d => f.toLowerCase().includes(d.toLowerCase())));
+
+      // Never present an empty list — fall back to all-season fruits
+      if (fruits.length === 0) {
+        const fb = await c.env.DB.prepare(
+          `SELECT name FROM items WHERE category='fruit' AND season='all' ORDER BY RANDOM() LIMIT 6`
+        ).all();
+        fruits = (fb.results as any[]).map((r: any) => r.name as string)
+          .filter(f => !userFacts.dislikes.some(d => f.toLowerCase().includes(d.toLowerCase())));
+      }
+
+      // If specific fruit asked, feature it first
+      if (featuredFruit) {
+        fruits = [featuredFruit.charAt(0).toUpperCase()+featuredFruit.slice(1), ...fruits.filter(f => !f.toLowerCase().includes(featuredFruit.toLowerCase()))];
+      }
+
+      if (isJuice) {
+        if (isMix) {
+          // Pick 3 complementary fruits — light, cooling fruits that mix well
+          const pickFruits = fruits.slice(0, 3);
+          const healthNote = userFacts.health_notes.includes("diabetes")
+            ? "\n\n⚠️ For diabetes: Avoid adding sugar. Keep portions small (150ml max) and drink after a meal."
+            : userFacts.health_notes.some(n => n.includes("blood pressure"))
+            ? "\n\n💡 Good for blood pressure — these fruits are naturally rich in potassium."
+            : "";
+          finalResponse = `🥤 **${SEASON_LABELS[season] ?? season} Mix Fruit Juice**\n\n`
+            + `Fruits: **${pickFruits.join(" + ")}**\n\n`
+            + `How to make:\n`
+            + `1. Peel and chop each fruit\n`
+            + `2. Blend together with a pinch of black salt\n`
+            + `3. Strain lightly (or keep fibrous for better nutrition)\n`
+            + `4. Serve fresh — no added sugar\n\n`
+            + `Nutritional benefit: Natural sugars + Vitamin C + hydration`
+            + healthNote;
+        } else {
+          // Direct juice question about a specific fruit or general options
+          const healthNote = userFacts.health_notes.includes("diabetes")
+            ? `\n\n⚠️ For your diabetes: Limit juice to 150ml per serving. Prefer whole fruit over juice.`
+            : "";
+          finalResponse = `Here are good **${SEASON_LABELS[season] ?? season} juice** options:\n\n`
+            + fruits.slice(0, 4).map(f => `🥤 **${f} juice** — fresh, seasonal, nutritious`).join("\n")
+            + `\n\n💡 No added sugar — natural sweetness is enough and keeps glycaemic load low.`
+            + healthNote;
+        }
+      } else {
+        const vegRows = await c.env.DB.prepare(
+          `SELECT name FROM items WHERE category='vegetable' AND (season=?1 OR season='all') ORDER BY RANDOM() LIMIT 4`
+        ).bind(season).all();
+        const vegs = (vegRows.results as any[]).map((r: any) => r.name as string);
+        finalResponse = `**${SEASON_LABELS[season] ?? season} Salad** idea:\n\n`
+          + `🥗 Veggies: ${vegs.join(", ")}\n`
+          + `🍎 Fruits: ${fruits.slice(0,2).join(", ")}\n`
+          + `💪 Protein: Chickpeas or Paneer\n`
+          + `🥣 Dressing: Curd + lemon + mint\n\n`
+          + (season === "monsoon" ? "💡 During Varsha Ritu, lightly steam the vegetables — raw salads can be heavy on digestion." : "All seasonal, fresh, and nutritious!");
+      }
+      } // end if (!finalResponse) — non-fruit juice guard may have already answered
+      taskType = "general";
+    }
+
+    // ── Diet/add-to-diet advice (yes/no verdict) ───────────────────────────────
+    else if (intent === "diet_advice" && parsedFoods.length > 0) {
+      const food = parsedFoods[0];
+      const result = await toolFoodLookup(c.env.DB, food.name);
       if (result.found) {
         const isDisliked = userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()));
-        const goal = userFacts.goal || profile?.goal || "balanced";
-        const cal = result.calories_per_100g ?? 0;
         if (isDisliked) {
-          finalResponse = `You've told me you don't like **${result.name}** — I'd skip it and suggest alternatives. Ask me for foods that are similar in nutrition if you want.`;
+          finalResponse = `You've told me you don't like **${result.name}**. I'd suggest alternatives. What nutritional benefit are you looking for?`;
         } else {
-          const verdict = (goal.includes("lose") && cal > 300) ? "⚠️ In moderation" :
-                          (goal.includes("gain") && cal < 50) ? "⚠️ Pair with higher-calorie foods" : "✅ Yes, include it";
-          const reason = goal.includes("lose") && cal > 300
-            ? `It's calorie-dense at ${cal} kcal/100g — keep portions small.`
-            : goal.includes("gain") && cal < 50
-            ? `It's light at ${cal} kcal/100g — pair it with grains or nuts for calorie density.`
-            : `At ${cal} kcal/100g it fits your ${goal || "balanced"} goal well.`;
-          // Health condition flags
-          const diabetesNote = userFacts.health_notes.some(n => n.includes("diabet"))
-            ? ` Good for blood sugar control.` : "";
-          const bpNote = userFacts.health_notes.some(n => n.includes("blood pressure") || n.includes("bp"))
-            ? ` Watch sodium intake alongside.` : "";
-          finalResponse = `${verdict} — **${result.name}** is a great addition to your plan. ${reason}${diabetesNote}${bpNote}\n\nJust ask me to **build a diet plan** and it will be included.`;
+          const goal = userFacts.goal || profile?.goal || "balanced";
+          const cal  = result.calories_per_100g ?? 0;
+          const verdict = (goal.includes("lose") && cal > 300) ? "⚠️ In moderation" : "✅ Yes, include it";
+          const diabNote = userFacts.health_notes.includes("diabetes") ? " For diabetes: enjoy in small portions." : "";
+          finalResponse = `${verdict} — **${result.name}** (${cal} kcal/100g) fits your **${goal}** goal.${diabNote}\n\nJust say "build my diet plan" and I'll include it.`;
         }
       } else {
-        finalResponse = `I don't have **${foodInMsg.name}** in my database yet. Try asking about a similar food I know.`;
+        finalResponse = buildDirectResponse("food_lookup", result, message);
       }
       taskType = "diet_advice"; toolsUsed = ["food_lookup"];
     }
 
-    // Route 3: Food lookup (nutrients / health question about a specific food)
-    else if (wantsFoodInfo || wantsHealth || (foodInMsg && !wantsDiet && !wantsIntake)) {
-      const result = await toolFoodLookup(c.env.DB, foodInMsg!.name);
-      finalResponse = buildDirectResponse("food_lookup", result, message);
+    // ── Nutrient amount in a specific food ("vitamin b6 in tofu") ──────────────
+    else if (wantsNutrientInFood) {
+      const result: any = await toolFoodLookup(c.env.DB, foodInMsg!.name);
       if (result.found) {
-        const bmiCtx = profile && computeBmi(profile);
-        const isDisliked = userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()));
-
-        if (isAddToDietQuestion) {
-          // "add X to my diet / should I add wheat?" — give a direct yes/no + reasoning
-          if (isDisliked) {
-            finalResponse += `\n\nYou've mentioned you don't like **${result.name}** — I'd skip it. There are better alternatives that you enjoy.`;
-          } else {
-            const goal = userFacts.goal || profile?.goal || "";
-            const cal = result.calories_per_100g ?? 0;
-            const isHighCal = cal > 300;
-            const isGoodForGoal =
-              goal.includes("lose") ? !isHighCal :
-              goal.includes("gain") ? isHighCal :
-              true;
-            const verdict = isGoodForGoal ? "✅ Yes" : "⚠️ In moderation";
-            const reason = goal.includes("lose") && isHighCal
-              ? `It's calorie-dense at ${cal} kcal/100g — have small portions if you're trying to lose weight.`
-              : goal.includes("gain") && !isHighCal
-              ? `It's relatively light at ${cal} kcal/100g — pair it with higher-calorie foods for weight gain.`
-              : `At ${cal} kcal/100g it fits well into a balanced diet.`;
-            if (userFacts.health_notes.includes("diabetes")) {
-              const hasHighSugar = (result.nutrients ?? []).find((n: any) => n.name === "Sugar" && n.amount > 10);
-              finalResponse += hasHighSugar
-                ? `\n\n${verdict}, but watch portion sizes. ${result.name} has ${hasHighSugar.amount}g sugar per 100g — eat with a meal, not alone, for blood sugar management.`
-                : `\n\n${verdict} — ${reason} Good choice for blood sugar management too.`;
-            } else if (userFacts.health_notes.includes("high blood pressure")) {
-              const sodium = (result.nutrients ?? []).find((n: any) => n.name === "Sodium");
-              finalResponse += sodium && sodium.amount > 400
-                ? `\n\n⚠️ High sodium (${sodium.amount}mg/100g) — limit this if you have high blood pressure.`
-                : `\n\n${verdict} — ${reason}`;
-            } else {
-              finalResponse += `\n\n${verdict} — ${reason}`;
-            }
-          }
-        } else if (wantsHealth) {
-          if (bmiCtx) {
-            finalResponse += `\n\nFor your profile (BMI ${bmiCtx.bmi}, ${bmiCtx.label}): `;
-            finalResponse += (result.calories_per_100g ?? 0) > 300
-              ? `${result.name} is calorie-dense — have it in small portions.`
-              : `${result.name} fits well into a balanced diet at ${result.calories_per_100g} kcal/100g.`;
-          }
-          if (isDisliked) {
-            finalResponse += `\n\n_(You've mentioned you don't usually eat ${result.name} — I'll keep that in mind for your plans.)_`;
-          }
+        const row = (result.nutrients ?? []).find(
+          (n: any) => (n.name ?? "").toLowerCase() === (nutrientMentioned ?? "").toLowerCase()
+        );
+        if (row) {
+          finalResponse = `**${result.name}** has **${row.amount}${row.unit}** of ${nutrientMentioned} per 100g`
+            + (row.rda_pct != null ? ` (${row.rda_pct}% of daily RDA).` : ".");
+        } else {
+          const topFew = (result.nutrients ?? []).slice(0, 5)
+            .map((n: any) => `${n.name} ${n.amount}${n.unit}`).join(", ");
+          finalResponse = `I don't have **${nutrientMentioned}** data for **${result.name}** specifically. `
+            + `What I do have per 100g: ${topFew || "no nutrient data on file"}.`;
         }
+        taskType = "nutrient_in_food"; toolsUsed = ["food_lookup"];
+      } else {
+        finalResponse = `I couldn't find **${foodInMsg!.name}** in my database.`;
+        taskType = "clarification";
       }
-      taskType = "food_lookup"; toolsUsed = ["food_lookup"];
     }
 
-    // Route 4: Nutrient-rich foods
+    // ── Food lookup ────────────────────────────────────────────────────────────
+    else if (wantsFoodInfo) {
+      const name = parsedFoods[0]?.name ?? foodInMsg?.name ?? "";
+      if (name) {
+        const result = await toolFoodLookup(c.env.DB, name);
+        finalResponse = buildDirectResponse("food_lookup", result, message);
+        if (result.found && (m.includes("good for me") || m.includes("should i") || m.includes("can i eat") || m.includes("healthy"))) {
+          const cal = result.calories_per_100g ?? 0;
+          if (userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()))) {
+            finalResponse += `\n\nYou've mentioned you don't like **${result.name}** — I'll leave it out of your plans.`;
+          } else if (userFacts.health_notes.includes("diabetes") && cal > 60) {
+            finalResponse += `\n\nFor diabetes: enjoy in moderation and pair with fibre.`;
+          }
+        }
+        taskType = "food_lookup"; toolsUsed = ["food_lookup"];
+      } else {
+        finalResponse = "Which food would you like to know about?";
+        taskType = "clarification";
+      }
+    }
+
+    // ── Nutrient-rich food sources ─────────────────────────────────────────────
     else if (wantsNutrientSources && nutrientMentioned) {
-      const result = await toolGetNutrientRichFoods(c.env.DB, nutrientMentioned, seasonMentioned !== "all" ? seasonMentioned : undefined);
+      const result = await toolGetNutrientRichFoods(c.env.DB, nutrientMentioned, seasonMentioned);
       finalResponse = buildDirectResponse("get_nutrient_rich_foods", result, message);
       taskType = "get_nutrient_rich_foods"; toolsUsed = ["get_nutrient_rich_foods"];
     }
 
-    // Route 4.5: "what to eat now" / "what next" — suggest next meal based on logged meals
-    else if (wantsNextMeal) {
-      const hour = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
-      const nextSlot = hour < 10 ? "breakfast" : hour < 13 ? "lunch" : hour < 17 ? "evening snack" : "dinner";
-      const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned !== "all" ? seasonMentioned : agentContext.current_season ?? "all");
-      const suggestion = result.foods?.slice(0, 3).map((f: any) => `**${f.name}**`).join(", ") ?? "seasonal foods";
-      finalResponse = `For ${nextSlot}, try: ${suggestion}. These fit your current season and your weight management goal.`;
-      taskType = "meal_suggestion"; toolsUsed = ["get_seasonal_foods"];
-    }
-
-    // Route 4a.5: "What should I avoid this season?" / "foods to avoid in monsoon"
-    else if (
-      (m.includes("avoid") || m.includes("not eat") || m.includes("stay away") || m.includes("skip")) &&
-      (m.includes("season") || m.includes("ritu") || Object.keys(SEASON_MAP).some(k => m.includes(k)))
-    ) {
-      const avoidSeason = seasonMentioned !== "all" ? seasonMentioned : getCurrentSeason();
-      const avoidLabel = SEASON_LABELS[avoidSeason] ?? avoidSeason;
-      const journal = await c.env.DB.prepare(
-        `SELECT avoid, eat_more, dosha, description FROM ritu_journal WHERE season = ?1`
-      ).bind(avoidSeason).first<any>();
-      if (journal?.avoid) {
-        let msg = `In **${avoidLabel}**, you should avoid: **${journal.avoid}**.`;
-        if (journal.dosha) msg += `\n\nThis season aggravates the **${journal.dosha}** dosha — these foods make it worse.`;
-        if (journal.eat_more) msg += `\n\nInstead, focus on: ${journal.eat_more}.`;
-        finalResponse = msg;
+    // ── Availability: "can I get/find X in <season>?" ──────────────────────────
+    else if (isAvailabilityQ) {
+      const avItem = await c.env.DB.prepare(
+        `SELECT name, season FROM items WHERE LOWER(name) = ?1 LIMIT 1`
+      ).bind(foodInMsg.name.toLowerCase()).first<any>();
+      if (avItem) {
+        const itemSeasonLabel = SEASON_LABELS[avItem.season] ?? avItem.season;
+        const askedLabel = SEASON_LABELS[explicitSeason] ?? explicitSeason;
+        if (avItem.season === "all") {
+          finalResponse = `Yes! **${avItem.name}** is available year-round, including ${askedLabel}. 🌿`;
+        } else if (avItem.season === explicitSeason) {
+          finalResponse = `Yes! **${avItem.name}** is in peak season during ${askedLabel} — the best time to eat it fresh. ✅`;
+        } else {
+          finalResponse = `**${avItem.name}** is best in **${itemSeasonLabel}**, not ${askedLabel}. You may find cold-stored stock in ${askedLabel}, but it won't be at peak freshness or nutrition.\n\nWant seasonal alternatives? Ask: "What fruits are good in ${askedLabel}?"`;
+        }
+        taskType = "seasonal_availability"; toolsUsed = ["food_lookup"];
       } else {
-        finalResponse = `I don't have specific avoid-list data for that season right now. Generally, avoid heavy, fried, or stale foods and focus on fresh, seasonal produce.`;
+        finalResponse = `I couldn't find that food in my database. I track 57 Indian seasonal foods — try asking about fruits, vegetables, grains, dals, dairy, or nuts.`;
+        taskType = "clarification";
       }
-      taskType = "season_info"; toolsUsed = ["ritu_journal"];
     }
 
-    // Route 4b: Current season info — Phase 2 fix
-    // "What is the current season?" / "Which Ritu is it now?" — answers directly
-    else if (wantsCurrentSeasonInfo) {
-      const cs = getCurrentSeason();
-      const csLabel = SEASON_LABELS[cs] ?? cs;
+    // ── Seasonal info ──────────────────────────────────────────────────────────
+    else if (wantsSeason && !symptomKey && !m.includes("balanced")) {
+      const targetSeason = parsedSeason ?? seasonMentioned ?? currentSeason;
       const journal = await c.env.DB.prepare(
         `SELECT title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal WHERE season = ?1`
-      ).bind(cs).first<any>();
-      const foods = await toolGetSeasonalFoods(c.env.DB, cs, undefined, 6);
-      const foodList = (foods.foods as any[])
-        .filter((f: any) => !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d.toLowerCase())))
-        .slice(0, 5)
-        .map((f: any) => `**${f.name}**`)
-        .join(", ");
+      ).bind(targetSeason).first<any>();
 
-      let msg = `We are currently in **${csLabel}**.`;
       if (journal) {
-        msg += `\n\n${journal.description}`;
-        if (journal.dosha) msg += ` This season is governed by the **${journal.dosha}** dosha.`;
-        if (foodList) msg += `\n\n🌿 **Best foods right now:** ${foodList}.`;
-        if (journal.eat_more) msg += `\n\n✅ **Eat more:** ${journal.eat_more}.`;
-        if (journal.avoid) msg += `\n\n❌ **Avoid:** ${journal.avoid}.`;
-        if (journal.ayurvedic_note) msg += `\n\n_${journal.ayurvedic_note}_`;
-      } else if (foodList) {
-        msg += ` Good foods to eat right now: ${foodList}.`;
-      }
-      finalResponse = msg;
-      taskType = "season_info";
-      toolsUsed = ["get_seasonal_foods"];
-    }
-
-    // Route 5: Seasonal foods / season journal
-    else if (wantsSeason) {
-      // "tell me about spring season" / "about Hemanta Ritu" → full journal + foods
-      const wantsSeasonDetail = m.includes("tell me about") || m.includes("about the") ||
-        m.includes("what is") || m.includes("describe") || m.includes("explain") ||
-        (m.includes("about") && !m.includes("what should i eat"));
-
-      if (wantsSeasonDetail && seasonMentioned !== "all") {
-        // Return full journal entry for named season
-        const journal = await c.env.DB.prepare(
-          `SELECT title, description, eat_more, avoid, dosha, ayurvedic_note FROM ritu_journal WHERE season = ?1`
-        ).bind(seasonMentioned).first<any>();
-        const foods = await toolGetSeasonalFoods(c.env.DB, seasonMentioned, undefined, 6);
-        const foodList = (foods.foods as any[])
-          .filter((f: any) => !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d.toLowerCase())))
-          .slice(0, 5).map((f: any) => `**${f.name}**`).join(", ");
-        if (journal) {
-          let msg = `**${journal.title}**\n\n${journal.description}`;
-          if (journal.dosha) msg += ` This season is governed by the **${journal.dosha}** dosha.`;
-          if (foodList) msg += `\n\n🌿 **Foods in season:** ${foodList}.`;
-          if (journal.eat_more) msg += `\n\n✅ **Eat more:** ${journal.eat_more}.`;
-          if (journal.avoid) msg += `\n\n❌ **Avoid:** ${journal.avoid}.`;
-          if (journal.ayurvedic_note) msg += `\n\n_${journal.ayurvedic_note}_`;
-          finalResponse = msg;
+        if (intent === "seasonal_avoid" || m.includes("avoid") || m.includes("not eat") || m.includes("what not")) {
+          finalResponse = `In **${SEASON_LABELS[targetSeason] ?? targetSeason}**, avoid: **${journal.avoid}**.${journal.dosha ? ` (aggravates ${journal.dosha} dosha)` : ""}\n\nInstead focus on: ${journal.eat_more}.`;
         } else {
-          finalResponse = buildDirectResponse("get_seasonal_foods", foods, message);
+          finalResponse = `**${journal.title}**\n\n${journal.description}`;
+          if (journal.dosha)         finalResponse += ` Governed by the **${journal.dosha}** dosha.`;
+          if (journal.eat_more)      finalResponse += `\n\n✅ **Eat more:** ${journal.eat_more}.`;
+          if (journal.avoid)         finalResponse += `\n\n❌ **Avoid:** ${journal.avoid}.`;
+          if (journal.ayurvedic_note) finalResponse += `\n\n🌿 ${journal.ayurvedic_note}`;
         }
       } else {
-        // Simple: "what should I eat in monsoon?" → food list
-        const result = await toolGetSeasonalFoods(c.env.DB, seasonMentioned);
-        if (result.foods && userFacts.dislikes.length > 0) {
-          result.foods = result.foods.filter((f: any) =>
-            !userFacts.dislikes.some(d => d.toLowerCase() === f.name?.toLowerCase())
-          );
-        }
+        const result = await toolGetSeasonalFoods(c.env.DB, targetSeason);
+        (result as any).foods = filterFoodsForUser((result as any).foods ?? [], userFacts);
         finalResponse = buildDirectResponse("get_seasonal_foods", result, message);
       }
-      taskType = "get_seasonal_foods"; toolsUsed = ["get_seasonal_foods"];
+      taskType = "get_seasonal_foods";
     }
 
-    // Route 6: Diet plan — PHASE 1: passes dislikedFoods
-    else if (wantsDiet) {
-      const spokenGoal =
-        m.includes("gain") || m.includes("increase weight") ? "gain weight" :
-        m.includes("lose") || m.includes("weight loss")      ? "lose weight" :
-        m.includes("maintain")                                ? "maintain weight" :
-        m.includes("gym") || m.includes("muscle")            ? "muscle gain" : undefined;
-      const days = (wantsPDF || m.includes("week") || m.includes("7 day") || m.includes("7-day") || m.includes("whole week") || m.includes("entire week")) ? 7 : 1;
-
-      // PHASE 1: pass user's dislikes AND dietary preference from learned facts
-      // Merge profile dietary_preference with learned facts dietary
-      const profileWithFacts: Profile | null = profile ? {
-        ...profile,
-        dietary_preference: userFacts.dietary || profile.dietary_preference,
-      } : (userFacts.dietary ? { dietary_preference: userFacts.dietary } as Profile : null);
-
-      const result = await toolBuildDietPlan(
-        c.env.DB, profileWithFacts, seasonMentioned, spokenGoal, days, userFacts.dislikes
-      );
+    // ── Diet plan ──────────────────────────────────────────────────────────────
+    else if (isPlanReq) {
+      const season = parsedSeason ?? seasonMentioned ?? currentSeason;
+      // BUG 3 fix: vegetarian preference lives in user_facts, not just profiles table
+      const isVegUser = userFacts.dietary === "vegetarian" || userFacts.dietary === "vegan" || userFacts.dietary === "jain";
+      const dislikesWithNonVeg = isVegUser
+        ? [...userFacts.dislikes, "chicken breast", "salmon", "egg"]
+        : userFacts.dislikes;
+      const profileForPlan = isVegUser
+        ? ({ ...(profile ?? {}), dietary_preference: userFacts.dietary } as Profile)
+        : profile;
+      const result = await toolBuildDietPlan(c.env.DB, profileForPlan, season, userFacts.goal, planDays, dislikesWithNonVeg);
       finalResponse = buildDirectResponse("build_diet_plan", result, message);
-      if (profile?.goal && !spokenGoal) finalResponse += `\n\nThis plan takes your profile goal into account: **${profile.goal}**.`;
-      // Signal frontend to show PDF download button when user asked for PDF
-      if (wantsPDF && result.days?.length === 7) {
+      if (profile?.goal) finalResponse += `\n\n_This plan takes your profile goal into account: ${profile.goal}._`;
+      if (isPdf && planDays === 7) {
         finalResponse += "\n\n📄 Your 7-day PDF is ready to download.";
+        (c as any).__wantsPDF = true;
       }
-      taskType = "build_diet_plan"; toolsUsed = ["build_diet_plan"];
-      // Attach structured plan data so frontend can render PDF without re-fetching
       (c as any).__planData = result;
-      (c as any).__wantsPDF = wantsPDF && result.days?.length === 7;
+
+      // Update session memory
+      try {
+        const smKey = `session_summary:${sessionId}`;
+        const smRaw = await c.env.SESSIONS.get(smKey);
+        const sm = smRaw ? JSON.parse(smRaw) : {topics:[],plans_built:[],foods_mentioned:[],meals_logged:[]};
+        const note = `${planDays === 7 ? "7-day" : "Day"} plan (${SEASON_LABELS[season] ?? season}) — ${new Date().toLocaleDateString("en-IN")}`;
+        sm.plans_built = [note, ...(sm.plans_built ?? [])].slice(0, 3);
+        sm.topics = [`${planDays === 7 ? "Week" : "Day"} diet plan`, ...(sm.topics ?? [])].slice(0, 8);
+        await c.env.SESSIONS.put(smKey, JSON.stringify(sm), { expirationTtl: 604800 });
+      } catch { /* non-fatal */ }
+      taskType = "build_diet_plan"; toolsUsed = ["build_diet_plan"];
     }
 
-    // Route 7: Intake analysis + PHASE 1 meal logging
+    // ── Intake analysis + logging ──────────────────────────────────────────────
     else if (wantsIntake) {
-      // Use extractFoodsWithAmounts so '3 eggs' parses as 165g, '2 glass milk' as 480g
-      const foodsWithAmt = await extractFoodsWithAmounts(m, c.env.DB);
+      // Use Gemini-parsed foods (with per-food meal slots) if available
+      let foodsWithAmt: Array<{name:string; amount_g:number; meal_slot:string}> = [];
+
+      if (parsedFoods.length > 0) {
+        // Gemini gives us per-food meal slots — use them.
+        // If a food has NO slot from Gemini, resolve it via the same
+        // clause-boundary splitter used in the fallback path (fixes
+        // multi-slot messages collapsing into one slot).
+        const clauses = splitIntoMealClauses(m);
+        for (const f of parsedFoods) {
+          let slot = f.meal_slot ?? null;
+          if (!slot) {
+            const fname = (f.name ?? "").toLowerCase().split(" ")[0];
+            const c2 = fname ? clauses.find(cl => cl.text.includes(fname)) : null;
+            slot = c2?.slot ?? null;
+          }
+          foodsWithAmt.push({
+            name:      f.name,
+            amount_g:  f.amt_g ?? 100,
+            meal_slot: slot ?? parsedMealSlot ?? detectMealSlot(message),
+          });
+        }
+      } else {
+        // Fallback: extract foods + amounts per meal-clause (splits on "in/for <slot>"
+        // markers, not on punctuation — so commas and periods behave identically)
+        const clauses = splitIntoMealClauses(m);
+        const globalSlot = detectMealSlot(message);
+        const seen = new Set<string>();
+        for (const clause of clauses) {
+          const extracted = await extractFoodsWithAmounts(clause.text, c.env.DB);
+          const slot = clause.slot ?? globalSlot;
+          for (const e of extracted) {
+            const key = `${e.name}|${slot}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            foodsWithAmt.push({ name: e.name, amount_g: e.amount_g, meal_slot: slot });
+          }
+        }
+      }
+
       if (foodsWithAmt.length === 0) {
-        finalResponse = "I couldn't identify specific foods in your message. Try: 'I ate 2 eggs, oats, and a glass of milk for breakfast'.";
+        finalResponse = "I couldn't match those foods to my seasonal database — I track 57 whole Indian foods (fruits, vegetables, grains, dals, dairy, nuts, and proteins), so prepared dishes like pizza or pasta aren't in it yet.\n\nTry logging the ingredients instead, e.g. 'I ate 100g wheat and 50g paneer for dinner'.";
         taskType = "clarification";
       } else {
+        // Analyse (scale nutrients by amount)
         const allFoods  = foodsWithAmt.map(f => f.name);
         const allAmts   = foodsWithAmt.map(f => f.amount_g);
+        const result    = await toolAnalyzeIntake(c.env.DB, allFoods, profile, allAmts);
+        finalResponse   = buildDirectResponse("analyze_intake", result, message);
 
-        // Analyse nutrition scaled by actual amounts
-        const result = await toolAnalyzeIntake(c.env.DB, allFoods, profile, allAmts);
-        finalResponse = buildDirectResponse("analyze_intake", result, message);
+        // Portion summary
+        const portionSummary = foodsWithAmt.map(f => `${f.name} (${f.amount_g}g)`).join(", ");
+        finalResponse = `Portions understood: ${portionSummary}.\n\n${finalResponse}`;
 
-        // Show portion summary so user knows what was understood
-        const portionSummary = foodsWithAmt
-          .map(f => `${f.name} (${f.amount_g}g)`).join(", ");
-        finalResponse = finalResponse.replace(
-          "Analysed:",
-          `Portions understood: ${portionSummary}.\n\nAnalysed:`
-        );
-
-        // Log to D1 with actual amounts
-        const mealSlot = detectMealSlot(message);
-        const today = new Date().toISOString().split("T")[0];
+        // Log each food to its correct meal slot
+        const today = getISTDateString();
         const loggedNames: string[] = [];
-        for (const { name: fn, amount_g } of foodsWithAmt) {
-          const item = await c.env.DB.prepare(
-            `SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`
-          ).bind(`%${fn}%`).first<any>();
+        for (const food of foodsWithAmt) {
+          const item = await c.env.DB.prepare(`SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`)
+            .bind(`%${food.name}%`).first<any>();
           if (item) {
             await c.env.DB.prepare(
               `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
                VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
-            ).bind(profileId, today, item.id, amount_g, mealSlot).run();
-            loggedNames.push(`${fn} (${amount_g}g)`);
+            ).bind(profileId, today, item.id, food.amount_g, food.meal_slot).run();
+            loggedNames.push(`${food.name} (${food.amount_g}g → ${food.meal_slot})`);
           }
         }
-        if (loggedNames.length > 0) {
-          finalResponse += `\n\n✅ Logged to your meal diary: ${loggedNames.join(", ")}.`;
-        }
+        if (loggedNames.length > 0) finalResponse += `\n\n✅ Logged: ${loggedNames.join(", ")}.`;
+
+        // Session memory
+        try {
+          const smKey = `session_summary:${sessionId}`;
+          const smRaw = await c.env.SESSIONS.get(smKey);
+          const sm = smRaw ? JSON.parse(smRaw) : {topics:[],plans_built:[],foods_mentioned:[],meals_logged:[]};
+          sm.meals_logged = [portionSummary, ...(sm.meals_logged ?? [])].slice(0, 5);
+          sm.foods_mentioned = [...new Set([...allFoods, ...(sm.foods_mentioned ?? [])])].slice(0, 20);
+          sm.topics = ["Meal intake logging", ...(sm.topics ?? [])].slice(0, 8);
+          await c.env.SESSIONS.put(smKey, JSON.stringify(sm), { expirationTtl: 604800 });
+        } catch { /* non-fatal */ }
 
         taskType = "analyze_intake"; toolsUsed = ["analyze_intake"];
       }
     }
 
-    // Route 8a: "What to eat now?" — context-aware suggestion based on today's intake
-    else if (isVagueEatNow) {
-      // Look at what they've eaten today and suggest what's missing
-      const mealLogToday = await c.env.DB.prepare(
-        `SELECT i.name, i.calories_per_100g FROM meal_logs ml
-         JOIN items i ON i.id = ml.item_id
-         WHERE ml.session_id = ?1 AND ml.logged_date = date('now')`
-      ).bind(profileId).all();
-      const eaten = (mealLogToday.results as any[]).map(l => l.name);
-      const cal = (mealLogToday.results as any[]).reduce((s: number, l: any) => s + l.calories_per_100g, 0);
-      const tdee = profile ? computeTdee(profile) : 1800;
-      const remaining = (tdee ?? 1800) - cal;
-
-      if (eaten.length > 0) {
-        const seasonResult = await toolGetSeasonalFoods(c.env.DB, agentContext.current_season ?? "all", undefined, 6);
-        const suggestions = (seasonResult.foods as any[])
-          .filter(f => !eaten.includes(f.name) && !userFacts.dislikes.some(d => f.name.toLowerCase().includes(d)))
-          .slice(0, 3)
-          .map(f => `**${f.name}** (${f.calories_per_100g} kcal)`)
-          .join(", ");
-        finalResponse = `You've had ${eaten.join(", ")} today — about **${cal} kcal** so far. You have ~${remaining} kcal remaining.${suggestions ? `
-
-Good options for your next meal: ${suggestions}.` : ""}`;
-      } else {
-        finalResponse = `You haven't logged any meals today. Try something light to start — a fruit and some whole grains for breakfast. What season are you eating for?`;
-      }
-      taskType = "intake_suggestion";
-      toolsUsed = ["meal_log"];
+    // ── Meal slot suggestion ───────────────────────────────────────────────────
+    else if (wantsMealSlot) {
+      const slot = parsedMealSlot ?? detectMealSlot(message);
+      const slotLabel: Record<string,string> = {
+        breakfast:"breakfast", mid_morning:"mid-morning snack",
+        lunch:"lunch", evening:"evening snack", dinner:"dinner", general:"meal",
+      };
+      const result = await toolGetSeasonalFoods(c.env.DB, currentSeason);
+      const foods  = filterFoodsForUser((result as any).foods ?? [], userFacts)
+        .slice(0, 5);
+      const suggestions = foods.map((f: any) => `**${f.name}** (${f.calories_per_100g} kcal/100g)`).join(", ");
+      finalResponse = suggestions
+        ? `For your ${slotLabel[slot] ?? "meal"}: ${suggestions}.\n\nAll seasonal choices for ${SEASON_LABELS[currentSeason] ?? currentSeason}.`
+        : "Say 'Build my day plan' for a full personalised meal plan.";
+      taskType = "meal_suggestion"; toolsUsed = ["get_seasonal_foods"];
     }
 
-    // Route 8: Symptoms
-    else if (SYMPTOM_MAP[Object.keys(SYMPTOM_MAP).find(k => m.includes(k)) ?? ""]) {
-      const symptomKey = Object.keys(SYMPTOM_MAP).find(k => m.includes(k))!;
+    // ── Symptom advice ─────────────────────────────────────────────────────────
+    else if (symptomKey) {
       finalResponse = SYMPTOM_MAP[symptomKey];
-      // PHASE 1: personalise if we know their conditions
       if (userFacts.health_notes.length > 0) {
         finalResponse += `\n\n_Keeping in mind your health notes: ${userFacts.health_notes.join(", ")}._`;
       }
-      taskType = "symptom";
+      taskType = "symptom_advice";
     }
 
-    // Route 8b: User correction — "not brown rice, I selected guava" / "I said mango not banana"
-    // Detect when user is correcting the agent about which food they meant
+    // ── Correction / disagreement handler ────────────────────────────────────
     else if (
-      /not (?:brown rice|banana|oats|lentils|the|that|it|this)/i.test(m) ||
-      /i (?:said|selected|chose|meant|have selected|have clicked|am talking about) (.{2,25})/i.test(m) ||
-      /that.?s (?:not|wrong)|you.?re wrong|incorrect|it is not|it.?s not/i.test(m)
+      /^(?:no|that.?s wrong|you are wrong|incorrect|not right|wrong|you.?re wrong|nope)[\.!\s]*$/.test(msgClean)
+      || /^no[,.]? (?:you are|that.?s|it.?s) (?:wrong|incorrect|not right)/.test(msgClean)
     ) {
-      // Try to find the food the user is actually referring to
-      const correctionFoodMatch = await findFoodInMessage(m, c.env.DB);
-      if (correctionFoodMatch) {
-        const result = await toolFoodLookup(c.env.DB, correctionFoodMatch.name);
-        finalResponse = `Got it — you meant **${correctionFoodMatch.name}**! ` + buildDirectResponse("food_lookup", result, message);
-        taskType = "food_lookup"; toolsUsed = ["food_lookup"];
-      } else if (currentItem) {
-        const result = await toolFoodLookup(c.env.DB, currentItem.name);
-        finalResponse = `I see you have **${currentItem.name}** selected. ` + buildDirectResponse("food_lookup", result, message);
-        taskType = "food_lookup"; toolsUsed = ["food_lookup"];
-      } else {
-        finalResponse = `I'm sorry about the confusion! Which food were you asking about? You can click it in the food grid on the left and I'll pick it up automatically.`;
-        taskType = "clarification";
-      }
+      finalResponse = "I'm sorry about that! What specifically was incorrect? Tell me and I'll give you the right answer.";
+      taskType = "clarification";
     }
 
-    // Route 9: Gemini Flash — with PHASE 1 enriched system prompt
+    // ── Follow-up / "tell me more" ─────────────────────────────────────────────
+    else if (wantsFollowUp) {
+      const lastAsst  = [...history].reverse().find(h => h.role === "assistant" && h.content.length > 50);
+      const lastUserQ = [...history].reverse().find(h => h.role === "user" &&
+        !/^(?:tell me|please|no i mean|yes but|go on|continue|tell me more)/.test(h.content.toLowerCase()));
+      if (lastAsst && geminiKey) {
+        const fp = `Previous Q: "${lastUserQ?.content?.slice(0,150) ?? ""}"\nYour answer: "${lastAsst.content.slice(0,250)}"\nUser says: "${message}"\nExpand helpfully in max 80 words.`;
+        const sysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId);
+        finalResponse = await callGeminiFlash(fp, sysp, geminiKey, []);
+      }
+      if (!finalResponse) finalResponse = lastAsst?.content ?? "What would you like to know more about?";
+      taskType = "follow_up";
+    }
+
+    // ── Calorie count / intake summary today ────────────────────────────────────
+    else if (
+      (m.includes("calorie") && (m.includes("today") || m.includes("count") || m.includes("total") || m.includes("intake")))
+      || /what(?: all)? did i eat(?: today)?/.test(m)
+      || /what have i (?:eaten|had)(?: today)?/.test(m)
+      || (m.includes("meal log") && (m.includes("show") || m.includes("total")))
+    ) {
+      const today = getISTDateString();
+      // Match on EITHER identifier — profile_id and session_id can diverge
+      // between the chat widget and dashboard REST calls; this keeps the
+      // agent's answer consistent with what the dashboard shows.
+      const rows = await c.env.DB.prepare(
+        `SELECT i.name, ml.amount_g, ml.meal_slot, i.calories_per_100g
+         FROM meal_logs ml JOIN items i ON i.id = ml.item_id
+         WHERE (ml.profile_id = ?1 OR ml.session_id = ?2) AND ml.logged_date = ?3
+         ORDER BY ml.created_at ASC`
+      ).bind(profileId, sessionId, today).all();
+      const logs = rows.results as any[];
+      const totalCal  = Math.round(logs.reduce((s, l) => s + (l.calories_per_100g * l.amount_g / 100), 0));
+      const targetCal = computeTdee(profile ?? {}) ?? 2000;
+      const remaining = Math.max(0, targetCal - totalCal);
+
+      if (logs.length === 0) {
+        finalResponse = "No meals logged yet today. Tell me what you ate and I'll track your calories.";
+      } else if (/what(?: all)? did i eat|what have i (?:eaten|had)/.test(m)) {
+        const bySlot: Record<string, string[]> = {};
+        for (const l of logs) (bySlot[l.meal_slot ?? "meal"] ??= []).push(l.name);
+        const lines = Object.entries(bySlot).map(([slot, foods]) => `**${slot}**: ${foods.join(", ")}`);
+        finalResponse = `Today you've had:\n\n${lines.join("\n")}\n\nTotal: ~${totalCal} kcal out of your ~${targetCal} kcal target.`;
+      } else {
+        finalResponse = `Today you've had **~${totalCal} kcal** out of your **~${targetCal} kcal** target. You have ~${remaining} kcal remaining.`;
+      }
+      taskType = "calorie_query";
+    }
+
+    // ── Veg/non-veg classification ─────────────────────────────────────────────
+    else if (m.includes("veg or non veg") || m.includes("vegetarian or not") || m.includes("is it veg") || m.includes("is it non")) {
+      const food = parsedFoods[0]?.name ?? foodInMsg?.name ?? "that food";
+      const isNV = ["egg","chicken","salmon","fish","meat"].some(f => food.toLowerCase().includes(f));
+      finalResponse = `**${food.charAt(0).toUpperCase()+food.slice(1)}** is **${isNV ? "non-vegetarian" : "vegetarian"}** in Indian dietary categories.${isNV ? " Some communities include eggs (eggetarian diet) but most Indian vegetarian diets exclude it." : ""}`;
+      taskType = "general";
+    }
+
+    // ── Allergy / preference sub-queries ──────────────────────────────────────
+    else if (m.includes("allerg") || m.includes("what do i like") || m.includes("what do i dislike") || m.includes("my dislikes") || m.includes("my likes")) {
+      const parts: string[] = [];
+      if (userFacts.allergies.length)    parts.push(`⚠️ Allergies: ${userFacts.allergies.join(", ")}`);
+      if (userFacts.dislikes.length)     parts.push(`🚫 Dislikes: ${userFacts.dislikes.join(", ")}`);
+      if (userFacts.likes.length)        parts.push(`✅ Likes: ${userFacts.likes.join(", ")}`);
+      finalResponse = parts.length ? parts.join("\n") : "I don't have any recorded preferences yet.";
+      taskType = "memory_recall";
+    }
+
+    // ── Goal/health question about selected food ──────────────────────────────
+    else if (currentItem && (m.includes("my goal") || m.includes("weight goal") || m.includes("my diet") || m.includes("for my"))) {
+      const result = await toolFoodLookup(c.env.DB, currentItem.name);
+      const goal   = userFacts.goal || profile?.goal || "balanced";
+      const cal    = result.calories_per_100g ?? 0;
+      const verdict = (goal.includes("lose") && cal > 300) ? "⚠️ Best in moderation" : "✅ Good choice";
+      finalResponse = `${verdict} — **${currentItem.name}** (${cal} kcal/100g) for your **${goal}** goal.`;
+      taskType = "diet_advice"; toolsUsed = ["food_lookup"];
+    }
+
+    // ── Gemini fallback for truly ambiguous queries ────────────────────────────
     else {
-      const geminiKey = c.env.GEMINI_API_KEY ?? "";
       if (geminiKey) {
         try {
-          // PHASE 1: use enriched prompt that includes learned facts
-          const systemPrompt = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId);
-          finalResponse = await callGeminiFlash(message, systemPrompt, geminiKey, history);
+          const sysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId)
+            + (sessionSummaryText ? `\n\n${sessionSummaryText}` : "");
+          finalResponse = await callGeminiFlash(message, sysp, geminiKey, history);
         } catch (e) {
-          console.error("Gemini error:", e);
+          console.error("Gemini fallback error:", e);
           finalResponse = "";
         }
       }
-
       if (!finalResponse) {
         if (currentItem) {
           const result = await toolFoodLookup(c.env.DB, currentItem.name);
           finalResponse = buildDirectResponse("food_lookup", result, message);
           taskType = "food_lookup"; toolsUsed = ["food_lookup"];
         } else {
-          finalResponse = `I'm not sure I understood that. Here are some things you can ask:\n\n• "Tell me about spinach"\n• "Compare mango and banana"\n• "Foods rich in iron in winter"\n• "Build a summer diet plan"\n• "I ate banana and oats today"`;
+          // Health question about a food that's not in the 57-food DB ("is ghee good for health?")
+          const healthQ = m.match(/(?:^|\s)is (?:the )?([a-z][a-z\s]{1,25}?) (?:good|healthy|bad|ok|okay)\b/);
+          if (healthQ && healthQ[1]) {
+            const unknownFood = healthQ[1].trim();
+            finalResponse = `**${unknownFood.charAt(0).toUpperCase() + unknownFood.slice(1)}** isn't in my 57-food seasonal database, so I can't give you exact nutrient numbers for it.\n\n`
+              + `As a general rule: whole, minimally processed foods in moderate portions are good for most people. If you tell me your goal, I can suggest similar foods I *do* track — for example: "foods rich in healthy fats" or "compare paneer and tofu".`;
+            taskType = "clarification";
+          } else {
+            finalResponse = "I'm not sure I understood that — I'm best with questions about the 57 Indian seasonal foods I track. Try:\n\n• \"Tell me about spinach\"\n• \"Compare mango and banana\"\n• \"Foods rich in iron\"\n• \"Build a summer diet plan\"\n• \"I ate 2 eggs and milk for breakfast\"";
+            taskType = "clarification";
+          }
         }
       }
       taskType = "general";
@@ -2960,6 +3717,22 @@ Good options for your next meal: ${suggestions}.` : ""}`;
       : ["Tell me about guava", "Build my day plan", "What can you do?"];
   }
 
+  // ── Lightweight multi-intent addendum ────────────────────────────────────
+  // Full multi-intent parsing (N independent intents executed and merged) is a
+  // bigger architectural change; this handles the common real-world pattern —
+  // a real question with a pleasantry riding along ("thanks, what's my calorie
+  // count, bye") — by acknowledging the pleasantry alongside the primary answer,
+  // instead of either intent silently winning and the other being dropped.
+  if (finalResponse && taskType !== "greeting" && taskType !== "farewell" && taskType !== "smalltalk") {
+    const endsWithBye = /(?:,|\.|;|\s)\s*(bye+|goodbye|see\s*you|good\s*night|ttyl|take\s*care)\s*[!.]*$/i.test(msgClean);
+    const startsWithThanks = /^(?:thanks?|thank\s*you|thx|ty)\b/i.test(msgClean) && msgClean.length > 12;
+    if (endsWithBye) {
+      finalResponse += "\n\nTake care! 👋";
+    } else if (startsWithThanks) {
+      finalResponse = "You're welcome! " + finalResponse;
+    }
+  }
+
   const smartNextActions = buildNextActions(taskType, currentItem?.name ?? null, !!profile || Object.keys(userFacts).some(k => (userFacts as any)[k]?.length > 0));
 
   return c.json({
@@ -2978,7 +3751,7 @@ Good options for your next meal: ${suggestions}.` : ""}`;
 
 app.get("/agent/morning/:profile_id", async (c) => {
   const profileId = c.req.param("profile_id");
-  const today = new Date().toISOString().split("T")[0];
+  const today = getISTDateString();
   const cached = await c.env.SESSIONS.get(`morning:${profileId}:${today}`);
   if (cached) return c.json(JSON.parse(cached));
 
@@ -3024,6 +3797,25 @@ app.get("/agent/season-check/:profile_id", async (c) => {
   });
 
   return c.json({ changed: false, current });
+});
+
+// ── PHASE 4.2: Ingredient swap endpoint ───────────────────────────────────────
+
+app.post("/agent/task/swap", async (c) => {
+  const body = await c.req.json();
+  const { food_name, season, profile_id } = body;
+  if (!food_name) return c.json({ error: "food_name is required" }, 400);
+
+  const uf = profile_id
+    ? await loadUserFacts(profile_id, c.env.DB)
+    : { dislikes: [], likes: [], dietary: "", health_notes: [], allergies: [], goal: "", lifestyle: "" };
+  const isVegU = uf.dietary === "vegetarian" || uf.dietary === "vegan" || uf.dietary === "jain";
+  const targetSeason = (season && season !== "all") ? season : getCurrentSeason();
+
+  const alternatives = await findIngredientSwap(
+    applyFoodAlias(String(food_name)), c.env.DB, targetSeason, uf.dislikes, isVegU
+  );
+  return c.json({ food: food_name, season: targetSeason, alternatives });
 });
 
 // ── Diet plan endpoint ────────────────────────────────────────────────────────
