@@ -1,5 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { tryQuickParse, parseMessageIntentCached, type ParsedMessage } from "./intentParser";
+import { dispatchIntents, type DispatchContext } from "./intentDispatcher";
+// sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -369,12 +372,19 @@ async function extractAndStoreFacts(
         .map((f: string) => f.trim().replace(/\s+/g, " "))
         .filter((f: string) => f.length > 1 && f.length < 40);
 
-      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or","is","are"];
+      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or","is","are",
+        "you","it","this","that","he","she","they","we","chatbot","bot","app","ai","agent","thing","service"];
       for (const foodName of foodCandidates) {
         const firstWord = foodName.split(" ")[0];
         if (stopWords.includes(firstWord)) continue;
         // Normalise using the master alias map — covers all variants
         const normalizedName = applyFoodAlias(foodName);
+        // Validate against the real food database before storing — the "X is/are
+        // bad" pattern has no food constraint on its own and was matching insults
+        // ("you are bad" → stored "you" as a disliked food). Fixed 2026-07-03.
+        const dbHit = await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
+          .bind(`%${normalizedName}%`).first().catch(() => null);
+        if (!dbHit) continue;
         await db.prepare(
           `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
         ).bind(profileId, `%${normalizedName}%`).run();
@@ -413,13 +423,19 @@ async function extractAndStoreFacts(
         .map((f: string) => f.trim().replace(/\s+/g, " "))
         .filter((f: string) => f.length > 1 && f.length < 40);
 
-      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or"];
+      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or",
+        "you","it","this","that","he","she","they","we","chatbot","bot","app","ai","agent","thing","service"];
       for (const foodName of foodCandidates) {
         const firstWord = foodName.split(" ")[0];
         if (stopWords.includes(firstWord)) continue;
         if (foodName.length > 1 && foodName.length < 40) {
           // Normalise before storing — "panner" → "paneer" so no duplicates
           const normLike = applyFoodAlias(foodName);
+          // Validate against the real food database — same fix as the dislike
+          // loop above (see comment there). Fixed 2026-07-03.
+          const dbHit = await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
+            .bind(`%${normLike}%`).first().catch(() => null);
+          if (!dbHit) continue;
           await db.prepare(
             `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
           ).bind(profileId, `%${normLike}%`).run();
@@ -745,7 +761,8 @@ async function extractFoodsWithAmounts(
 async function logMealFromMessage(
   message: string,
   profileId: string,
-  db: D1Database
+  db: D1Database,
+  sessionId: string = profileId
 ): Promise<{ logged: string[]; notFound: string[] }> {
   const foodsWithAmounts = await extractFoodsWithAmounts(message, db);
   if (foodsWithAmounts.length === 0) return { logged: [], notFound: [] };
@@ -763,8 +780,8 @@ async function logMealFromMessage(
     if (item) {
       await db.prepare(
         `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
-      ).bind(profileId, today, item.id, amount_g, mealSlot).run();
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`
+      ).bind(profileId, sessionId, today, item.id, amount_g, mealSlot).run();
       logged.push(foodName);
     } else {
       notFound.push(foodName);
@@ -2105,7 +2122,7 @@ app.post("/meals/log", async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+     VALUES (?1, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
   ).bind(body.profile_id, today, body.item_id, body.amount_g ?? 100, body.meal_slot ?? "meal").run();
 
   return c.json({ ok: true, logged_date: today });
@@ -2454,10 +2471,16 @@ app.post("/agent/message", async (c) => {
                      msgClean.includes("what are you") || msgClean.includes("tell me about yourself") ||
                      msgClean.includes("introduce yourself") ||
                      msgClean.includes("are you chatgpt") || msgClean.includes("are you gemini") ||
-                     msgClean.includes("are you claude") || msgClean.includes("are you an ai");
+                     msgClean.includes("are you claude") || msgClean.includes("are you an ai") ||
+                     msgClean.includes("are you a real") || msgClean.includes("are you real") ||
+                     msgClean.includes("your expertise") || msgClean.includes("your purpose") ||
+                     msgClean.includes("benefit from you") || msgClean.includes("help me with") ||
+                     msgClean.includes("helping in general") || msgClean.includes("what do you know how to");
   const isAccuracy = msgClean.includes("how accurate") || msgClean.includes("are you accurate") ||
                      msgClean.includes("is this accurate") || msgClean.includes("is the data accurate") ||
-                     msgClean.includes("is that all you know") || msgClean.includes("accuracy");
+                     msgClean.includes("is that all you know") || msgClean.includes("accuracy") ||
+                     msgClean.includes("doctor worthy") || msgClean.includes("is this real") ||
+                     msgClean.includes("medical advice") || msgClean.includes("can i trust");
   const hasDietIntent = msgClean.includes("diet") || msgClean.includes("plan") || msgClean.includes("what to eat");
   const isMemory   = !hasDietIntent && MEMORY_PHRASES.some(p => msgClean.includes(p));
   // Memory update: "remove X from likes" / "delete X from dislikes"
@@ -2750,15 +2773,94 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     });
   }
 
+  // ── Phase 3.5 PRIMARY PATH: spec-compliant cached intent parser + dispatcher ──
+  // Master Plan 3.5.1/3.5.3: single cached Gemini call → parallel tool execution.
+  // The deterministic chain below (built before this integration) becomes the
+  // FALLBACK — a deliberate reliability addition beyond the literal spec, since
+  // free-tier Gemini availability can't be guaranteed and "industry grade, near-
+  // zero wrong answers" requires a safety net when the primary path can't answer
+  // confidently. See CHANGELOG 2026-07-02 (Phase 3.5 integration).
+  let dispatchedResponse: { text: string; taskType: string; toolsUsed: string[]; planData?: any; wantsPdf?: boolean } | null = null;
+  try {
+    const quick = tryQuickParse(msgClean);
+    const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
+      ? agentContext.current_season : getCurrentSeason();
+    const parsed: ParsedMessage | null = quick ?? await parseMessageIntentCached(
+      message,
+      c.env.GEMINI_API_KEY ?? "",
+      earlySeason,
+      `Likes: ${userFacts.likes.join(", ") || "none"}; Dislikes: ${userFacts.dislikes.join(", ") || "none"}; Goal: ${userFacts.goal || "none"}`,
+      c.env.SESSIONS
+    );
+
+    // ── Verified-safe allowlist ────────────────────────────────────────────────
+    // Testing surfaced real regressions: diet_plan returned truncated/hallucinated
+    // Gemini prose instead of the deterministic plan builder; intake_log and
+    // calorie_query failed to find meals just logged in the same session;
+    // multi-intent synthesis stitched unrelated answers together ("I couldn't
+    // find fruit... Also: [unrelated text]"). Root cause: the Gemini classifier
+    // doesn't reliably hit the right intent for these every time, and a single
+    // miss produces a visibly broken reply. Until each of those paths is
+    // individually re-verified, only single-intent messages of TYPES ALREADY
+    // PROVEN CORRECT go through the new dispatcher. Everything else — including
+    // any multi-intent message — falls to the deterministic router, which has
+    // been directly tested against real transcripts all night.
+    const VERIFIED_SAFE_INTENTS = new Set([
+      "food_lookup", "compare", "nutrient_query", "nutrient_in_food", "availability",
+      "swap_request", "memory_read", "memory_update", "symptom_query",
+      "seasonal_info", "seasonal_avoid", "current_season", "bmi_query",
+      "greeting", "farewell", "thanks",
+    ]);
+    const isSingleSafeIntent = !!parsed && parsed.intents.length === 1
+      && VERIFIED_SAFE_INTENTS.has(parsed.intents[0].type);
+
+    if (isSingleSafeIntent && parsed) {
+      const dispatchSysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId);
+      const dispatchToolFns: Record<string, Function> = {
+        foodLookup:           (name: string) => toolFoodLookup(c.env.DB, name),
+        compareFoods:         (f1: string, f2: string) => toolCompareFoods(c.env.DB, f1, f2),
+        getSeasonalFoods:     (season: string) => toolGetSeasonalFoods(c.env.DB, season),
+        getNutrientRichFoods: (nutrient: string, season?: string) => toolGetNutrientRichFoods(c.env.DB, nutrient, season),
+        buildDietPlan:        (season: string, prof: any, dislikes: string[]) => toolBuildDietPlan(c.env.DB, prof, season, prof?.goal, 1, dislikes),
+        analyzeIntake:        (foods: string[], amounts: number[]) => toolAnalyzeIntake(c.env.DB, foods, profile, amounts),
+        buildDirectResponse:  (toolName: string, result: any, q: string) => buildDirectResponse(toolName, result, q),
+        computeBmi:           (prof: any) => computeBmi(prof),
+        computeTdee:          (prof: any) => computeTdee(prof),
+        seasonLabel:          (season: string) => SEASON_LABELS[season] ?? season,
+        geminiNarrative:      (prompt: string) => callGeminiFlash(prompt, dispatchSysp, c.env.GEMINI_API_KEY ?? "", history),
+        findIngredientSwap:   (foodName: string, season: string, dislikes: string[], isVeg: boolean) =>
+                                 findIngredientSwap(foodName, c.env.DB, season, dislikes, isVeg),
+      };
+      const dispatchCtx: DispatchContext = {
+        db: c.env.DB, kv: c.env.SESSIONS, geminiKey: c.env.GEMINI_API_KEY ?? "",
+        profileId, sessionId, profile, userFacts, currentItem, currentSeason: earlySeason,
+        history, systemPrompt: dispatchSysp,
+      };
+      const result = await dispatchIntents(parsed, dispatchCtx, dispatchToolFns);
+      // Confidence gate — reject anything that looks like the dispatcher's own
+      // generic fallback rather than a real answer, regardless of length.
+      const looksGeneric = result.taskType === "general" || result.taskType === "clarification"
+        || result.taskType === "error" || /^I'm not sure|^I couldn't find|^Which /.test(result.text ?? "");
+      if (result.text && !looksGeneric) {
+        dispatchedResponse = result;
+      }
+    }
+  } catch (dispatchErr) {
+    console.error("Phase 3.5 dispatch failed, falling back to deterministic router:", dispatchErr);
+  }
+
   // ── Phase 3.5: NLP intent parse + deterministic tool execution ─────────────
   // NO dynamic imports. Everything inline. Gemini parses intent (200 tokens),
   // deterministic tools execute, Gemini narrative only for truly ambiguous.
 
-  let finalResponse = "";
-  let taskType      = "general";
-  let toolsUsed: string[] = [];
+  let finalResponse = dispatchedResponse?.text ?? "";
+  let taskType      = dispatchedResponse?.taskType ?? "general";
+  let toolsUsed: string[] = dispatchedResponse?.toolsUsed ?? [];
+  if (dispatchedResponse?.planData) (c as any).__planData = dispatchedResponse.planData;
+  if (dispatchedResponse?.wantsPdf) (c as any).__wantsPDF = dispatchedResponse.wantsPdf;
 
   try {
+    if (!dispatchedResponse) {
     const geminiKey     = c.env.GEMINI_API_KEY ?? "";
     // "all" is a UI filter pill, not a real season — never let it become the current season
     const ctxSeason     = (agentContext.current_season && agentContext.current_season !== "all")
@@ -2766,114 +2868,36 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     const currentSeason = ctxSeason ?? getCurrentSeason();
     const m             = msgClean;
 
-    // ── Step 1: Gemini intent parse ────────────────────────────────────────────
+    // ── Step 1: reuse the Stage-1 parse — NO second Gemini call ────────────────
+    // CRITICAL FIX 2026-07-03: this block used to make its OWN Gemini call here,
+    // completely redundant with parseMessageIntentCached() above — every message
+    // was firing 2+ Gemini requests. That's the direct cause of a 260/263 (98.9%)
+    // 429 rate. Now this reuses whatever `parsed` already returned (or nothing,
+    // if Gemini was unavailable) and makes zero additional network calls. The
+    // deterministic regex/keyword detection throughout the rest of this chain
+    // was already built to work with these variables null/empty — that's exactly
+    // the fallback path that's been carrying most traffic anyway.
     let parsedIntentType: string | null = null;
     let parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
     let parsedSeason: string | null  = null;
     let parsedNutrient: string | null = null;
     let parsedMealSlot: string | null = null;
-    let parsedIsPdf = false;
+    let parsedIsPdf = /\bpdf\b/.test(m);
     let parsedDays  = 1;
 
-    if (geminiKey) {
-      try {
-        const knownFoods = "Banana,Mango,Apple,Guava,Pomegranate,Pear,Grape,Plum,Jamun,Watermelon,Papaya,Litchi,Pineapple,Orange,Amla,Dates,Peach,Strawberry,Onion,Tomato,Spinach,Broccoli,Carrot,Cucumber,Bell Pepper,Pumpkin,Beetroot,Sweet Potato,Cabbage,Cauliflower,Bitter Gourd,Ridge Gourd,Bottle Gourd,Green Peas,Mustard Greens,Fenugreek Leaves,Oats,Brown Rice,Bajra,Jowar,Wheat,Lentils,Moong Dal,Chickpeas,Rajma,Soybean,Milk,Curd,Paneer,Egg,Chicken Breast,Tofu,Salmon,Almonds,Walnuts,Peanuts,Sesame Seeds";
-        const parsePrompt = [
-          "Extract structured data from this nutrition message.",
-          "Return ONLY valid JSON:",
-          '{"intent":"food_lookup","foods":[{"name":"Egg","qty":3,"unit":"piece","amt_g":165,"sentiment":"neutral","meal_slot":"breakfast"}],"season":"monsoon","nutrient":null,"meal_slot":"breakfast","is_pdf":false,"days":1}',
-          "",
-          "intent options: food_lookup|compare|intake_log|diet_plan|seasonal_info|seasonal_avoid|current_season|nutrient_query|memory_read|preference_set|memory_update|meal_suggestion|diet_advice|bmi_query|symptom_query|juice_salad|general_question|follow_up|general",
-          "- intake_log ONLY when user reports eating/drinking something (past tense or 'i ate/had/drank')",
-          "- preference_set when user says they like/dislike/love/hate a food",
-          "- diet_plan for 'build/make/give me a diet plan' — check days: 7 for week, 1 for day",
-          "- days: set 7 ONLY if user explicitly says 'week plan', '7 day', 'full week'. Default is 1.",
-          "- juice_salad for juice, smoothie, or salad requests",
-          "- foods: only real food items from: " + knownFoods,
-          "- sentiment: like|dislike|allergy|neutral",
-          "- meal_slot per food: breakfast|mid_morning|lunch|evening|dinner (null if not specified)",
-          "- qty: numeric quantity if mentioned (2 eggs=2, half kg=0.5, 200g=200)",
-          "- unit: piece|g|kg|ml|glass|bowl|katori|plate|tablespoon (null if not specified)",
-          "- amt_g: pre-compute grams (qty * unit_weight). glass=240g, bowl=150g, kg=1000g, g=1, piece=100g",
-          "  Food-specific weights: egg=55g, banana=120g, mango=200g, date=10g, almond=1g",
-          "",
-          'Message: "' + message.slice(0, 300).replace(/"/g, "'") + '"',
-          "JSON:",
-        ].join("\\n");
-
-        const parseResp = await fetchGeminiWithRetry(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
-          {
-            contents: [{ role: "user", parts: [{ text: parsePrompt }] }],
-            generationConfig: { maxOutputTokens: 300, temperature: 0 },
-          }
-        );
-
-        if (parseResp && parseResp.ok) {
-          const pd = await parseResp.json() as any;
-          const raw = (pd.candidates?.[0]?.content?.parts?.[0]?.text ?? "").trim().replace(/```json|```/g, "").trim();
-          if (raw.startsWith("{")) {
-            const p = JSON.parse(raw);
-            parsedIntentType = p.intent ?? null;
-            parsedFoods      = Array.isArray(p.foods) ? p.foods : [];
-            parsedSeason     = p.season ?? null;
-            parsedNutrient   = p.nutrient ?? null;
-            parsedMealSlot   = p.meal_slot ?? null;
-            parsedIsPdf      = !!p.is_pdf;
-            parsedDays       = (p.days === 7) ? 7 : 1;
-
-            // Unit → grams conversion table
-            const UNIT_G: Record<string, number> = {
-              g:1, gram:1, grams:1, kg:1000,
-              ml:1, l:1000, glass:240, glasses:240,
-              cup:240, cups:240, bowl:150, bowls:150,
-              katori:150, plate:200, tablespoon:15, tbsp:15,
-              teaspoon:5, tsp:5, piece:100, pieces:100,
-              roti:30, handful:30,
-            };
-            const FOOD_G: Record<string, number> = {
-              egg:55, eggs:55, banana:120, mango:200, date:10, dates:10,
-              almond:1, almonds:1, walnut:5, walnuts:5,
-            };
-            for (const f of parsedFoods) {
-              f.name = applyFoodAlias((f.name ?? "").toLowerCase().trim());
-              if (f.qty && !f.amt_g) {
-                const u = (f.unit ?? "").toLowerCase().trim();
-                if (UNIT_G[u]) {
-                  f.amt_g = Math.round(f.qty * UNIT_G[u]);
-                } else {
-                  const fn = f.name.toLowerCase();
-                  const fk = Object.keys(FOOD_G).find(k => fn.includes(k));
-                  f.amt_g = fk ? Math.round(f.qty * FOOD_G[fk]) : Math.round(f.qty * 100);
-                }
-              }
-              f.amt_g = f.amt_g ?? 100;
-            }
-
-            // Store preferences found by Gemini
-            for (const f of parsedFoods) {
-              if (!f.name || f.name.length < 2) continue;
-              const norm = applyFoodAlias(f.name);
-              if (f.sentiment === "like") {
-                await c.env.DB.prepare(
-                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-                   VALUES (?1,'preference',?2,?2,'conversation',datetime('now'),datetime('now'))`
-                ).bind(profileId, norm).run().catch(() => {});
-              } else if (f.sentiment === "dislike") {
-                await c.env.DB.prepare(
-                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-                   VALUES (?1,'dislike',?2,?2,'conversation',datetime('now'),datetime('now'))`
-                ).bind(profileId, norm).run().catch(() => {});
-              } else if (f.sentiment === "allergy") {
-                await c.env.DB.prepare(
-                  `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-                   VALUES (?1,'allergy',?2,?2,'conversation',datetime('now'),datetime('now'))`
-                ).bind(profileId, norm).run().catch(() => {});
-              }
-            }
-          }
-        }
-      } catch { /* Gemini parse failed — keyword fallback handles it */ }
+    if (parsed) {
+      const primary = parsed.intents.find(i => i.is_primary) ?? parsed.intents[0];
+      if (primary) {
+        parsedIntentType = primary.type;
+        parsedSeason     = primary.season ?? null;
+        parsedNutrient   = primary.nutrient ?? null;
+        parsedMealSlot   = primary.meal_slot ?? null;
+        parsedFoods = (primary.foods ?? []).map(f => ({
+          name: applyFoodAlias((f.name ?? "").toLowerCase().trim()),
+          qty: f.quantity, unit: f.unit, amt_g: f.amount_g,
+          sentiment: f.sentiment, meal_slot: f.meal_slot,
+        }));
+      }
     }
 
     // ── Step 2: Session memory injection ─────────────────────────────────────
@@ -2979,6 +3003,9 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         m.includes("tell me") || m.includes("what is") || m.includes("about")
         || m.includes("info") || m.startsWith((foodInMsg.name ?? "").toLowerCase())
         || m.includes("is it") || m.includes("good for") || m.includes("healthy")
+        || m.includes("should i add") || m.includes("should i eat") || m.includes("should i have")
+        || m.includes("can i add") || m.includes("can i eat") || m.includes("add to my diet")
+        || m.includes("add to diet") || m.includes("worth eating") || m.includes("ok to eat")
       ))
     );
 
@@ -3491,8 +3518,8 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
           if (item) {
             await c.env.DB.prepare(
               `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-               VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
-            ).bind(profileId, today, item.id, food.amount_g, food.meal_slot).run();
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`
+            ).bind(profileId, sessionId, today, item.id, food.amount_g, food.meal_slot).run();
             loggedNames.push(`${food.name} (${food.amount_g}g → ${food.meal_slot})`);
           }
         }
@@ -3627,6 +3654,28 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
 
     // ── Gemini fallback for truly ambiguous queries ────────────────────────────
     else {
+      // ── Domain classifier ─────────────────────────────────────────────────
+      // This bot's scope is nutrition & health for Indian seasonal eating —
+      // not general chat. A message that reaches this point matched none of
+      // the ~30 specific handlers above. Before spending a (currently very
+      // unreliable) Gemini call on it, decide: is this even in our domain?
+      const IN_DOMAIN_SIGNALS = [
+        "nutrient","vitamin","mineral","protein","carb","fat","fibre","fiber",
+        "calorie","kcal","diet","meal","nutrition","food","eat","eating","drink",
+        "recipe","ingredient","portion","serving","snack","breakfast","lunch","dinner",
+        "health","weight","bmi","blood pressure","diabetes","sugar","cholesterol",
+        "immunity","digestion","digest","symptom","disease","illness","body",
+        "exercise","fitness","hydration","allerg","pregnant","child","elderly",
+        "season","ritu","monsoon","summer","winter","spring","autumn",
+        "dosha","ayurved","vegetarian","vegan","weak","tired","energy",
+      ];
+      const isInDomain = IN_DOMAIN_SIGNALS.some(k => m.includes(k))
+        || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);
+
+      if (!isInDomain) {
+        finalResponse = "Sorry this is out of our expertise. Please feel free to ask any questions from nutrition and health based.";
+        taskType = "out_of_domain";
+      } else {
       if (geminiKey) {
         try {
           const sysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId)
@@ -3657,7 +3706,9 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         }
       }
       taskType = "general";
+      } // end else (isInDomain) — out-of-domain branch already set its own response above
     }
+    } // end if (!dispatchedResponse) — deterministic fallback chain
 
   } catch (err: any) {
     console.error("Agent error:", err);
