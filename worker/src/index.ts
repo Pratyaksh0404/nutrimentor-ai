@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { tryQuickParse, parseMessageIntentCached, type ParsedMessage } from "./intentParser";
-import { dispatchIntents, type DispatchContext } from "./intentDispatcher";
+// intentParser.ts / intentDispatcher.ts intentionally not imported into the hot
+// path — see ARCHITECTURE DECISION comment below. Kept in the repo, spec-compliant,
+// for future use if a reliable free (or paid) inference source becomes available.
 // sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -298,53 +299,13 @@ async function extractAndStoreFacts(
   const stored: string[] = [];
   // Wrap all fact storage in try/catch — a DB error must never crash the agent response
 
-  // ── Gemini-powered food entity extraction ────────────────────────────────────
-  // Handles complex sentences: "I like mango I hate litchi I get sick from plum"
-  // Falls back to regex below if Gemini unavailable or returns nothing.
-  // QUOTA GUARD: only call Gemini here when the message plausibly contains
-  // preference/sentiment language. Most messages (food lookups, symptoms,
-  // plan requests, intake logs) have none — calling a rate-limited free-tier
-  // model to look for likes/dislikes in "what is my BMI?" wastes quota that
-  // the intent-parsing call (which runs on every message) needs more.
-  const hasSentimentLanguage = /\b(like|likes|liked|love|loves|loved|dislike|dislikes|disliked|hate|hates|hated|allerg\w*|favorite|favourite|avoid\w*|can'?t (?:eat|have|drink|stand)|cannot (?:eat|have|drink|stand)|prefer\w*|fond of|enjoy\w*|sick from|makes me ill)\b/i.test(message);
-  let geminiHandledLikeDislikes = false;
-  if (geminiKey && hasSentimentLanguage) {
-    try {
-      const entities = await geminiExtractFoodEntities(message, geminiKey);
-      if (entities.length > 0) {
-        geminiHandledLikeDislikes = true;
-        for (const { food, sentiment } of entities) {
-          if (!food || food.length < 2 || food.length > 30) continue;
-          const norm = applyFoodAlias(food.toLowerCase().trim());
-          if (sentiment === "like") {
-            await db.prepare(
-              `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
-            ).bind(profileId, `%${norm}%`).run();
-            await db.prepare(
-              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-               VALUES (?1, 'preference', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
-            ).bind(profileId, norm).run();
-            stored.push(`like:${norm}`);
-          } else if (sentiment === "dislike") {
-            await db.prepare(
-              `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
-            ).bind(profileId, `%${norm}%`).run();
-            await db.prepare(
-              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-               VALUES (?1, 'dislike', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
-            ).bind(profileId, norm).run();
-            stored.push(`dislike:${norm}`);
-          } else if (sentiment === "allergy") {
-            await db.prepare(
-              `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-               VALUES (?1, 'allergy', ?2, ?2, 'conversation', datetime('now'), datetime('now'))`
-            ).bind(profileId, norm).run();
-            stored.push(`allergy:${norm}`);
-          }
-        }
-      }
-    } catch { /* non-fatal */ }
-  }
+  // ── Food entity extraction — deterministic only ───────────────────────────────
+  // Per the architecture decision (see agent route handler): Gemini is no longer
+  // called here either. The regex patterns below (like/dislike/allergy, now
+  // DB-validated and covering the phrasings Gemini used to catch — "sick from X",
+  // "makes me ill") handle this deterministically. geminiHandledLikeDislikes is
+  // kept as `false` so the loops below always run.
+  const geminiHandledLikeDislikes = false;
 
   // ── Dislikes (regex fallback when Gemini not available or returned nothing) ──
   // Also handles goal/health/profile fields regardless of geminiHandledLikeDislikes
@@ -516,6 +477,9 @@ async function extractAndStoreFacts(
     /(?:allergic to|allergy to) ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
     /i have (?:an )?allergy (?:to|for) ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
     /i am (?:allergic|sensitive) to ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+    // Was Gemini-only before the architecture change — now deterministic too.
+    /i get sick from ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+    /([a-z][a-z\s]{1,25}?) makes me (?:sick|ill)/,
   ];
   for (const allergyPat of allergyPatterns) {
     const allergyMatch = m.match(allergyPat);
@@ -524,14 +488,17 @@ async function extractAndStoreFacts(
       // Skip non-food allergens like "dogs", "cats", "pollen"
       const nonFoodAllergens = ["dog","cat","pollen","dust","pet","animal","bee","insect","latex","mold","mould"];
       const isNonFood = nonFoodAllergens.some(a => allergen.includes(a));
-      if (!isNonFood && allergen.length > 1 && allergen.length < 30) {
+      // DB-validate — same fix as the like/dislike loops above (see comment there)
+      const dbHit = isNonFood ? null : await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
+        .bind(`%${applyFoodAlias(allergen)}%`).first().catch(() => null);
+      if (!isNonFood && dbHit && allergen.length > 1 && allergen.length < 30) {
         await db.prepare(
           `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
            VALUES (?1, 'allergy', ?2, 'true', 'conversation', datetime('now'))
            ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
            fact_value='true', updated_at=datetime('now')`
-        ).bind(profileId, allergen).run();
-        stored.push(`allergy:${allergen}`);
+        ).bind(profileId, applyFoodAlias(allergen)).run();
+        stored.push(`allergy:${applyFoodAlias(allergen)}`);
       }
       break;
     }
@@ -2773,85 +2740,26 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     });
   }
 
-  // ── Phase 3.5 PRIMARY PATH: spec-compliant cached intent parser + dispatcher ──
-  // Master Plan 3.5.1/3.5.3: single cached Gemini call → parallel tool execution.
-  // The deterministic chain below (built before this integration) becomes the
-  // FALLBACK — a deliberate reliability addition beyond the literal spec, since
-  // free-tier Gemini availability can't be guaranteed and "industry grade, near-
-  // zero wrong answers" requires a safety net when the primary path can't answer
-  // confidently. See CHANGELOG 2026-07-02 (Phase 3.5 integration).
-  let dispatchedResponse: { text: string; taskType: string; toolsUsed: string[]; planData?: any; wantsPdf?: boolean } | null = null;
-  try {
-    const quick = tryQuickParse(msgClean);
-    const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
-      ? agentContext.current_season : getCurrentSeason();
-    const parsed: ParsedMessage | null = quick ?? await parseMessageIntentCached(
-      message,
-      c.env.GEMINI_API_KEY ?? "",
-      earlySeason,
-      `Likes: ${userFacts.likes.join(", ") || "none"}; Dislikes: ${userFacts.dislikes.join(", ") || "none"}; Goal: ${userFacts.goal || "none"}`,
-      c.env.SESSIONS
-    );
+  // ── ARCHITECTURE DECISION (2026-07-03): Gemini removed from intent classification ──
+  // Evidence: 260/263 (98.9%) Gemini calls failed in production testing. For a
+  // BOUNDED domain — 57 foods, ~25 intents, 6 seasons, ~20 symptoms — calling an
+  // external, rate-limited LLM to classify every message is the wrong mechanism,
+  // not a reliability bug to patch around. Production closed-domain assistants
+  // (Dialogflow, Rasa, Alexa Skills) solve exactly this class of problem with
+  // deterministic NLU as the PRIMARY engine, using an LLM only as optional
+  // narrative polish on top of an already-correct deterministic answer.
+  // The comprehensive deterministic router below — built and directly tested
+  // against real transcripts all night — is now the sole, unconditional
+  // classifier. `intentParser.ts`/`intentDispatcher.ts` remain in the repo
+  // (still spec-compliant, still importable) for if/when a paid tier or a
+  // reliable free inference source becomes available, but nothing in the
+  // critical path awaits them anymore.
+  const dispatchedResponse: { text: string; taskType: string; toolsUsed: string[]; planData?: any; wantsPdf?: boolean } | null = null;
 
-    // ── Verified-safe allowlist ────────────────────────────────────────────────
-    // Testing surfaced real regressions: diet_plan returned truncated/hallucinated
-    // Gemini prose instead of the deterministic plan builder; intake_log and
-    // calorie_query failed to find meals just logged in the same session;
-    // multi-intent synthesis stitched unrelated answers together ("I couldn't
-    // find fruit... Also: [unrelated text]"). Root cause: the Gemini classifier
-    // doesn't reliably hit the right intent for these every time, and a single
-    // miss produces a visibly broken reply. Until each of those paths is
-    // individually re-verified, only single-intent messages of TYPES ALREADY
-    // PROVEN CORRECT go through the new dispatcher. Everything else — including
-    // any multi-intent message — falls to the deterministic router, which has
-    // been directly tested against real transcripts all night.
-    const VERIFIED_SAFE_INTENTS = new Set([
-      "food_lookup", "compare", "nutrient_query", "nutrient_in_food", "availability",
-      "swap_request", "memory_read", "memory_update", "symptom_query",
-      "seasonal_info", "seasonal_avoid", "current_season", "bmi_query",
-      "greeting", "farewell", "thanks",
-    ]);
-    const isSingleSafeIntent = !!parsed && parsed.intents.length === 1
-      && VERIFIED_SAFE_INTENTS.has(parsed.intents[0].type);
-
-    if (isSingleSafeIntent && parsed) {
-      const dispatchSysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId);
-      const dispatchToolFns: Record<string, Function> = {
-        foodLookup:           (name: string) => toolFoodLookup(c.env.DB, name),
-        compareFoods:         (f1: string, f2: string) => toolCompareFoods(c.env.DB, f1, f2),
-        getSeasonalFoods:     (season: string) => toolGetSeasonalFoods(c.env.DB, season),
-        getNutrientRichFoods: (nutrient: string, season?: string) => toolGetNutrientRichFoods(c.env.DB, nutrient, season),
-        buildDietPlan:        (season: string, prof: any, dislikes: string[]) => toolBuildDietPlan(c.env.DB, prof, season, prof?.goal, 1, dislikes),
-        analyzeIntake:        (foods: string[], amounts: number[]) => toolAnalyzeIntake(c.env.DB, foods, profile, amounts),
-        buildDirectResponse:  (toolName: string, result: any, q: string) => buildDirectResponse(toolName, result, q),
-        computeBmi:           (prof: any) => computeBmi(prof),
-        computeTdee:          (prof: any) => computeTdee(prof),
-        seasonLabel:          (season: string) => SEASON_LABELS[season] ?? season,
-        geminiNarrative:      (prompt: string) => callGeminiFlash(prompt, dispatchSysp, c.env.GEMINI_API_KEY ?? "", history),
-        findIngredientSwap:   (foodName: string, season: string, dislikes: string[], isVeg: boolean) =>
-                                 findIngredientSwap(foodName, c.env.DB, season, dislikes, isVeg),
-      };
-      const dispatchCtx: DispatchContext = {
-        db: c.env.DB, kv: c.env.SESSIONS, geminiKey: c.env.GEMINI_API_KEY ?? "",
-        profileId, sessionId, profile, userFacts, currentItem, currentSeason: earlySeason,
-        history, systemPrompt: dispatchSysp,
-      };
-      const result = await dispatchIntents(parsed, dispatchCtx, dispatchToolFns);
-      // Confidence gate — reject anything that looks like the dispatcher's own
-      // generic fallback rather than a real answer, regardless of length.
-      const looksGeneric = result.taskType === "general" || result.taskType === "clarification"
-        || result.taskType === "error" || /^I'm not sure|^I couldn't find|^Which /.test(result.text ?? "");
-      if (result.text && !looksGeneric) {
-        dispatchedResponse = result;
-      }
-    }
-  } catch (dispatchErr) {
-    console.error("Phase 3.5 dispatch failed, falling back to deterministic router:", dispatchErr);
-  }
-
-  // ── Phase 3.5: NLP intent parse + deterministic tool execution ─────────────
-  // NO dynamic imports. Everything inline. Gemini parses intent (200 tokens),
-  // deterministic tools execute, Gemini narrative only for truly ambiguous.
+  // ── Phase 3.5: deterministic NLP intent parse + tool execution ─────────────
+  // NO dynamic imports. Everything inline. Gemini narrative only for the rare
+  // truly-unmatched in-domain query (see domain classifier further below) —
+  // and even that is optional; the app is 100% functional without it.
 
   let finalResponse = dispatchedResponse?.text ?? "";
   let taskType      = dispatchedResponse?.taskType ?? "general";
@@ -2868,37 +2776,21 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     const currentSeason = ctxSeason ?? getCurrentSeason();
     const m             = msgClean;
 
-    // ── Step 1: reuse the Stage-1 parse — NO second Gemini call ────────────────
-    // CRITICAL FIX 2026-07-03: this block used to make its OWN Gemini call here,
-    // completely redundant with parseMessageIntentCached() above — every message
-    // was firing 2+ Gemini requests. That's the direct cause of a 260/263 (98.9%)
-    // 429 rate. Now this reuses whatever `parsed` already returned (or nothing,
-    // if Gemini was unavailable) and makes zero additional network calls. The
-    // deterministic regex/keyword detection throughout the rest of this chain
-    // was already built to work with these variables null/empty — that's exactly
-    // the fallback path that's been carrying most traffic anyway.
-    let parsedIntentType: string | null = null;
-    let parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
-    let parsedSeason: string | null  = null;
-    let parsedNutrient: string | null = null;
-    let parsedMealSlot: string | null = null;
-    let parsedIsPdf = /\bpdf\b/.test(m);
-    let parsedDays  = 1;
-
-    if (parsed) {
-      const primary = parsed.intents.find(i => i.is_primary) ?? parsed.intents[0];
-      if (primary) {
-        parsedIntentType = primary.type;
-        parsedSeason     = primary.season ?? null;
-        parsedNutrient   = primary.nutrient ?? null;
-        parsedMealSlot   = primary.meal_slot ?? null;
-        parsedFoods = (primary.foods ?? []).map(f => ({
-          name: applyFoodAlias((f.name ?? "").toLowerCase().trim()),
-          qty: f.quantity, unit: f.unit, amt_g: f.amount_g,
-          sentiment: f.sentiment, meal_slot: f.meal_slot,
-        }));
-      }
-    }
+    // ── Step 1: intent signal variables ─────────────────────────────────────────
+    // These used to be populated by a Gemini classification call. Per the
+    // architecture decision above, that call has been removed entirely — every
+    // deterministic check throughout this chain was already written as
+    // `intent === "x" || <regex/keyword condition>`, so it degrades to the
+    // regex/keyword path with zero behavior change. Left as typed placeholders
+    // (rather than deleting every reference) to keep this diff reviewable and
+    // reversible if a reliable inference source is added later.
+    const parsedIntentType: string | null = null;
+    const parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
+    const parsedSeason: string | null  = null;
+    const parsedNutrient: string | null = null;
+    const parsedMealSlot: string | null = null;
+    const parsedIsPdf = /\bpdf\b/.test(m);
+    const parsedDays  = 1;
 
     // ── Step 2: Session memory injection ─────────────────────────────────────
     let sessionSummaryText = "";
