@@ -747,8 +747,8 @@ async function logMealFromMessage(
     if (item) {
       await db.prepare(
         `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`
-      ).bind(profileId, sessionId, today, item.id, amount_g, mealSlot).run();
+         VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+      ).bind(profileId, today, item.id, amount_g, mealSlot).run();
       logged.push(foodName);
     } else {
       notFound.push(foodName);
@@ -1421,25 +1421,53 @@ async function buildSystemPromptWithFacts(
     if (todayLogs.results.length > 0) {
       const mealLines = (todayLogs.results as any[]).map(l => `${l.meal_slot}: ${l.name}`).join(", ");
       todayMealContext = `\n\nToday's logged meals: ${mealLines}`;
+    } else {
+      todayMealContext = `\n\nToday's logged meals: none yet. If asked about today's intake or calories, say so honestly — do not invent meals or numbers.`;
     }
   } catch { /* non-fatal */ }
 
-  // Inject session summary (rolling notes from this session)
-  // This gives the agent memory of what happened earlier in the current chat
-  let sessionSummary = "";
+  // Inject REAL 7-day nutrient deficiency data — the model must never guess
+  // or claim to have "checked the dashboard"; it either has this exact data
+  // or it says it doesn't. This directly fixes a hallucination bug where the
+  // model invented fictional deficiencies with confident, specific language.
+  let deficiencyContext = "";
   try {
-    // We pass sessionId via a closure trick — it's set as a KV key
-    // The summary is updated after every exchange
-    // Note: sessionId not available here directly, so we look it up via profileId
-    // This is best-effort; the main memory is in user_facts
+    const rows = await db.prepare(
+      `SELECT n.name as nutrient_name, SUM(in_.amount_per_100g * ml.amount_g / 100.0) as total, rda.daily_amount
+       FROM meal_logs ml
+       JOIN item_nutrients in_ ON in_.item_id = ml.item_id
+       JOIN nutrients n ON n.id = in_.nutrient_id
+       LEFT JOIN rda ON rda.nutrient_name = n.name
+       WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+       GROUP BY n.name`
+    ).bind(profileId).all();
+    const rowsArr = rows.results as any[];
+    if (rowsArr.length > 0) {
+      const deficient = rowsArr
+        .filter(r => r.daily_amount && (r.total / (r.daily_amount * 7)) < 0.4)
+        .map(r => r.nutrient_name);
+      deficiencyContext = deficient.length > 0
+        ? `\n\n7-day nutrient data (REAL, from database — use this exact list, do not add or invent others): appears low on ${deficient.join(", ")}.`
+        : `\n\n7-day nutrient data (REAL, from database): no significant deficiencies detected in logged meals.`;
+    } else {
+      deficiencyContext = `\n\n7-day nutrient data: no meals logged in the last 7 days. If asked about deficiencies, say you need meal logs first — do not invent specific nutrients.`;
+    }
   } catch { /* non-fatal */ }
+
+  const groundingRules = `\n\nCRITICAL RULES:
+1. You do NOT have live access to any dashboard, chart, or UI the user is looking at. Never say "I checked the dashboard" or "I can see it shows X" — you only have the data explicitly given to you in this prompt.
+2. For nutrient deficiency or calorie questions, use ONLY the "7-day nutrient data" and "Today's logged meals" lines above — never invent specific numbers, percentages, or nutrient names not listed there.
+3. If the user states something you cannot verify from your data (e.g. "the dashboard shows X"), do not agree or disagree with confidence — say you don't have access to that view and offer to check what you do have (today's log / 7-day data above).
+4. For ANY question involving a medical condition, symptom, medication, or "should I consult a doctor" — give helpful nutrition-relevant guidance AND explicitly add: "I'm an AI nutrition assistant, not a doctor — please consult a healthcare professional for medical concerns." Keep this natural, not robotic, but never omit it for medical topics.
+5. Stay within nutrition, food, and health. For anything else, politely decline and redirect to nutrition/health topics.`;
 
   const systemParts = [
     base,
     `\n\nWhat I know about this user from our conversations:\n${factLines}`,
     `\n\nAlways use these learned preferences when giving advice. Never suggest foods the user has said they dislike.`,
     todayMealContext,
-    sessionSummary,
+    deficiencyContext,
+    groundingRules,
   ];
   return systemParts.join("");
 }
@@ -2089,7 +2117,7 @@ app.post("/meals/log", async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-     VALUES (?1, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+     VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
   ).bind(body.profile_id, today, body.item_id, body.amount_g ?? 100, body.meal_slot ?? "meal").run();
 
   return c.json({ ok: true, logged_date: today });
@@ -2250,7 +2278,11 @@ app.get("/nutrition-score/:profile_id", async (c) => {
   const breakdown = Object.entries(SCORE_WEIGHTS).map(([nutrient, weight]) => {
     const avg = nutrientAverages[nutrient] ?? 0;
     const rda = rdaMap[nutrient] ?? 1;
-    const pct = Math.round(Math.min((avg / rda) * 100, 100));
+    // Do NOT cap at 100 — that silently made every well-covered nutrient show
+    // as identically "100%" even when actual intake varied widely (150% vs
+    // 340% vs 220% all displayed the same). Cap only at a sane ceiling to
+    // guard against bad data, not to hide genuinely-high (healthy) intake.
+    const pct = Math.round(Math.min((avg / rda) * 100, 500));
     return { nutrient, avg: Math.round(avg * 10) / 10, rda, pct, weight,
              status: pct >= 70 ? "good" : pct >= 40 ? "low" : "deficient" };
   }).sort((a, b) => a.pct - b.pct);
@@ -2429,10 +2461,11 @@ app.post("/agent/message", async (c) => {
   const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted"].includes(msgClean);
   const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
                        "that's wrong","thats wrong","incorrect","not right","what the","wtf","wth"].includes(msgClean)
-    || msgClean.startsWith("what the") || msgClean.startsWith("what ?");
-  const isFrustration = msgClean.includes("what the fuck") || msgClean.includes("wtf") ||
+    || ((msgClean.startsWith("what the") || msgClean.startsWith("what ?")) && msgClean.split(/\s+/).length <= 5);
+  const isFrustration = (msgClean.includes("what the fuck") || msgClean.includes("wtf") ||
                         msgClean.includes("what the hell") || msgClean.includes("this is wrong") ||
-                        msgClean.includes("stupid") || msgClean.includes("dumb");
+                        msgClean.includes("stupid") || msgClean.includes("dumb"))
+    && !/expertise|purpose|who (?:made|are|built|created)|what (?:can|do) you|your (?:name|area)/.test(msgClean);
   const isIdentity = msgClean.includes("who made you") || msgClean.includes("who are you") ||
                      msgClean.includes("who built you") || msgClean.includes("who created you") ||
                      msgClean.includes("what are you") || msgClean.includes("tell me about yourself") ||
@@ -2440,7 +2473,7 @@ app.post("/agent/message", async (c) => {
                      msgClean.includes("are you chatgpt") || msgClean.includes("are you gemini") ||
                      msgClean.includes("are you claude") || msgClean.includes("are you an ai") ||
                      msgClean.includes("are you a real") || msgClean.includes("are you real") ||
-                     msgClean.includes("your expertise") || msgClean.includes("your purpose") ||
+                     msgClean.includes("expertise") || msgClean.includes("your purpose") ||
                      msgClean.includes("benefit from you") || msgClean.includes("help me with") ||
                      msgClean.includes("helping in general") || msgClean.includes("what do you know how to");
   const isAccuracy = msgClean.includes("how accurate") || msgClean.includes("are you accurate") ||
@@ -3404,18 +3437,27 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         // Log each food to its correct meal slot
         const today = getISTDateString();
         const loggedNames: string[] = [];
+        let logFailed = false;
         for (const food of foodsWithAmt) {
-          const item = await c.env.DB.prepare(`SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`)
-            .bind(`%${food.name}%`).first<any>();
-          if (item) {
-            await c.env.DB.prepare(
-              `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`
-            ).bind(profileId, sessionId, today, item.id, food.amount_g, food.meal_slot).run();
-            loggedNames.push(`${food.name} (${food.amount_g}g → ${food.meal_slot})`);
+          try {
+            const item = await c.env.DB.prepare(`SELECT id FROM items WHERE name LIKE ?1 LIMIT 1`)
+              .bind(`%${food.name}%`).first<any>();
+            if (item) {
+              await c.env.DB.prepare(
+                `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
+                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
+              ).bind(profileId, today, item.id, food.amount_g, food.meal_slot).run();
+              loggedNames.push(`${food.name} (${food.amount_g}g → ${food.meal_slot})`);
+            }
+          } catch (logErr) {
+            // A single food's DB error must never wipe out the whole response —
+            // the nutrient analysis above is still valid and worth showing.
+            console.error("Meal log insert failed for", food.name, logErr);
+            logFailed = true;
           }
         }
         if (loggedNames.length > 0) finalResponse += `\n\n✅ Logged: ${loggedNames.join(", ")}.`;
+        else if (logFailed) finalResponse += `\n\n⚠️ I analysed this, but couldn't save it to your log — please try logging it again in a moment.`;
 
         // Session memory
         try {
@@ -3455,10 +3497,11 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       if (userFacts.health_notes.length > 0) {
         finalResponse += `\n\n_Keeping in mind your health notes: ${userFacts.health_notes.join(", ")}._`;
       }
+      finalResponse += `\n\n⚕️ I'm an AI nutrition assistant, not a doctor — for diagnosis or treatment, please consult a healthcare professional.`;
       taskType = "symptom_advice";
     }
 
-    // ── Correction / disagreement handler ────────────────────────────────────
+    // ── Improve the correction handler too: also handle "no wrong" free-form ──
     else if (
       /^(?:no|that.?s wrong|you are wrong|incorrect|not right|wrong|you.?re wrong|nope)[\.!\s]*$/.test(msgClean)
       || /^no[,.]? (?:you are|that.?s|it.?s) (?:wrong|incorrect|not right)/.test(msgClean)
@@ -3495,9 +3538,9 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       const rows = await c.env.DB.prepare(
         `SELECT i.name, ml.amount_g, ml.meal_slot, i.calories_per_100g
          FROM meal_logs ml JOIN items i ON i.id = ml.item_id
-         WHERE (ml.profile_id = ?1 OR ml.session_id = ?2) AND ml.logged_date = ?3
+         WHERE ml.session_id = ?1 AND ml.logged_date = ?2
          ORDER BY ml.created_at ASC`
-      ).bind(profileId, sessionId, today).all();
+      ).bind(profileId, today).all();
       const logs = rows.results as any[];
       const totalCal  = Math.round(logs.reduce((s, l) => s + (l.calories_per_100g * l.amount_g / 100), 0));
       const targetCal = computeTdee(profile ?? {}) ?? 2000;
@@ -3514,6 +3557,32 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         finalResponse = `Today you've had **~${totalCal} kcal** out of your **~${targetCal} kcal** target. You have ~${remaining} kcal remaining.`;
       }
       taskType = "calorie_query";
+    }
+
+    // ── Deficiency query — real 7-day data, no guessing ─────────────────────────
+    else if (m.includes("deficien") || (m.includes("low on") && m.includes("nutrient"))
+             || /what (?:am i|nutrients am i) (?:low|lacking)/.test(m)) {
+      const rows = await c.env.DB.prepare(
+        `SELECT n.name as nutrient_name, SUM(in_.amount_per_100g * ml.amount_g / 100.0) as total, rda.daily_amount
+         FROM meal_logs ml
+         JOIN item_nutrients in_ ON in_.item_id = ml.item_id
+         JOIN nutrients n ON n.id = in_.nutrient_id
+         LEFT JOIN rda ON rda.nutrient_name = n.name
+         WHERE ml.session_id = ?1 AND ml.logged_date >= date('now', '-7 days')
+         GROUP BY n.name`
+      ).bind(profileId).all();
+      const rowsArr = rows.results as any[];
+      if (rowsArr.length === 0) {
+        finalResponse = "I don't have enough logged meals from the last 7 days to check your nutrient levels. Log a few meals (e.g. \"I ate 2 eggs and spinach for lunch\") and ask me again!";
+      } else {
+        const deficient = rowsArr
+          .filter(r => r.daily_amount && (r.total / (r.daily_amount * 7)) < 0.4)
+          .map(r => r.nutrient_name);
+        finalResponse = deficient.length > 0
+          ? `Based on your last 7 days of logged meals, you may be low on: **${deficient.join(", ")}**.\n\nWant food suggestions to help close these gaps? Try: "foods rich in ${deficient[0].toLowerCase()}".`
+          : "Based on your last 7 days of logged meals, you're not showing any significant nutrient deficiencies. Keep it up!";
+      }
+      taskType = "deficiency_query"; toolsUsed = ["nutrient_analysis"];
     }
 
     // ── Veg/non-veg classification ─────────────────────────────────────────────
@@ -3560,6 +3629,14 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         "exercise","fitness","hydration","allerg","pregnant","child","elderly",
         "season","ritu","monsoon","summer","winter","spring","autumn",
         "dosha","ayurved","vegetarian","vegan","weak","tired","energy",
+        // Broadened: general medical/body topics — this is a nutrition AND
+        // health assistant, so these should be answered (with a doctor
+        // disclaimer for medical-specific ones), not rejected as out of scope.
+        "doctor","consult","medicine","medication","pain","ache","injury",
+        "joint","knee","back","muscle","bone","surgery","treatment","cure",
+        "remedy","condition","deficiency","deficient","pregnan","infant",
+        "sleep","stress","mental","gut","stomach","liver","kidney","heart",
+        "lung","skin","hair","eye","cancer","infection","fever","cold","cough",
       ];
       const isInDomain = IN_DOMAIN_SIGNALS.some(k => m.includes(k))
         || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);
