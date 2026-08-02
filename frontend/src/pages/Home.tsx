@@ -5,6 +5,7 @@ import FoodGrid from "../components/food/FoodGrid";
 import DashboardPage from "./DashboardPage";
 import MealLogPage from "./MealLogPage";
 import RituJournalPage from "./RituJournalPage";
+import SettingsPage from "./SettingsPage";
 import { useItems } from "../hooks/useItems";
 import { useDashboard } from "../hooks/useDashboard";
 import { RITU_INFO } from "../constants/ritu";
@@ -63,9 +64,7 @@ export const EMOJI: Record<string, string> = {
 };
 
 // Phase-3 coming-soon tabs that don't have real pages yet
-const COMING_SOON: Record<string, { icon: string; title: string; desc: string; phase: string }> = {
-  settings: { icon:"⚙️",  title:"Settings",      desc:"Profile settings, clear memory, preferences.", phase:"Phase 5" },
-};
+const COMING_SOON: Record<string, { icon: string; title: string; desc: string; phase: string }> = {};
 
 interface MorningInsight { insights: Array<{ message: string }>; }
 interface SeasonTransition {
@@ -246,7 +245,12 @@ export default function Home() {
       return <RituJournalPage onAskAgent={handleAskAgent} />;
     }
 
-    // ── COMING SOON (settings) ──
+    // ── SETTINGS (live) ──
+    if (activeTab === "settings") {
+      return <SettingsPage />;
+    }
+
+    // ── COMING SOON (none currently) ──
     const info = COMING_SOON[activeTab];
     if (!info) return null;
     return (

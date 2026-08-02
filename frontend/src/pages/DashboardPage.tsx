@@ -53,15 +53,20 @@ function StreakBadge({ streak }: { streak: number }) {
 // ── Nutrient bar row ─────────────────────────────────────────────────────────
 function NutrientRow({ n }: { n: NutrientBreakdown }) {
   const color = n.status === "good" ? "#4ade80" : n.status === "low" ? "#f59e0b" : "#f87171";
+  // Bar width caps at 100% visually (a bar physically can't render wider than
+  // its box) — the number on the right always shows the real percentage, so
+  // 128%, 165%, and 340% are still distinguishable by their number even
+  // though their bars all render full.
+  const barWidth = Math.min(n.pct, 100);
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
       <div style={{ width: 90, fontSize: 11, color: "var(--text-2)", fontWeight: 500, flexShrink: 0, textAlign: "right" }}>
         {n.nutrient}
       </div>
       <div style={{ flex: 1, height: 7, background: "var(--bg-card)", borderRadius: 4, overflow: "hidden" }}>
-        <div style={{ width: `${n.pct}%`, height: "100%", background: color, borderRadius: 4, transition: "width .5s ease" }} />
+        <div style={{ width: `${barWidth}%`, height: "100%", background: color, borderRadius: 4, transition: "width .5s ease" }} />
       </div>
-      <div style={{ width: 34, fontSize: 11, fontWeight: 700, color, textAlign: "right", flexShrink: 0 }}>
+      <div style={{ width: 40, fontSize: 11, fontWeight: 700, color, textAlign: "right", flexShrink: 0 }}>
         {n.pct}%
       </div>
     </div>

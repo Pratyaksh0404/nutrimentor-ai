@@ -4,13 +4,15 @@ import { useChat } from "../../hooks/useChat";
 import FeedbackModal from "../footer/FeedbackModal";
 import type { AgentPanelProps, AgentProfile } from "../../types/chat";
 import { generateDietPDF } from "../../utils/generateDietPDF";
+import { API_BASE_URL } from "../../api/config";
 
-const PKEY = "nutrimentor-agent-profile";
+const PROFILE_ID_KEY = "nutrimentor-profile-id";
 const DEF: AgentProfile = { allergies: [], health_cautions: [] };
 
-function loadProfile(): AgentProfile {
-  try { const r = localStorage.getItem(PKEY); return r ? { ...DEF, ...JSON.parse(r) } : DEF; }
-  catch { return DEF; }
+function getProfileId(): string {
+  let id = localStorage.getItem(PROFILE_ID_KEY);
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem(PROFILE_ID_KEY, id); }
+  return id;
 }
 
 function bmi(p: AgentProfile): string | null {
@@ -62,7 +64,7 @@ interface ExtProps extends AgentPanelProps {
 
 export default function ChatBox({ selectedItem, season, onClearSelectedItem, pendingMessage, onPendingMessageSent }: ExtProps) {
   const [input,    setInput]    = useState("");
-  const [profile,  setProfile]  = useState<AgentProfile>(loadProfile);
+  const [profile,  setProfile]  = useState<AgentProfile>(DEF);
   const [showProf, setShowProf] = useState(false);
   const [showSess,     setShowSess]     = useState(false);
   const [pdfLoading,   setPdfLoading]   = useState<string | null>(null); // msg id being downloaded
@@ -75,7 +77,20 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
           starterPrompts, sendMessage, continueSession, clearContext, startNewChat }
     = useChat({ selectedItem, season, profile });
 
-  useEffect(() => { localStorage.setItem(PKEY, JSON.stringify(profile)); }, [profile]);
+  // Profile is READ-ONLY here — Settings is the single place to edit it.
+  // Previously this component kept its own editable copy in a separate
+  // localStorage key and sent it with every chat message, silently
+  // overwriting whatever the Settings page had just saved. Now it just
+  // displays whatever the backend has (same source Settings writes to).
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE_URL}/profile/${getProfileId()}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(p => { if (!cancelled && p) setProfile(prev => ({ ...prev, ...p })); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => { const el = msgRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages, loading]);
 
   // Handle prompts from centre panel
@@ -104,7 +119,6 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
   }
 
   async function handleClear() { await clearContext(); onClearSelectedItem(); }
-  function upd(p: Partial<AgentProfile>) { setProfile(prev => ({ ...prev, ...p })); }
 
   const BMI = useMemo(() => bmi(profile), [profile]);
 
@@ -145,46 +159,23 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
         </div>
       </div>
 
-      {/* Profile */}
+      {/* Profile — read-only, edit in Settings */}
       {showProf && (
         <div className="nm-profile-panel">
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:8 }}>
             <div>
               <div className="nm-profile-label">Profile memory</div>
-              <div className="nm-profile-sub">Used for BMI, calories & plans.</div>
+              <div className="nm-profile-sub">Used for BMI, calories & plans. Edit in ⚙️ Settings.</div>
             </div>
             {BMI && <div><div className="nm-profile-bmi-label">BMI</div><div className="nm-profile-bmi">{BMI}</div></div>}
           </div>
           <div className="nm-profile-grid">
-            <input className="nm-field" placeholder="Age" type="number"
-              value={profile.age ?? ""} onChange={e => upd({ age: e.target.value ? +e.target.value : undefined })} />
-            <select className="nm-field" value={profile.sex ?? ""}
-              onChange={e => upd({ sex: e.target.value || undefined })}>
-              <option value="">Sex</option>
-              <option value="male">Male</option>
-              <option value="female">Female</option>
-              <option value="other">Other</option>
-            </select>
-            <input className="nm-field" placeholder="Height (cm)" type="number"
-              value={profile.height_cm ?? ""} onChange={e => upd({ height_cm: e.target.value ? +e.target.value : undefined })} />
-            <input className="nm-field" placeholder="Weight (kg)" type="number"
-              value={profile.weight_kg ?? ""} onChange={e => upd({ weight_kg: e.target.value ? +e.target.value : undefined })} />
-            <select className="nm-field" value={profile.goal ?? ""}
-              onChange={e => upd({ goal: e.target.value || undefined })}>
-              <option value="">Goal</option>
-              <option value="maintain weight">Maintain</option>
-              <option value="lose weight">Lose weight</option>
-              <option value="gain weight">Gain weight</option>
-              <option value="better energy">Better energy</option>
-            </select>
-            <select className="nm-field" value={profile.activity_level ?? ""}
-              onChange={e => upd({ activity_level: e.target.value || undefined })}>
-              <option value="">Activity</option>
-              <option value="sedentary">Sedentary</option>
-              <option value="light">Light</option>
-              <option value="moderate">Moderate</option>
-              <option value="high">High</option>
-            </select>
+            <input className="nm-field" placeholder="Age" value={profile.age ?? "—"} disabled readOnly />
+            <input className="nm-field" placeholder="Sex" value={profile.sex ?? "—"} disabled readOnly />
+            <input className="nm-field" placeholder="Height (cm)" value={profile.height_cm ?? "—"} disabled readOnly />
+            <input className="nm-field" placeholder="Weight (kg)" value={profile.weight_kg ?? "—"} disabled readOnly />
+            <input className="nm-field" placeholder="Goal" value={profile.goal ?? "—"} disabled readOnly />
+            <input className="nm-field" placeholder="Activity" value={profile.activity_level ?? "—"} disabled readOnly />
           </div>
         </div>
       )}
