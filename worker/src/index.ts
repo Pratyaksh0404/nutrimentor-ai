@@ -3,11 +3,12 @@ import { cors } from "hono/cors";
 // intentParser.ts / intentDispatcher.ts intentionally not imported into the hot
 // path — see ARCHITECTURE DECISION comment below. Kept in the repo, spec-compliant,
 // for future use if a reliable free (or paid) inference source becomes available.
+import { runAgentLoop, type AgentContext as AgentLoopContext } from "./agentLoop";
 // sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface Env {
+export interface Env {
   DB: D1Database;
   SESSIONS: KVNamespace;
   AI: Ai;
@@ -18,7 +19,7 @@ interface Env {
   FRONTEND_URL: string;
 }
 
-interface Profile {
+export interface Profile {
   id?: number;
   google_id?: string;
   email?: string;
@@ -48,7 +49,7 @@ interface AgentRequest {
 
 // ── Season labels ─────────────────────────────────────────────────────────────
 
-const SEASON_LABELS: Record<string, string> = {
+export const SEASON_LABELS: Record<string, string> = {
   spring:    "Vasanta Ritu (Spring)",
   summer:    "Grishma Ritu (Summer)",
   monsoon:   "Varsha Ritu (Monsoon)",
@@ -60,7 +61,7 @@ const SEASON_LABELS: Record<string, string> = {
 
 // ── BMI + TDEE helpers ────────────────────────────────────────────────────────
 
-function computeBmi(profile: Profile): { bmi: number; label: string } | null {
+export function computeBmi(profile: Profile): { bmi: number; label: string } | null {
   if (!profile.height_cm || !profile.weight_kg) return null;
   const bmi = Math.round((profile.weight_kg / ((profile.height_cm / 100) ** 2)) * 10) / 10;
   const label =
@@ -71,7 +72,7 @@ function computeBmi(profile: Profile): { bmi: number; label: string } | null {
   return { bmi, label };
 }
 
-function computeTdee(profile: Profile): number | null {
+export function computeTdee(profile: Profile): number | null {
   const { weight_kg: w, height_cm: h, age, sex, activity_level } = profile;
   if (!w || !h || !age) return null;
   const bmr = (sex === "male" || sex === "m")
@@ -153,7 +154,7 @@ const MASTER_FOOD_ALIAS: Record<string, string> = {
 
 // Apply alias map to a string — normalises all known variants to canonical names.
 // Handles multi-word aliases by checking longest match first.
-function applyFoodAlias(text: string): string {
+export function applyFoodAlias(text: string): string {
   let result = text.toLowerCase().trim();
   // Sort by length descending so longer aliases (e.g. "soya bean") match before shorter ("soya")
   const sorted = Object.entries(MASTER_FOOD_ALIAS).sort((a, b) => b[0].length - a[0].length);
@@ -177,7 +178,7 @@ function applyFoodAlias(text: string): string {
 // Retries once on 429/503 (transient rate-limit/overload) with a short backoff.
 // Free-tier quota gets exhausted fast under burst traffic — a single retry
 // after ~500ms recovers a meaningful fraction of these without adding much latency.
-async function fetchGeminiWithRetry(url: string, body: any): Promise<Response | null> {
+export async function fetchGeminiWithRetry(url: string, body: any): Promise<Response | null> {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const resp = await fetch(url, {
@@ -309,108 +310,95 @@ async function extractAndStoreFacts(
 
   // ── Dislikes (regex fallback when Gemini not available or returned nothing) ──
   // Also handles goal/health/profile fields regardless of geminiHandledLikeDislikes
-  if (!geminiHandledLikeDislikes) { // only run regex for likes/dislikes if Gemini didn't handle them
+  if (!geminiHandledLikeDislikes) {
 
-  // ── Dislikes ──
-  // Dislike patterns — stop at prepositions and clause boundaries
-  const DISLIKE_STOP = "(?:\\s*[.,!]|\\s+(?:now|but|please|in |at |when|during|with|after|before|every|for )|$)";
-  const FOOD_CAPTURE = "([a-z][a-z]{1,20}(?:\\s[a-z]{1,15})?)";
-  const dislikePatterns: Array<[RegExp, number]> = [
-    [new RegExp(`i (?:don't|do not|hate|dislike|avoid)(?: (?:eating|having|drinking|consuming|to eat|to drink|to have|to consume))? ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
-    [/([a-z][a-z\s]{1,25}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/, 1],
-    [new RegExp(`not a fan of ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
-    [new RegExp(`i (?:can't|cannot) (?:eat|stand|have|drink|consume) ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
-    [new RegExp(`i (?:don't|do not) like (?:to )?(?:eat|drink|have|consume) ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
-    [new RegExp(`i (?:don't|do not) like ${FOOD_CAPTURE}${DISLIKE_STOP}`), 1],
-  ];
-  for (const [pattern, group] of dislikePatterns) {
-    const match = m.match(pattern);
-    if (match && match[group]) {
-      const rawCapture = match[group].trim();
-      // Split on "and", "," to handle multi-food dislikes: "jamun and soyabean"
-      const foodCandidates = rawCapture
-        .split(/\s*(?:,|\band\b)\s*/)
-        .map((f: string) => f.trim().replace(/\s+/g, " "))
-        .filter((f: string) => f.length > 1 && f.length < 40);
+  // ── Multi-clause, multi-item sentiment extraction ─────────────────────────
+  // Finds EVERY "i like/love/hate/don't like/allergic to/can't eat/not a fan
+  // of" clause in the message (not just the first), and within each clause
+  // splits on commas/"and"/"&" to catch food LISTS, not just single items.
+  // This is what makes "i like tomato, potato, i don't like carrot, beetroot,
+  // papaya, i hate spinach i love mango" correctly extract all 6 foods across
+  // 4 clauses, instead of the old single-match approach finding just one.
+  const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or","is","are",
+    "you","it","this","that","he","she","they","we","chatbot","bot","app","ai","agent","thing","service"];
+  const CLAUSE_STOP_RE = /\s+(?:now|but|please|in|at|when|during|with|after|before|every|for|so|because|also)\b/i;
 
-      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or","is","are",
-        "you","it","this","that","he","she","they","we","chatbot","bot","app","ai","agent","thing","service"];
-      for (const foodName of foodCandidates) {
-        const firstWord = foodName.split(" ")[0];
-        if (stopWords.includes(firstWord)) continue;
-        // Normalise using the master alias map — covers all variants
-        const normalizedName = applyFoodAlias(foodName);
-        // Validate against the real food database before storing — the "X is/are
-        // bad" pattern has no food constraint on its own and was matching insults
-        // ("you are bad" → stored "you" as a disliked food). Fixed 2026-07-03.
-        const dbHit = await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
-          .bind(`%${normalizedName}%`).first().catch(() => null);
-        if (!dbHit) continue;
-        await db.prepare(
-          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
-        ).bind(profileId, `%${normalizedName}%`).run();
-        await db.prepare(
-          `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
-           VALUES (?1, 'dislike', ?2, 'true', 'conversation', datetime('now'))
-           ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
-           fact_value='true', updated_at=datetime('now')`
-        ).bind(profileId, normalizedName).run();
-        stored.push(`dislike:${normalizedName}`);
-      }
+  async function storeSentiment(rawFood: string, sentiment: "like" | "dislike" | "allergy") {
+    const firstWord = rawFood.split(" ")[0];
+    if (stopWords.includes(firstWord)) return;
+    const normalized = applyFoodAlias(rawFood);
+    // DB-validate — never store a non-food phrase as a preference (fixes the
+    // "you are bad" → stored "you" as disliked food class of bug).
+    const dbHit = await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
+      .bind(`%${normalized}%`).first().catch(() => null);
+    if (!dbHit) return;
+
+    if (sentiment === "dislike") {
+      await db.prepare(
+        `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
+      ).bind(profileId, `%${normalized}%`).run();
+      await db.prepare(
+        `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
+         VALUES (?1, 'dislike', ?2, 'true', 'conversation', datetime('now'))
+         ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
+         fact_value='true', updated_at=datetime('now')`
+      ).bind(profileId, normalized).run();
+      stored.push(`dislike:${normalized}`);
+    } else if (sentiment === "like") {
+      await db.prepare(
+        `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
+      ).bind(profileId, `%${normalized}%`).run();
+      await db.prepare(
+        `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
+         VALUES (?1, 'preference', ?2, 'like', 'conversation', datetime('now'))
+         ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
+         fact_value='like', updated_at=datetime('now')`
+      ).bind(profileId, normalized).run();
+      stored.push(`like:${normalized}`);
+    } else {
+      const nonFoodAllergens = ["dog","cat","pollen","dust","pet","animal","bee","insect","latex","mold","mould"];
+      if (nonFoodAllergens.some(a => normalized.includes(a))) return;
+      await db.prepare(
+        `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
+         VALUES (?1, 'allergy', ?2, 'true', 'conversation', datetime('now'))
+         ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
+         fact_value='true', updated_at=datetime('now')`
+      ).bind(profileId, normalized).run();
+      stored.push(`allergy:${normalized}`);
     }
   }
 
-  // ── Likes ──
-  // Like patterns — stop at clause boundaries AND prepositions
-  // "i like milk in lunch" → captures "milk" only (stops at "in")
-  // "i like milk when i get up" → captures "milk" only (stops at "when")
-  const CLAUSE_STOP = "(?:\\s*[,!.]|\\s+(?:now|but|and also|however|though|please|in |at |when|during|with|after|before|every|for )|$)";
-  // FOOD_CAPTURE declared above (before dislikePatterns) — same scope
-  const likePatterns: Array<[RegExp, number]> = [
-    [new RegExp(`i (?:love|enjoy|prefer|adore)(?: eating| having| drinking)? ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
-    [new RegExp(`i like ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
-    [new RegExp(`i(?:'m| am) (?:a fan of|fond of) ${FOOD_CAPTURE}${CLAUSE_STOP}`), 1],
-    [/([a-z][a-z\s]{1,25}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/, 1],
-  ];
-  // Only run likes patterns if message does NOT contain negation near "like"
-  const hasNegationBeforeLike = /(?:don't|do not|can't|cannot|never)\s+(?:like|enjoy|eat|have)/i.test(m);
-  for (const [pattern, group] of hasNegationBeforeLike ? [] : likePatterns) {
-    const match = m.match(pattern);
-    if (match && match[group]) {
-      const rawCapture = match[group].trim();
-      // Split on "and", "," to handle: "i like apple and papaya"
-      const foodCandidates = rawCapture
-        .split(/\s*(?:,|\band\b)\s*/)
-        .map((f: string) => f.trim().replace(/\s+/g, " "))
-        .filter((f: string) => f.length > 1 && f.length < 40);
+  const SENT_TRIGGER = /\bi\s*(?:am|'m)?\s*(don'?t\s+like|do\s+not\s+like|dislike|hate|not\s+a\s+fan\s+of|can'?t\s+(?:eat|stand|have|drink|consume)|cannot\s+(?:eat|stand|have|drink|consume)|allergic\s+to|like|love)\b/gi;
+  const triggerMatches = [...m.matchAll(SENT_TRIGGER)];
 
-      const stopWords = ["like","love","eat","have","a","the","my","i","to","and","or",
-        "you","it","this","that","he","she","they","we","chatbot","bot","app","ai","agent","thing","service"];
-      for (const foodName of foodCandidates) {
-        const firstWord = foodName.split(" ")[0];
-        if (stopWords.includes(firstWord)) continue;
-        if (foodName.length > 1 && foodName.length < 40) {
-          // Normalise before storing — "panner" → "paneer" so no duplicates
-          const normLike = applyFoodAlias(foodName);
-          // Validate against the real food database — same fix as the dislike
-          // loop above (see comment there). Fixed 2026-07-03.
-          const dbHit = await db.prepare(`SELECT 1 FROM items WHERE LOWER(name) LIKE ?1 LIMIT 1`)
-            .bind(`%${normLike}%`).first().catch(() => null);
-          if (!dbHit) continue;
-          await db.prepare(
-            `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
-          ).bind(profileId, `%${normLike}%`).run();
-          await db.prepare(
-            `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, updated_at)
-             VALUES (?1, 'preference', ?2, 'like', 'conversation', datetime('now'))
-             ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET
-             fact_value='like', updated_at=datetime('now')`
-          ).bind(profileId, normLike).run();
-          stored.push(`like:${normLike}`);
-        }
-      }
-    }
+  for (let i = 0; i < triggerMatches.length; i++) {
+    const trigRaw = triggerMatches[i][1].toLowerCase().replace(/\s+/g, " ");
+    const sentiment: "like" | "dislike" | "allergy" =
+      /don.?t like|do not like|dislike|hate|can.?t|cannot|not a fan/.test(trigRaw) ? "dislike"
+      : /allergic/.test(trigRaw) ? "allergy" : "like";
+    const start = triggerMatches[i].index! + triggerMatches[i][0].length;
+    const end = (i + 1 < triggerMatches.length) ? triggerMatches[i + 1].index! : m.length;
+    let clauseText = m.slice(start, end);
+    const stopMatch = clauseText.match(CLAUSE_STOP_RE);
+    if (stopMatch) clauseText = clauseText.slice(0, stopMatch.index);
+
+    const candidates = clauseText
+      .split(/\s*(?:,|\band\b|&)\s*/)
+      .map(f => f.trim().replace(/[.!?]+$/, "").replace(/\s+/g, " "))
+      .filter(f => f.length > 1 && f.length < 40);
+
+    for (const rawFood of candidates) await storeSentiment(rawFood, sentiment);
   }
+
+  // ── Supplementary patterns: different grammar, not "i <verb> food" ──────────
+  // "X is/are bad/gross/..." and "X is/are my favorite/delicious/..." — subject
+  // comes first, so these can't share the clause splitter above.
+  const badMatch = m.match(/([a-z][a-z\s]{1,25}?) (?:is|are) (?:gross|bad|terrible|disgusting|awful)/);
+  if (badMatch?.[1]) await storeSentiment(badMatch[1].trim(), "dislike");
+
+  const goodMatch = m.match(/([a-z][a-z\s]{1,25}?) (?:is|are) (?:my favorite|my favourite|delicious|amazing)/);
+  if (goodMatch?.[1]) await storeSentiment(goodMatch[1].trim(), "like");
+
   } // end if (!geminiHandledLikeDislikes)
 
   // ── Dietary preference (always runs) ──
@@ -479,6 +467,7 @@ async function extractAndStoreFacts(
     /i am (?:allergic|sensitive) to ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
     // Was Gemini-only before the architecture change — now deterministic too.
     /i get sick from ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
+    /i get sick (?:when|after|if) (?:i )?(?:eat|have|drink|consume) ([a-z][a-z\s]{1,25}?)(?:\.|,|$)/,
     /([a-z][a-z\s]{1,25}?) makes me (?:sick|ill)/,
   ];
   for (const allergyPat of allergyPatterns) {
@@ -542,7 +531,7 @@ async function extractAndStoreFacts(
 
 // ── PHASE 1: Load all learned facts for a profile ────────────────────────────
 
-async function loadUserFacts(profileId: string, db: D1Database): Promise<{
+export async function loadUserFacts(profileId: string, db: D1Database): Promise<{
   dislikes: string[];
   likes: string[];
   dietary: string;
@@ -760,7 +749,7 @@ async function logMealFromMessage(
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 
-async function toolFoodLookup(db: D1Database, name: string) {
+export async function toolFoodLookup(db: D1Database, name: string) {
   const item = await db.prepare(
     `SELECT i.*, GROUP_CONCAT(n.name || '::' || in_.amount_per_100g || '::' || n.unit, '|||') AS nutrients
      FROM items i
@@ -809,7 +798,7 @@ async function toolFoodLookup(db: D1Database, name: string) {
   };
 }
 
-async function toolCompareFoods(db: D1Database, food1: string, food2: string, nutrientFilter?: string) {
+export async function toolCompareFoods(db: D1Database, food1: string, food2: string, nutrientFilter?: string) {
   const [r1, r2] = await Promise.all([
     toolFoodLookup(db, food1),
     toolFoodLookup(db, food2),
@@ -853,7 +842,7 @@ async function toolCompareFoods(db: D1Database, food1: string, food2: string, nu
 // ── PHASE 4.2: Ingredient swap engine ────────────────────────────────────────
 // "I don't have spinach, what can I use instead?" → same-season alternatives
 // with a similar nutrient profile. Module scope — never nested (Workers rule).
-async function findIngredientSwap(
+export async function findIngredientSwap(
   foodName: string,
   db: D1Database,
   season: string,
@@ -904,7 +893,7 @@ function filterFoodsForUser(
   });
 }
 
-async function toolGetSeasonalFoods(db: D1Database, season: string, category?: string, limit = 12) {
+export async function toolGetSeasonalFoods(db: D1Database, season: string, category?: string, limit = 12) {
   let q = `SELECT i.id, i.name, i.category, i.calories_per_100g, i.season, i.image_url
            FROM items i WHERE (i.season = ?1 OR i.season = 'all')`;
   const binds: any[] = [season];
@@ -914,7 +903,7 @@ async function toolGetSeasonalFoods(db: D1Database, season: string, category?: s
   return { season, season_label: SEASON_LABELS[season] ?? season, foods: result.results };
 }
 
-async function toolGetNutrientRichFoods(db: D1Database, nutrient: string, season?: string, limit = 8) {
+export async function toolGetNutrientRichFoods(db: D1Database, nutrient: string, season?: string, limit = 8) {
   const nut = await db.prepare(`SELECT id FROM nutrients WHERE name LIKE ?1`).bind(`%${nutrient}%`).first<any>();
   if (!nut) return { error: `Nutrient "${nutrient}" not found`, nutrient };
 
@@ -1009,7 +998,7 @@ async function dietFetchCat(
 }
 
 
-async function toolBuildDietPlan(
+export async function toolBuildDietPlan(
   db: D1Database,
   profile: Profile | null,
   season: string,
@@ -1195,7 +1184,7 @@ async function toolBuildDietPlan(
 }
 
 
-async function toolAnalyzeIntake(
+export async function toolAnalyzeIntake(
   db: D1Database,
   foods: string[],
   profile: Profile | null,
@@ -1481,7 +1470,7 @@ function cleanUnit(unit: string): string {
 
 // ── Direct response builder ───────────────────────────────────────────────────
 
-function buildDirectResponse(toolName: string, result: any, userMessage: string): string {
+export function buildDirectResponse(toolName: string, result: any, userMessage: string): string {
   if (result.error) {
     return `I couldn't find that in my database. ${result.suggestions?.length ? `Did you mean: ${result.suggestions.join(", ")}?` : "Try a different food name."}`;
   }
@@ -1530,7 +1519,7 @@ function buildDirectResponse(toolName: string, result: any, userMessage: string)
   }
 
   if (toolName === "build_diet_plan" && result.days?.length) {
-    const excludeNote = result.excluded_foods?.length ? `\n\n_(Excluded your dislikes: ${result.excluded_foods.join(", ")})_` : "";
+    const excludeNote = result.excluded_foods?.length ? `\n\n_(Excluded based on your dislikes & allergies: ${result.excluded_foods.join(", ")})_` : "";
     const goalNote = "";
 
     if (result.days.length === 1) {
@@ -1590,10 +1579,24 @@ const SYMPTOM_MAP: Record<string, string> = {
 
 // ── Food name extraction ──────────────────────────────────────────────────────
 
+// Escapes a string for safe use inside a RegExp (food names are plain text, but
+// being defensive costs nothing).
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Word-boundary substring test — "apple" must NOT match inside "pineapple",
+// "egg" must NOT match inside "eggplant". Plain .includes() doesn't respect
+// word boundaries and produced wrong matches (found "Apple" in a message
+// that only mentioned "pineapple"). Fixed 2026-08-02.
+function containsWholeWord(msg: string, word: string): boolean {
+  return new RegExp(`\\b${escapeRegex(word)}\\b`, "i").test(msg);
+}
+
 async function findFoodInMessage(msg: string, db: D1Database): Promise<{ name: string } | null> {
   const allFoods = await db.prepare(`SELECT name FROM items ORDER BY LENGTH(name) DESC`).all();
   for (const row of allFoods.results as any[]) {
-    if (msg.includes(row.name.toLowerCase())) return { name: row.name };
+    if (containsWholeWord(msg, row.name.toLowerCase())) return { name: row.name };
   }
   return null;
 }
@@ -1601,7 +1604,7 @@ async function findFoodInMessage(msg: string, db: D1Database): Promise<{ name: s
 async function findSecondFoodInMessage(msg: string, excludeName: string, db: D1Database): Promise<{ name: string } | null> {
   const allFoods = await db.prepare(`SELECT name FROM items ORDER BY LENGTH(name) DESC`).all();
   for (const row of allFoods.results as any[]) {
-    if (row.name.toLowerCase() !== excludeName.toLowerCase() && msg.includes(row.name.toLowerCase())) {
+    if (row.name.toLowerCase() !== excludeName.toLowerCase() && containsWholeWord(msg, row.name.toLowerCase())) {
       return { name: row.name };
     }
   }
@@ -1612,7 +1615,7 @@ async function extractFoodsFromText(msg: string, db: D1Database): Promise<string
   const allFoods = await db.prepare(`SELECT name FROM items`).all();
   const found: string[] = [];
   for (const row of allFoods.results as any[]) {
-    if (msg.includes(row.name.toLowerCase())) found.push(row.name);
+    if (containsWholeWord(msg, row.name.toLowerCase())) found.push(row.name);
   }
   return found;
 }
@@ -1699,12 +1702,12 @@ const SEASON_CALENDAR: Array<{ season: string; start: string }> = [
 // to 5:30am) where a meal logged "today" (IST) got stored under UTC "yesterday",
 // silently breaking streaks and today's-intake queries. Every date-for-logging
 // or date-for-lookup call now goes through this one function.
-function getISTDateString(daysAgo = 0): string {
+export function getISTDateString(daysAgo = 0): string {
   const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
   return new Date(Date.now() + IST_OFFSET_MS - daysAgo * 86400000).toISOString().split("T")[0];
 }
 
-function getCurrentSeason(): string {
+export function getCurrentSeason(): string {
   const now = new Date();
   const mmdd = `${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
   let current = "winter";
@@ -2170,12 +2173,53 @@ app.get("/facts/:profile_id", async (c) => {
   return c.json(result.results);
 });
 
+// Add a fact — Settings page "add like/dislike/allergy/health note" button.
+// Uses the same applyFoodAlias normalization as chat-based extraction, so
+// "Mango" added here and "mango" mentioned later in chat resolve to the same
+// fact_key (UNIQUE(profile_id, fact_type, fact_key) prevents any duplicate row).
+app.post("/facts/:profile_id", async (c) => {
+  const { fact_type, fact_key } = await c.req.json<{ fact_type: string; fact_key: string }>();
+  if (!fact_type || !fact_key?.trim()) return c.json({ error: "fact_type and fact_key are required" }, 400);
+  const profileId = c.req.param("profile_id");
+  const normalized = ["dislike", "preference", "allergy"].includes(fact_type)
+    ? applyFoodAlias(fact_key.toLowerCase().trim())
+    : fact_key.toLowerCase().trim();
+
+  // Mutual exclusion — a food can't be simultaneously liked and disliked
+  if (fact_type === "preference") {
+    await c.env.DB.prepare(`DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) = ?2`)
+      .bind(profileId, normalized).run();
+  } else if (fact_type === "dislike") {
+    await c.env.DB.prepare(`DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) = ?2`)
+      .bind(profileId, normalized).run();
+  }
+
+  await c.env.DB.prepare(
+    `INSERT INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?3, 'settings', datetime('now'), datetime('now'))
+     ON CONFLICT(profile_id, fact_type, fact_key) DO UPDATE SET updated_at=datetime('now')`
+  ).bind(profileId, fact_type, normalized).run();
+
+  return c.json({ ok: true, fact_key: normalized });
+});
+
 app.delete("/facts/:profile_id", async (c) => {
   const { fact_type, fact_key } = await c.req.json<{ fact_type: string; fact_key: string }>();
   await c.env.DB.prepare(
     `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = ?2 AND fact_key = ?3`
   ).bind(c.req.param("profile_id"), fact_type, fact_key).run();
   return c.json({ ok: true });
+});
+
+// Bulk clear — Settings page "Clear all memory" button. Deletes every learned
+// fact (likes, dislikes, allergies, health notes) for this profile. Does NOT
+// touch meal_logs (that's a separate, explicit action) or the profile record
+// itself (age/height/goal etc — edited via POST /profile, not cleared here).
+app.delete("/facts/:profile_id/all", async (c) => {
+  const result = await c.env.DB.prepare(
+    `DELETE FROM user_facts WHERE profile_id = ?1`
+  ).bind(c.req.param("profile_id")).run();
+  return c.json({ ok: true, deleted: result.meta?.changes ?? 0 });
 });
 
 
@@ -2282,7 +2326,7 @@ app.get("/nutrition-score/:profile_id", async (c) => {
     // as identically "100%" even when actual intake varied widely (150% vs
     // 340% vs 220% all displayed the same). Cap only at a sane ceiling to
     // guard against bad data, not to hide genuinely-high (healthy) intake.
-    const pct = Math.round(Math.min((avg / rda) * 100, 500));
+    const pct = Math.round(Math.min((avg / rda) * 100, 100));
     return { nutrient, avg: Math.round(avg * 10) / 10, rda, pct, weight,
              status: pct >= 70 ? "good" : pct >= 40 ? "low" : "deficient" };
   }).sort((a, b) => a.pct - b.pct);
@@ -2345,19 +2389,23 @@ app.post("/agent/message", async (c) => {
 
   const sessionId = context.session_id || crypto.randomUUID().replace(/-/g, "");
 
-  // Load / merge profile
-  const profileData = await c.env.SESSIONS.get(`profile:${sessionId}`);
-  let profile: Profile | null = profileData ? JSON.parse(profileData) : null;
+  // ── PHASE 1: Use stable profile_id (browser fingerprint) separate from sessionId
+  // profile_id comes from context (localStorage "nutrimentor-profile-id")
+  // Falls back to sessionId if not provided — but facts will then reset each new session
+  // Hoisted here (was previously declared later, causing a TDZ error once the
+  // profile-loading code below needed to use it before its old declaration point).
+  const profileId = (context as any).profile_id || sessionId;
 
-  if (context.profile && Object.keys(context.profile).length > 0) {
-    const incoming = context.profile as Profile;
-    if (incoming.height_cm || incoming.weight_kg || incoming.age) {
-      profile = { ...profile, ...incoming };
-      await c.env.SESSIONS.put(`profile:${sessionId}`, JSON.stringify(profile), {
-        expirationTtl: 60 * 60 * 24 * 90,
-      });
-    }
-  }
+  // Load profile — KV is the single source of truth (written by Settings'
+  // POST /profile endpoint, or by the profile-field-update chat handler below).
+  // Previously this also merged in `context.profile` sent with every chat
+  // message and wrote it straight back to KV — but ChatBox fetches the
+  // profile once on mount and never refreshes, so after any Settings edit,
+  // the NEXT chat message would silently overwrite the fresh save with
+  // ChatBox's stale in-memory copy. Removed 2026-08-02 — profile writes now
+  // only happen through the two intentional paths above.
+  const profileData = await c.env.SESSIONS.get(`profile:${profileId}`);
+  let profile: Profile | null = profileData ? JSON.parse(profileData) : null;
 
   // Load selected item — KV is authoritative, payload is fallback
   // This handles the race condition where context/select hasn't propagated yet
@@ -2373,9 +2421,7 @@ app.post("/agent/message", async (c) => {
     current_season: context.current_season ?? "all",
   };
 
-  // Extract profileId early so we can pass it to getOrCreateSession for pruning
-  const earlyProfileId = (context as any).profile_id || sessionId;
-  await getOrCreateSession(c.env.DB, c.env.SESSIONS, sessionId, earlyProfileId);
+  await getOrCreateSession(c.env.DB, c.env.SESSIONS, sessionId, profileId);
 
   // Load conversation history
   const historyResult = await c.env.DB.prepare(
@@ -2386,10 +2432,6 @@ app.post("/agent/message", async (c) => {
     content: m.content,
   }));
 
-  // ── PHASE 1: Use stable profile_id (browser fingerprint) separate from sessionId
-  // profile_id comes from context (localStorage "nutrimentor-profile-id")
-  // Falls back to sessionId if not provided — but facts will then reset each new session
-  const profileId = (context as any).profile_id || sessionId;
   let stored: string[] = [];
   try {
     // Pass alias-normalised message so "panner" stores as "paneer" etc.
@@ -2418,7 +2460,9 @@ app.post("/agent/message", async (c) => {
   const msgLower = applyFoodAlias(message.toLowerCase().trim());
   const msgClean = msgLower.replace(/[!?.]+$/, "").trim();
 
-  const GREETINGS    = ["hi", "hello", "hey", "hola", "namaste", "howdy", "sup", "yo", "hai"];
+  const GREETINGS    = ["hi", "hello", "hey", "hola", "namaste", "howdy", "sup", "yo", "hai",
+                        "how are you", "how r u", "hows it going", "whats up",
+                        "good morning", "good afternoon", "good evening", "good night"];
   const BYES         = ["bye", "goodbye", "see you", "ciao", "alvida", "tata", "byee", "byebye",
                          "bye bye", "good bye", "byeee", "byeeee", "bbye", "bay", "bb",
                          "see ya", "later", "ttyl", "tata", "cheerio", "cya",
@@ -2458,21 +2502,30 @@ app.post("/agent/message", async (c) => {
     new RegExp(`(?:^|\\s)${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\s|[.,!?]|$)`).test(msgClean)
   );
   const isHelp     = HELP_PHRASES.some(p => msgClean.includes(p));
-  const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted"].includes(msgClean);
+  const isOk       = ["ok","okay","cool","nice","great","good","fine","sure","alright","got it","noted",
+                       "never mind","leave it","nvm","forget it","no worries","no problem"].includes(msgClean)
+    || /^(?:good|nice|great|cool|well done|awesome)\s?(?:work|job|one|bro|bud|man)?[!.]?$/.test(msgClean)
+    || /^(?:ok|okay|alright|fine|sure)[,.]?\s+(?:never\s?mind|leave\s+it|forget\s+it|nvm)[!.]?$/.test(msgClean);
   const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
                        "that's wrong","thats wrong","incorrect","not right","what the","wtf","wth"].includes(msgClean)
     || ((msgClean.startsWith("what the") || msgClean.startsWith("what ?")) && msgClean.split(/\s+/).length <= 5);
   const isFrustration = (msgClean.includes("what the fuck") || msgClean.includes("wtf") ||
                         msgClean.includes("what the hell") || msgClean.includes("this is wrong") ||
-                        msgClean.includes("stupid") || msgClean.includes("dumb"))
+                        msgClean.includes("stupid") || msgClean.includes("dumb") ||
+                        msgClean.includes("fuck off") || msgClean.includes("f off") ||
+                        /you(?:'?re| are) so bad/.test(msgClean) || msgClean.includes("are you mad") ||
+                        msgClean.includes("so annoying") || msgClean.includes("you're annoying") ||
+                        msgClean.includes("annoyed with you"))
     && !/expertise|purpose|who (?:made|are|built|created)|what (?:can|do) you|your (?:name|area)/.test(msgClean);
-  const isIdentity = msgClean.includes("who made you") || msgClean.includes("who are you") ||
-                     msgClean.includes("who built you") || msgClean.includes("who created you") ||
+  const isIdentity = /who (?:the (?:hell|heck|f\w*))? ?(?:made|are|built|created|designed) you/.test(msgClean) ||
+                     /(?:who|what) (?:the (?:hell|heck|f\w*))? ?(?:made|designed|created|built|is) nutrimentor/.test(msgClean) ||
                      msgClean.includes("what are you") || msgClean.includes("tell me about yourself") ||
                      msgClean.includes("introduce yourself") ||
                      msgClean.includes("are you chatgpt") || msgClean.includes("are you gemini") ||
                      msgClean.includes("are you claude") || msgClean.includes("are you an ai") ||
                      msgClean.includes("are you a real") || msgClean.includes("are you real") ||
+                     msgClean.includes("are you intelligent") || msgClean.includes("are you smart") ||
+                     msgClean.includes("out of your mind") ||
                      msgClean.includes("expertise") || msgClean.includes("your purpose") ||
                      msgClean.includes("benefit from you") || msgClean.includes("help me with") ||
                      msgClean.includes("helping in general") || msgClean.includes("what do you know how to");
@@ -2491,6 +2544,14 @@ app.post("/agent/message", async (c) => {
     || /^add .{1,30} (?:to|in) (?:my )?(?:likes|dislikes|preferences|allergies)/i.test(msgClean)
     // "remove X" alone — handler verifies the item against saved facts (honest no-op if absent)
     || /^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean);
+
+  // Profile field updates via chat: "my age is 20", "update my height to 175",
+  // "i am 20 years old" — a real functionality gap found in production (these
+  // were falling through to the domain-rejection message).
+  const profileFieldMatch =
+    msgClean.match(/(?:my|update my|change my|set my) (age|height|weight|goal) (?:is|to) ([a-z0-9. ]{1,20}?)(?:\s*(?:cm|kg|years?( old)?|yo))?[.!?]?$/)
+    ?? msgClean.match(/i am (\d{1,3}) years? old/);
+  const isProfileFieldUpdate = !!profileFieldMatch;
 
   const VAGUE = ["this","this one","tell me about this","what is this",
                  "what about this","this food","should i eat this","is it good","is this good","this item",
@@ -2598,6 +2659,42 @@ For general guidance I'm highly reliable. For medical nutrition therapy (e.g. pr
       ? `Here's what I know about you:\n\n${lines.join("\n")}\n\nI use this to personalise your diet plans and suggestions. Tell me anything new and I'll remember it.`
       : "I don't know much about you yet! Tell me your food preferences, health goals, or dietary restrictions and I'll remember them for future conversations.";
     return respond(msg, "memory_recall", { next_actions: ["Update my preferences", "Build a personalised diet plan"] });
+  }
+
+  // Profile field update — "my age is 20", "update my height to 175"
+  if (isProfileFieldUpdate && profileFieldMatch) {
+    let field: string, rawValue: string;
+    if (profileFieldMatch.length >= 3 && profileFieldMatch[1] && ["age","height","weight","goal"].includes(profileFieldMatch[1])) {
+      field = profileFieldMatch[1];
+      rawValue = profileFieldMatch[2];
+    } else {
+      field = "age";
+      rawValue = profileFieldMatch[1];
+    }
+    const updated: Profile = { ...(profile ?? {}) };
+    let confirmText = "";
+    if (field === "age") {
+      const n = parseInt(rawValue, 10);
+      if (!isNaN(n) && n > 0 && n < 120) { updated.age = n; confirmText = `age to **${n}**`; }
+    } else if (field === "height") {
+      const n = parseFloat(rawValue);
+      if (!isNaN(n) && n > 50 && n < 250) { updated.height_cm = n; confirmText = `height to **${n}cm**`; }
+    } else if (field === "weight") {
+      const n = parseFloat(rawValue);
+      if (!isNaN(n) && n > 20 && n < 300) { updated.weight_kg = n; confirmText = `weight to **${n}kg**`; }
+    } else if (field === "goal") {
+      updated.goal = rawValue.trim();
+      confirmText = `goal to **${rawValue.trim()}**`;
+    }
+
+    if (confirmText) {
+      // Same KV key Settings writes to — chat and Settings stay in sync either way.
+      await c.env.SESSIONS.put(`profile:${profileId}`, JSON.stringify(updated), {
+        expirationTtl: 60 * 60 * 24 * 90,
+      });
+      return respond(`Got it! Updated your ${confirmText}.`, "profile_update",
+        { next_actions: ["What do you know about me?", "Build a personalised diet plan"] });
+    }
   }
 
   // Memory update handler — "remove panner from likes", "remove mango from both", "add aam to likes"
@@ -2773,35 +2870,28 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     });
   }
 
-  // ── ARCHITECTURE DECISION (2026-07-03): Gemini removed from intent classification ──
-  // Evidence: 260/263 (98.9%) Gemini calls failed in production testing. For a
-  // BOUNDED domain — 57 foods, ~25 intents, 6 seasons, ~20 symptoms — calling an
-  // external, rate-limited LLM to classify every message is the wrong mechanism,
-  // not a reliability bug to patch around. Production closed-domain assistants
-  // (Dialogflow, Rasa, Alexa Skills) solve exactly this class of problem with
-  // deterministic NLU as the PRIMARY engine, using an LLM only as optional
-  // narrative polish on top of an already-correct deterministic answer.
-  // The comprehensive deterministic router below — built and directly tested
-  // against real transcripts all night — is now the sole, unconditional
-  // classifier. `intentParser.ts`/`intentDispatcher.ts` remain in the repo
-  // (still spec-compliant, still importable) for if/when a paid tier or a
-  // reliable free inference source becomes available, but nothing in the
-  // critical path awaits them anymore.
-  const dispatchedResponse: { text: string; taskType: string; toolsUsed: string[]; planData?: any; wantsPdf?: boolean } | null = null;
-
-  // ── Phase 3.5: deterministic NLP intent parse + tool execution ─────────────
-  // NO dynamic imports. Everything inline. Gemini narrative only for the rare
-  // truly-unmatched in-domain query (see domain classifier further below) —
-  // and even that is optional; the app is 100% functional without it.
-
-  let finalResponse = dispatchedResponse?.text ?? "";
-  let taskType      = dispatchedResponse?.taskType ?? "general";
-  let toolsUsed: string[] = dispatchedResponse?.toolsUsed ?? [];
-  if (dispatchedResponse?.planData) (c as any).__planData = dispatchedResponse.planData;
-  if (dispatchedResponse?.wantsPdf) (c as any).__wantsPDF = dispatchedResponse.wantsPdf;
+  // ── ARCHITECTURE CORRECTION (2026-08-03): agent loop moved from primary to selective ──
+  // Making the agent loop primary for every non-trivial message was measured
+  // in production: 141 Gemini requests in one session, 12.06% success rate
+  // (119× 429, 5× 503). Tool-calling loops fire MULTIPLE sequential Gemini
+  // calls per single user message (initial call + one round trip per tool
+  // used) — this reintroduced, and worsened, the exact free-tier call-volume
+  // wall that the original "remove Gemini from the critical path" decision
+  // fixed. It also produced visible symptoms: duplicate meal logging (retries
+  // after 429s re-firing log_meal), and repeated diet plans (retries after
+  // failures). The deterministic router — proven, free, instant, and already
+  // handling the large majority of message types correctly per tonight's own
+  // transcript — is restored as the unconditional first path. The agent loop
+  // is NOT removed: it's relocated to replace the old bare-narrative Gemini
+  // fallback further below, so it still runs — with real tool access, not
+  // just narrative text — but only for the residual messages the
+  // deterministic router genuinely can't answer, not for every message.
+  let finalResponse = "";
+  let taskType      = "general";
+  let toolsUsed: string[] = [];
 
   try {
-    if (!dispatchedResponse) {
+    {
     const geminiKey     = c.env.GEMINI_API_KEY ?? "";
     // "all" is a UI filter pill, not a real season — never let it become the current season
     const ctxSeason     = (agentContext.current_season && agentContext.current_season !== "all")
@@ -2817,13 +2907,13 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     // regex/keyword path with zero behavior change. Left as typed placeholders
     // (rather than deleting every reference) to keep this diff reviewable and
     // reversible if a reliable inference source is added later.
-    const parsedIntentType: string | null = null;
-    const parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
-    const parsedSeason: string | null  = null;
-    const parsedNutrient: string | null = null;
-    const parsedMealSlot: string | null = null;
-    const parsedIsPdf = /\bpdf\b/.test(m);
-    const parsedDays  = 1;
+    let parsedIntentType = null as string | null;
+    let parsedFoods: Array<{name:string;qty?:number;unit?:string;amt_g?:number;sentiment?:string;meal_slot?:string}> = [];
+    let parsedSeason = null as string | null;
+    let parsedNutrient = null as string | null;
+    let parsedMealSlot = null as string | null;
+    let parsedIsPdf = /\bpdf\b/.test(m);
+    let parsedDays = 1 as number;
 
     // ── Step 2: Session memory injection ─────────────────────────────────────
     let sessionSummaryText = "";
@@ -2921,7 +3011,15 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     // Availability question: "can i get apple in summer?" — must not be eaten by food_lookup
     const isAvailabilityQ = /can (?:i|you|we) (?:get|find|buy|have)\b/.test(m) && !!foodInMsg && !!explicitSeason;
 
-    const wantsFoodInfo = !wantsIntake && !isPlanReq && !wantsCompare && !wantsSeason && !isAvailabilityQ && !(nutrientMentioned && foodInMsg) && (
+    // ── Food combination questions ──────────────────────────────────────────────
+    // "can i eat X and Y together", "can i pair/combine/consume X with Y" — these
+    // were being swallowed by single-food lookup (wantsFoodInfo matches the last
+    // food mentioned via foodInMsg and just dumps its nutrient info, completely
+    // ignoring the actual combination question). Must be checked BEFORE wantsFoodInfo.
+    const isCombinationQ = /\bcan i (?:eat|have|consume|drink|pair|combine|mix)\b.{2,50}\b(?:and|with)\b/.test(m)
+      || /\b(?:eat|have|consume|drink)\b.{0,40}\b(?:and|with)\b.{0,40}\btogether\b/.test(m);
+
+    const wantsFoodInfo = !wantsIntake && !isPlanReq && !wantsCompare && !wantsSeason && !isAvailabilityQ && !isCombinationQ && !(nutrientMentioned && foodInMsg) && (
       intent === "food_lookup" || intent === "diet_advice"
       || !!(isNutrientQuestion && (m.includes("juice") || m.includes("smoothie")) && (parsedFoods.length > 0 || foodInMsg))
       || !!(foodInMsg && (
@@ -2931,7 +3029,15 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         || m.includes("should i add") || m.includes("should i eat") || m.includes("should i have")
         || m.includes("can i add") || m.includes("can i eat") || m.includes("add to my diet")
         || m.includes("add to diet") || m.includes("worth eating") || m.includes("ok to eat")
+        || m.includes("uses of") || m.includes("use of") || m.includes("benefits of")
+        || m.includes("make with") || m.includes("cook with") || m.includes("dishes with")
+        || m.includes("how to consume") || m.includes("how can i consume") || m.includes("how to eat")
+        || m.includes("how to use") || m.includes("recipes with") || m.includes("recipe for")
+        || m.includes("easy to digest") || m.includes("hard to digest")
+        || m.includes("can i eat it") || m.includes("should i eat it")
       ))
+      // Also catch: "uses of X" / "benefits of X" / "dishes with X" without pre-matched foodInMsg
+      || (/(?:uses?|benefits?|dishes?|recipes?) (?:of|with|for) ([a-z]{3,20})/.test(m) && !foodInMsg)
     );
 
     const wantsNutrientSources = !wantsIntake && !isPlanReq && (
@@ -3033,45 +3139,13 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
           && !m.includes("i like to ") && !m.includes("i love to ") && !m.includes("i like going")
          )
     ) {
-      const likes     = parsedFoods.filter(f => f.sentiment === "like").map(f => f.name).filter(Boolean);
-      const dislikes  = parsedFoods.filter(f => f.sentiment === "dislike").map(f => f.name).filter(Boolean);
-      const allergies = parsedFoods.filter(f => f.sentiment === "allergy").map(f => f.name).filter(Boolean);
-      // Regex fallback: Gemini parse can return [] on 429 — extract food name directly
-      if (likes.length === 0 && dislikes.length === 0 && allergies.length === 0) {
-        const dm = m.match(/i (?:don'?t like|do not like|dislike|hate)\s+([a-z][a-z\s]{1,40}?)(?:\s+(?:at all|much|in|for|to|because|so|and)\b|[,.!]|$)/);
-        const lm = m.match(/i (?:like|love)\s+([a-z][a-z\s]{1,40}?)(?:\s+(?:a lot|very much|in|for|to|because|so|and)\b|[,.!]|$)/);
-        if (dm && dm[1]) dislikes.push(dm[1].trim());
-        else if (lm && lm[1]) likes.push(lm[1].trim());
-      }
-      // Explicit DB writes — do NOT rely only on extractAndStoreFacts (BUG 2 fix)
-      // Mutual exclusion: a food cannot be in likes AND dislikes at the same time
-      for (const name of dislikes) {
-        const norm = applyFoodAlias(name.toLowerCase().trim());
-        await c.env.DB.prepare(
-          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'preference' AND fact_key != 'dietary' AND LOWER(fact_key) LIKE ?2`
-        ).bind(profileId, `%${norm}%`).run().catch(() => {});
-        await c.env.DB.prepare(
-          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-           VALUES (?1,'dislike',?2,?2,'conversation',datetime('now'),datetime('now'))`
-        ).bind(profileId, norm).run().catch(() => {});
-      }
-      for (const name of likes) {
-        const norm = applyFoodAlias(name.toLowerCase().trim());
-        await c.env.DB.prepare(
-          `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = 'dislike' AND LOWER(fact_key) LIKE ?2`
-        ).bind(profileId, `%${norm}%`).run().catch(() => {});
-        await c.env.DB.prepare(
-          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-           VALUES (?1,'preference',?2,?2,'conversation',datetime('now'),datetime('now'))`
-        ).bind(profileId, norm).run().catch(() => {});
-      }
-      for (const name of allergies) {
-        const norm = applyFoodAlias(name.toLowerCase().trim());
-        await c.env.DB.prepare(
-          `INSERT OR IGNORE INTO user_facts (profile_id, fact_type, fact_key, fact_value, source, created_at, updated_at)
-           VALUES (?1,'allergy',?2,?2,'conversation',datetime('now'),datetime('now'))`
-        ).bind(profileId, norm).run().catch(() => {});
-      }
+      // Build the confirmation message from what extractAndStoreFacts ACTUALLY
+      // stored this turn (already ran above, already handles multi-clause,
+      // multi-item lists correctly) — instead of re-deriving a separate,
+      // now much weaker single-match duplicate that only reported one food.
+      const likes     = stored.filter(s => s.startsWith("like:")).map(s => s.slice(5));
+      const dislikes  = stored.filter(s => s.startsWith("dislike:")).map(s => s.slice(8));
+      const allergies = stored.filter(s => s.startsWith("allergy:")).map(s => s.slice(8));
       const parts: string[] = [];
       if (likes.length)     parts.push(`✅ Added to likes: **${likes.join(", ")}**`);
       if (dislikes.length)  parts.push(`🚫 Added to dislikes: **${dislikes.join(", ")}**`);
@@ -3161,7 +3235,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       if (!finalResponse) {
       const rows = await c.env.DB.prepare(
         `SELECT name FROM items WHERE category='fruit' AND (season=?1 OR season='all')
-         AND LOWER(name) NOT LIKE '%jamun%' ORDER BY RANDOM() LIMIT 8`
+         AND LOWER(name) NOT LIKE '%jamun%' ORDER BY RANDOM() LIMIT 15`
       ).bind(season).all();
       let fruits = (rows.results as any[]).map((r: any) => r.name as string);
 
@@ -3171,10 +3245,24 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       // Never present an empty list — fall back to all-season fruits
       if (fruits.length === 0) {
         const fb = await c.env.DB.prepare(
-          `SELECT name FROM items WHERE category='fruit' AND season='all' ORDER BY RANDOM() LIMIT 6`
+          `SELECT name FROM items WHERE category='fruit' AND season='all' ORDER BY RANDOM() LIMIT 10`
         ).all();
         fruits = (fb.results as any[]).map((r: any) => r.name as string)
           .filter(f => !userFacts.dislikes.some(d => f.toLowerCase().includes(d.toLowerCase())));
+      }
+
+      // "Mix" juice needs a REAL mix — top up to at least 3 distinct fruits from
+      // all-season options if the season+dislike filtering left too few. This is
+      // what fixes "Mix Fruit Juice" showing only 1 fruit (Plum) when monsoon
+      // has few tagged fruits and some got filtered by dislikes.
+      if (fruits.length < 3) {
+        const topUp = await c.env.DB.prepare(
+          `SELECT name FROM items WHERE category='fruit' AND season='all' ORDER BY RANDOM() LIMIT 10`
+        ).all();
+        const extra = (topUp.results as any[]).map((r: any) => r.name as string)
+          .filter(f => !userFacts.dislikes.some(d => f.toLowerCase().includes(d.toLowerCase())))
+          .filter(f => !fruits.includes(f));
+        fruits = [...fruits, ...extra];
       }
 
       // If specific fruit asked, feature it first
@@ -3270,15 +3358,51 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       }
     }
 
+    // ── Food combination questions ──────────────────────────────────────────────
+    else if (isCombinationQ) {
+      const f1 = await findFoodInMessage(m, c.env.DB);
+      const f2 = f1 ? await findSecondFoodInMessage(m, f1.name, c.env.DB) : null;
+
+      if (f1 && f2) {
+        const healthCtx = userFacts.health_notes.length ? ` The user has: ${userFacts.health_notes.join(", ")}.` : "";
+        const allergyCtx = userFacts.allergies.length ? ` Allergic to: ${userFacts.allergies.join(", ")}.` : "";
+        const prompt = `The user asked: "${message}". They want to know specifically whether **${f1.name}** and **${f2.name}** can be safely eaten/consumed together.${healthCtx}${allergyCtx}
+
+Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avoided, then the SPECIFIC reason for THIS combination (not a generic nutrient dump of either food). If there's a known concern (e.g. dairy + acidic fruit, dairy + fish in Ayurveda), mention it briefly. If relevant to their health notes, add one line. Do not list nutrients or calories — that's not what was asked.`;
+        let combo = "";
+        if (geminiKey) {
+          try {
+            combo = await callGeminiFlash(prompt, "You are a concise Indian nutrition assistant. Answer only what is asked.", geminiKey, []);
+          } catch { /* fall through to deterministic default */ }
+        }
+        finalResponse = combo || `**${f1.name}** and **${f2.name}** — I don't have a specific combination rule for this pair, but neither is flagged as generally unsafe together. If you have digestion concerns, introduce new combinations gradually.`;
+        taskType = "food_combination"; toolsUsed = ["food_lookup"];
+      } else {
+        // Only one (or zero) food actually resolved — not a real combination question after all
+        const name = (f1 ?? foodInMsg)?.name;
+        if (name) {
+          const result = await toolFoodLookup(c.env.DB, name);
+          finalResponse = buildDirectResponse("food_lookup", result, message);
+          taskType = "food_lookup"; toolsUsed = ["food_lookup"];
+        } else {
+          finalResponse = "Which two foods would you like to know about combining? e.g. \"can I eat milk and orange together?\"";
+          taskType = "clarification";
+        }
+      }
+    }
+
     // ── Food lookup ────────────────────────────────────────────────────────────
     else if (wantsFoodInfo) {
       const name = parsedFoods[0]?.name ?? foodInMsg?.name ?? "";
       if (name) {
         const result = await toolFoodLookup(c.env.DB, name);
         finalResponse = buildDirectResponse("food_lookup", result, message);
-        if (result.found && (m.includes("good for me") || m.includes("should i") || m.includes("can i eat") || m.includes("healthy"))) {
+        if (result.found && (m.includes("good for me") || m.includes("should i") || m.includes("can i eat") || m.includes("healthy") || m.includes("is it"))) {
           const cal = result.calories_per_100g ?? 0;
-          if (userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()))) {
+          // Check allergies FIRST — this is a safety-critical path
+          if (userFacts.allergies.some(a => result.name?.toLowerCase().includes(a.toLowerCase()))) {
+            finalResponse += `\n\n⚠️ **Important:** You have a recorded allergy to **${result.name}**. It's best to avoid eating it. If you believe this is no longer accurate, you can update your allergies in Settings.`;
+          } else if (userFacts.dislikes.some(d => result.name?.toLowerCase().includes(d.toLowerCase()))) {
             finalResponse += `\n\nYou've mentioned you don't like **${result.name}** — I'll leave it out of your plans.`;
           } else if (userFacts.health_notes.includes("diabetes") && cal > 60) {
             finalResponse += `\n\nFor diabetes: enjoy in moderation and pair with fibre.`;
@@ -3348,15 +3472,19 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     // ── Diet plan ──────────────────────────────────────────────────────────────
     else if (isPlanReq) {
       const season = parsedSeason ?? seasonMentioned ?? currentSeason;
-      // BUG 3 fix: vegetarian preference lives in user_facts, not just profiles table
       const isVegUser = userFacts.dietary === "vegetarian" || userFacts.dietary === "vegan" || userFacts.dietary === "jain";
-      const dislikesWithNonVeg = isVegUser
-        ? [...userFacts.dislikes, "chicken breast", "salmon", "egg"]
-        : userFacts.dislikes;
+      // Merge dislikes + allergies — both must be excluded from any generated plan.
+      // Previously only dislikes were excluded; allergies were silently ignored,
+      // causing plum to appear in every meal for a user with a plum allergy.
+      const allExclusions = [
+        ...userFacts.dislikes,
+        ...userFacts.allergies,
+        ...(isVegUser ? ["chicken breast", "salmon", "egg"] : []),
+      ];
       const profileForPlan = isVegUser
         ? ({ ...(profile ?? {}), dietary_preference: userFacts.dietary } as Profile)
         : profile;
-      const result = await toolBuildDietPlan(c.env.DB, profileForPlan, season, userFacts.goal, planDays, dislikesWithNonVeg);
+      const result = await toolBuildDietPlan(c.env.DB, profileForPlan, season, userFacts.goal, planDays, allExclusions);
       finalResponse = buildDirectResponse("build_diet_plan", result, message);
       if (profile?.goal) finalResponse += `\n\n_This plan takes your profile goal into account: ${profile.goal}._`;
       if (isPdf && planDays === 7) {
@@ -3505,6 +3633,8 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     else if (
       /^(?:no|that.?s wrong|you are wrong|incorrect|not right|wrong|you.?re wrong|nope)[\.!\s]*$/.test(msgClean)
       || /^no[,.]? (?:you are|that.?s|it.?s) (?:wrong|incorrect|not right)/.test(msgClean)
+      || /why did you (?:tell|say|give) me (?:wrong|incorrect|that wrong)/.test(msgClean)
+      || /that('?s| is) (?:wrong|incorrect|not (?:right|correct))/.test(msgClean)
     ) {
       finalResponse = "I'm sorry about that! What specifically was incorrect? Tell me and I'll give you the right answer.";
       taskType = "clarification";
@@ -3637,21 +3767,65 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         "remedy","condition","deficiency","deficient","pregnan","infant",
         "sleep","stress","mental","gut","stomach","liver","kidney","heart",
         "lung","skin","hair","eye","cancer","infection","fever","cold","cough",
+        "nose","throat","ear","blocked","congestion","runny","sneeze","allergic reaction",
       ];
       const isInDomain = IN_DOMAIN_SIGNALS.some(k => m.includes(k))
         || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);
 
-      if (!isInDomain) {
+      // A short, purely-alphabetic message ("kiwi", "dragon fruit") that matched
+      // no food in our DB and no domain keyword is much more likely to be an
+      // attempted food lookup for something we don't track than genuine small
+      // talk — give a specific, helpful answer instead of the generic rejection.
+      // EXCLUDED: pronouns/verbs/profanity — a real food name is never "you",
+      // "are you mad", or an insult. (Fixed 2026-08-02 — this exact class of
+      // bug produced "Fuck off isn't in my 57-food database".)
+      const NOT_A_FOOD_WORDS = ["you","your","yourself","i","me","my","mine","we","us",
+        "are","is","am","was","were","do","does","did","have","has","had","will","would",
+        "fuck","shit","damn","hell","stupid","dumb","idiot","suck","crap","bitch","asshole","mad","annoying"];
+      const wordsInMsg = msgClean.split(/\s+/);
+      const containsNonFoodWord = wordsInMsg.some(w => NOT_A_FOOD_WORDS.includes(w));
+
+      const knowledgeAboutMatch = msgClean.match(/(?:knowledge about|heard of|know about) ([a-z][a-z\s]{1,25}?)(?:\?|$)/);
+      const looksLikeUnknownFood = !isInDomain && !containsNonFoodWord
+        && (
+          (/^[a-z][a-z\s]{1,25}$/.test(msgClean) && wordsInMsg.length <= 3
+           && !GREETINGS.includes(msgClean) && !isOk)
+          || !!knowledgeAboutMatch
+        );
+      const unknownFoodName = knowledgeAboutMatch?.[1]?.trim() ?? msgClean;
+
+      if (looksLikeUnknownFood) {
+        finalResponse = `**${unknownFoodName.charAt(0).toUpperCase() + unknownFoodName.slice(1)}** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try "foods rich in vitamin C" or ask about a food I do track.`;
+        taskType = "unknown_food";
+      } else if (!isInDomain) {
         finalResponse = "Sorry this is out of our expertise. Please feel free to ask any questions from nutrition and health based.";
         taskType = "out_of_domain";
       } else {
+      // Real agent loop (Gemini function-calling over the deterministic
+      // tools) runs HERE — only for messages nothing above could match, not
+      // for every message. This is what keeps call volume sane while still
+      // giving the residual hard cases (combinations, corrections, "tell me
+      // only what was asked", multi-step conditionals) a grounded, tool-using
+      // answer instead of the old bare narrative call that could invent facts.
       if (geminiKey) {
         try {
-          const sysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId)
-            + (sessionSummaryText ? `\n\n${sessionSummaryText}` : "");
-          finalResponse = await callGeminiFlash(message, sysp, geminiKey, history);
+          const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
+            ? agentContext.current_season : getCurrentSeason();
+          const loopResult = await runAgentLoop(message, {
+            db: c.env.DB, geminiKey,
+            profileId, sessionId, profile, userFacts,
+            currentSeason: earlySeason, currentItemName: currentItem?.name ?? null,
+            history,
+          });
+          if (loopResult && loopResult.text) {
+            finalResponse = loopResult.text;
+            taskType = "agent_loop";
+            toolsUsed = loopResult.toolsUsed;
+            if (loopResult.planData) (c as any).__planData = loopResult.planData;
+            if (loopResult.wantsPdf) (c as any).__wantsPDF = loopResult.wantsPdf;
+          }
         } catch (e) {
-          console.error("Gemini fallback error:", e);
+          console.error("Agent loop fallback error:", e);
           finalResponse = "";
         }
       }
@@ -3677,7 +3851,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       taskType = "general";
       } // end else (isInDomain) — out-of-domain branch already set its own response above
     }
-    } // end if (!dispatchedResponse) — deterministic fallback chain
+    } // end deterministic chain block
 
   } catch (err: any) {
     console.error("Agent error:", err);

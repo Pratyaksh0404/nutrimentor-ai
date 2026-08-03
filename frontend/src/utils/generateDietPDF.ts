@@ -128,7 +128,7 @@ export async function generateDietPDF(plan: WeekPlanForPDF): Promise<void> {
     </div>`;
   }).join("");
 
-  el.innerHTML = `
+  const planHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:2px solid ${accentColor}">
       <div>
         <div style="font-size:22px;font-weight:800;color:#1a1a2e">NutriMentor AI</div>
@@ -156,7 +156,7 @@ export async function generateDietPDF(plan: WeekPlanForPDF): Promise<void> {
     </div>
 
     <div style="font-size:14px;font-weight:700;margin-bottom:12px">📅 7-Day Meal Plan</div>
-    <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+    <table style="width:100%;border-collapse:collapse;margin-bottom:8px">
       <thead>
         <tr style="background:#f9fafb">
           <th style="padding:10px;text-align:left;font-size:11px;color:#6b7280;font-weight:700;width:80px">Day</th>
@@ -166,7 +166,9 @@ export async function generateDietPDF(plan: WeekPlanForPDF): Promise<void> {
       </thead>
       <tbody>${mealRows}</tbody>
     </table>
+  `;
 
+  const shoppingHTML = `
     <div style="font-size:14px;font-weight:700;margin-bottom:12px">🛒 Shopping List</div>
     ${shopRows}
 
@@ -176,45 +178,58 @@ export async function generateDietPDF(plan: WeekPlanForPDF): Promise<void> {
     </div>
   `;
 
+  el.innerHTML = planHTML;
+
+  const elShopping = document.createElement("div");
+  elShopping.id = "nm-pdf-printable-shopping";
+  elShopping.style.cssText = el.style.cssText;
+  elShopping.innerHTML = shoppingHTML;
+
   document.body.appendChild(el);
+  document.body.appendChild(elShopping);
   try {
-    const canvas = await html2canvas(el, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
     const pdf    = new jsPDF("p", "mm", "a4");
     const w      = pdf.internal.pageSize.getWidth();
-    const h      = (canvas.height * w) / canvas.width;
+    const pageH  = pdf.internal.pageSize.getHeight();
 
-    // If content taller than A4, add pages
-    // Paginate correctly: slice canvas into A4-page-height chunks.
-    // Key fix: each slice draws at y offset 0 in the destination and -y in the source.
-    const pageH   = pdf.internal.pageSize.getHeight();
-    const pxPerMm = canvas.width / w;           // pixels per mm (at scale:2)
-    const pxPageH = pageH * pxPerMm;            // how many canvas pixels fit on one page
+    // Renders one element, sliced into as many pages as it needs, starting a
+    // fresh page first unless `firstPage` (used only for the very first call).
+    async function renderSection(target: HTMLElement, firstPage: boolean) {
+      const canvas  = await html2canvas(target, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+      const h       = (canvas.height * w) / canvas.width;
+      const pxPerMm = canvas.width / w;
+      const pxPageH = pageH * pxPerMm;
 
-    if (canvas.height <= pxPageH) {
-      // Fits on a single page
-      pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, w, h);
-    } else {
-      let srcY = 0;
-      let pageNum = 0;
+      if (canvas.height <= pxPageH) {
+        if (!firstPage) pdf.addPage();
+        pdf.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, w, h);
+        return;
+      }
+      let srcY = 0, pageNum = 0;
       while (srcY < canvas.height) {
         const slicePxH = Math.min(pxPageH, canvas.height - srcY);
         const sc = document.createElement("canvas");
         sc.width  = canvas.width;
         sc.height = slicePxH;
-        // Draw source starting at srcY into destination at 0
         sc.getContext("2d")!.drawImage(canvas, 0, srcY, canvas.width, slicePxH, 0, 0, canvas.width, slicePxH);
-        if (pageNum > 0) pdf.addPage();
-        const sliceMmH = (slicePxH / pxPerMm);  // mm height of this slice
+        if (!firstPage || pageNum > 0) pdf.addPage();
+        const sliceMmH = (slicePxH / pxPerMm);
         pdf.addImage(sc.toDataURL("image/png"), "PNG", 0, 0, w, sliceMmH);
         srcY += slicePxH;
         pageNum++;
       }
     }
 
-    const date    = new Date().toLocaleDateString("en-IN").replace(/\//g, "-");
+    // Plan content: page 1 (and more if it overflows). Shopping list: always
+    // starts on its own fresh page after that — this is the actual fix.
+    await renderSection(el, true);
+    await renderSection(elShopping, false);
+
+    const date = new Date().toLocaleDateString("en-IN").replace(/\//g, "-");
     pdf.save(`NutriMentor_${plan.season}_Plan_${date}.pdf`);
   } finally {
     document.body.removeChild(el);
+    document.body.removeChild(elShopping);
   }
 }
 
