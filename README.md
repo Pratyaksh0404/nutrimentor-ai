@@ -1,407 +1,185 @@
 # NutriMentor AI
 
-NutriMentor AI is a nutrition-focused web product built around seasonal food discovery, explainable nutrient information, diet deficiency analysis, and a context-aware chatbot.
+NutriMentor AI is a nutrition and health mentor for Indian seasonal (Ritu-based) eating, grounded food data, personalized diet plans, meal tracking, and a real tool-using AI agent for the questions a lookup table can't answer.
 
-The product direction is to make nutrition guidance feel useful, fast, grounded, and personal, while staying aligned with Indian `Ritu` season concepts and practical food selection.
+## What NutriMentor AI Actually Is
+
+This is **not** a general-purpose task-executing agent — it doesn't book flights, send emails, or manage your calendar, and it isn't trying to. By design, it works in exactly three domains: **nutrition, health, and medical-adjacent guidance** (with a hard boundary that it always redirects genuine medical/emergency situations to real professionals or emergency services, never attempts to handle them itself).
+
+Within that scope, it *is* a real agent, not a static chatbot:
+
+- It reasons in multiple steps per request — e.g. a diet plan question can check your logged deficiencies, today's intake, allergies, and dislikes, then build and explain a plan, all in one turn.
+- It has real tool access (Gemini function-calling) into a live nutrition database, not free-form generation — every nutrient number, calorie count, and seasonal fact is grounded in a tool call, not invented.
+- It remembers you across sessions (preferences, health notes, allergies, profile) via a persistent backend, editable from Settings or just by mentioning things in conversation.
+- It runs a daily background job (Cloudflare cron) that proactively surfaces nutrient patterns without being asked.
+- It maintains a hard safety boundary: emergency-language detection that overrides everything else and directs to real emergency services, and allergy-safety checks on every food recommendation and every meal log.
 
 ## Current Status
 
-This repository is in active development.
+**Working now:**
+- Deterministic router (fast, free, zero external calls) for the ~30 common intent types: food lookup, food comparison, diet plan generation (1-day and 7-day, with PDF export), meal logging with real-time deficiency analysis, seasonal (Ritu) guidance, nutrient-source search, ingredient substitution, symptom-based food advice, BMI/calorie calculation, memory read/update.
+- A real Gemini function-calling agent loop, used selectively for the residual questions the router can't cleanly match — combination questions ("can I eat X and Y together"), corrections, conditional/multi-step questions — with real tool access into the same database, not narrative guessing.
+- Hard safety layer: medical-emergency detection (checked before anything else, redirects to 112/108), allergy warnings on both food recommendations and meal logging.
+- Persistent user profile and preferences (likes/dislikes/allergies/health notes), editable from a Settings page or via natural conversation, kept in sync between both.
+- Weekly nutrition dashboard: score, 7-day calorie chart, per-nutrient RDA breakdown, day streak, seasonal-match percentage.
+- Ritu Journal: all 6 Ayurvedic seasons with what to eat/avoid, dosha info, and quick actions.
+- Daily proactive "morning insight" via a scheduled Cloudflare cron job.
+- Meal Log page with per-day history.
 
-What is working now:
-
-- Seasonal food explorer UI with a three-column layout.
-- Item cards with hover preview and selected-item context.
-- Detail panel with scientific name, calories, category, and key nutrients.
-- Backend health check and item APIs.
-- Chatbot with deterministic answers for many common nutrition prompts.
-- Selected-item chat context such as `what is this`, `what nutrients does it have`, and seasonal follow-ups.
-- Diet analysis endpoint for consumed items, deficiencies, and food suggestions.
-- Local SQLite database and JSON-based food seed data.
-- Local ML/LLM assets included in the backend codebase.
-
-What is still in progress:
-
-- Data cleanup and expansion.
-- Better image coverage for all foods.
-- More robust chatbot logic for broader diet and health questions.
-- Personalization features like BMI, profile memory, and saved sessions.
-- RAG-based retrieval and response streaming.
-- Auth, persistent user history, and deployment hardening.
+**In progress / not started:**
+- RAG-based knowledge layer for general nutrition/health questions beyond the 57-food database (currently these get either a database-grounded answer, an honest "not in my database," or a general-knowledge answer from the agent loop with no retrieval grounding).
+- Google Auth and persistent multi-device accounts (currently guest/local-device profiles via a stable browser-generated ID).
+- Meal log editing/deletion via chat (currently log-only; individual entries can't yet be removed conversationally).
+- Broader automated test coverage — testing has been manual, transcript-driven, against real usage patterns.
 
 ## Product Goals
 
-NutriMentor AI is being built as a product, not just a demo project. The intended experience is:
-
-- Fast answers for common nutrition questions.
-- Minimum hallucination by preferring structured data over free-form generation.
-- Season-aware food suggestions.
-- Clear and useful nutrient breakdowns.
-- Practical diet guidance that can later become personalized.
+- Fast, grounded answers — prefer structured tool/database data over free-form generation wherever a definitive answer exists.
+- Season-aware, Ayurveda-informed guidance specific to Indian eating patterns.
+- Personalization that compounds over time: the more you use it, the more it knows about you, without ever inventing what it doesn't actually know.
+- A real safety floor: never silently ignore an allergy, never leave a described emergency unaddressed.
+- Zero-cost operation — the entire stack runs on free tiers (Cloudflare Workers, D1, KV, Pages; Gemini API free tier used sparingly, not as a blanket dependency).
 
 ## Tech Stack
 
-### Frontend
+### Backend — Cloudflare Workers
+- **Hono** — routing framework
+- **TypeScript**
+- **D1** — SQLite-compatible edge database (57-food nutrient dataset, meal logs, user facts, sessions)
+- **KV** — session state, user profiles, response caching
+- **Cron Triggers** — daily scheduled job for proactive insights
+- **Gemini API** (`gemini-2.5-flash-lite`) — function-calling agent loop, used selectively, not as a blanket per-message dependency (see [Architecture](#architecture--why-its-built-this-way) below)
 
-- React 19
-- TypeScript
-- Vite / Rolldown Vite
-- Tailwind CSS
-- Axios
-- Lucide React
+### Frontend — Cloudflare Pages
+- **React 19** + **TypeScript**
+- **Vite** (Rolldown)
+- **Tailwind CSS**
+- **jsPDF + html2canvas** — client-side diet plan PDF export
+- **Lucide React** — icons
 
-### Backend
+## Architecture — why it's built this way
 
-- FastAPI
-- SQLAlchemy
-- SQLite
-- Pydantic
-- Uvicorn
+This project went through several architecture iterations, each driven by a real, measured production problem — worth documenting honestly rather than presenting the current state as the plan from day one:
 
-### ML / AI
+1. **Pure deterministic routing** (regex/keyword-based intent matching): fast and free, but felt exactly like what it was — a lookup table — for anything not explicitly pattern-matched.
+2. **Gemini as the primary classifier for every message**: measured at a 1.14% success rate under real testing load (429/503 errors from the shared free-tier quota). Reverted.
+3. **A full agentic tool-calling loop as the primary path for every message**: technically sound, but tool-calling loops fire multiple sequential API calls per single user message — measured at 12.06% success rate (119 rate-limit errors out of 141 requests in one session) once real usage volume hit it.
+4. **Current architecture**: the deterministic router runs first and handles the large majority of traffic — for free, instantly, with zero external dependency. The Gemini agent loop (real function-calling into the same deterministic tools, not bare narrative generation) is reserved for the residual messages the router genuinely can't match. This keeps API call volume sustainable on a free tier while still giving the harder conversational cases — corrections, combinations, multi-step reasoning — a grounded, tool-using answer instead of either a wrong lookup-table guess or an ungrounded hallucination risk.
 
-- `rapidfuzz` for fuzzy food matching
-- `torch` + `transformers` for intent classification assets
-- `llama-cpp-python` for local GGUF model inference
-- Local Mistral GGUF model in `backend/app/ml/models/mistral.gguf`
-- Local DistilBERT intent model in `backend/app/ml/intent_model/`
+The lesson carried forward: prefer the free, deterministic path wherever a definitive answer exists; reserve the LLM for genuine reasoning gaps; and always keep a working fallback under whichever layer is "primary" at the time.
 
 ## Repository Structure
 
 ```text
 Nutrimentor-Ai/
-├── backend/
-│   ├── app/
-│   │   ├── core/            # routing logic, chat logic, nutrient/diet engines
-│   │   ├── ml/              # local intent model + GGUF model assets
-│   │   ├── models/          # SQLAlchemy models
-│   │   ├── routes/          # FastAPI route modules
-│   │   ├── schemas/         # Pydantic schemas
-│   │   ├── config.py
-│   │   ├── database.py
-│   │   └── main.py
-│   ├── data/foods.json      # seed food dataset
-│   ├── scripts/seed_foods.py
-│   ├── nutrimentor.db
-│   └── test_intent.py
-├── frontend/
-│   ├── public/images/
+├── worker/                      # Cloudflare Worker (backend)
 │   ├── src/
-│   │   ├── api/
+│   │   ├── index.ts             # Hono app, routes, deterministic router, all deterministic tools
+│   │   ├── agentLoop.ts         # Gemini function-calling agent loop + tool declarations/dispatcher
+│   │   ├── intentParser.ts      # (unused in current hot path — see file header)
+│   │   ├── intentDispatcher.ts  # (unused in current hot path — see file header)
+│   │   └── sessionMemory.ts     # (built, not yet wired in — rolling session summary)
+│   ├── schema.sql               # D1 schema
+│   ├── *.sql                    # migrations
+│   └── wrangler.toml
+├── frontend/
+│   ├── src/
+│   │   ├── pages/                # Home, Dashboard, MealLog, RituJournal, Settings
 │   │   ├── components/
-│   │   ├── constants/
-│   │   ├── hooks/
-│   │   ├── pages/
-│   │   ├── types/
-│   │   └── main.tsx
+│   │   │   ├── chat/              # Chat panel (read-only profile display, session list, PDF trigger)
+│   │   │   ├── food/               # Food grid, cards, detail panel
+│   │   │   ├── season/             # Season selector
+│   │   │   └── layout/, common/, footer/
+│   │   ├── hooks/                 # useChat, useDashboard, useItems, useSeason, useBackendHealth
+│   │   ├── utils/generateDietPDF.ts
+│   │   └── api/                   # config + client
 │   └── package.json
-├── requirements.txt
 └── README.md
 ```
 
-## Frontend Features Implemented
-
-- Seasonal selector with `Ritu` mapping.
-- Food grid that updates by season filter.
-- Hover preview for food spotlight.
-- Click-to-select food for chatbot context.
-- Clear selected food from the detail panel.
-- Detail panel with:
-  - scientific name
-  - calories per 100g
-  - category
-  - key nutrients
-- Chat panel connected to backend.
-- Backend health-aware loading and error states.
-
-Main frontend screen:
-
-- [frontend/src/pages/Home.tsx](D:/Pratyaksh2/Root/pycharm/Project/Nutrimentor-Ai/frontend/src/pages/Home.tsx)
-
-## Backend Features Implemented
-
-- FastAPI application bootstrap with CORS.
-- Health endpoint.
-- Item listing by season.
-- Item nutrient lookup endpoint.
-- RDA create/list endpoints.
-- Diet analysis endpoint:
-  - consumed nutrient totals
-  - nutrient deficiencies
-  - suggestion mapping
-- Chat endpoint with deterministic routing before any model fallback.
-- Food search index built at startup.
-- Seed script to populate foods and item-nutrient relations.
-
-Backend entrypoint:
-
-- [backend/app/main.py](D:/Pratyaksh2/Root/pycharm/Project/Nutrimentor-Ai/backend/app/main.py)
-
-## Chatbot Behavior Today
-
-The chatbot is currently designed to prefer structured, instant answers whenever possible.
-
-It already handles:
-
-- greetings and basic conversational prompts
-- identity / capability prompts
-- selected-item context such as `what is this`
-- nutrient lookups for a selected or detected food
-- calorie questions
-- season suitability questions
-- food comparison prompts
-- general nutrient source prompts such as `foods rich in protein`
-- season-filtered nutrient suggestions such as `what should I eat in winter for protein`
-
-Core chat router:
-
-- [backend/app/core/agent_router.py](D:/Pratyaksh2/Root/pycharm/Project/Nutrimentor-Ai/backend/app/core/agent_router.py)
-
-Important note:
-
-- The current main chat path avoids unnecessary LLM calls for many common prompts.
-- Local intent and local LLM assets still exist in the repo because they are part of the broader roadmap, but the current fast path is mostly deterministic.
-
 ## API Overview
 
-Base URL used by the frontend:
+Base URL: your deployed Worker (`https://nutrimentor-worker.nutrimentor.workers.dev/`).
 
-- `http://localhost:8000`
-
-### Health
-
+### Health & Items
 - `GET /health`
+- `GET /items`, `GET /items/:id`, `GET /items/:id/nutrients`
+- `GET /nutrients`
 
-### Items
+### Agent
+- `POST /agent/message` — main chat endpoint (deterministic router + selective agent loop fallback)
+- `POST /agent/context/select`, `POST /agent/context/clear`
+- `GET /agent/sessions`, `GET /agent/sessions/:id`
+- `GET /agent/morning/:profile_id` — proactive daily insight
+- `GET /agent/season-check/:profile_id`
+- `POST /agent/task/diet-plan`, `POST /agent/task/swap`, `POST /agent/task/analyze-intake`
 
-- `GET /items/`
-- `GET /items/?season=summer`
-- `POST /items/`
-- `GET /items/{item_id}/nutrients`
+### Profile & Preferences
+- `GET /profile/:session_id`, `POST /profile/:session_id`
+- `GET /facts/:profile_id`, `POST /facts/:profile_id`, `DELETE /facts/:profile_id`, `DELETE /facts/:profile_id/all`
 
-### Nutrients
+### Meals
+- `POST /meals/log`, `DELETE /meals/:log_id`
+- `GET /meals/today/:profile_id`, `GET /meals/week/:profile_id`
+- `GET /nutrition-score/:profile_id`
 
-- `POST /nutrients/`
-- `GET /nutrients/item/{item_id}`
-
-### RDA
-
-- `GET /rda/`
-- `POST /rda/`
-
-### Diet
-
-- `POST /diet/analyze`
-
-### Chat
-
-- `POST /chat/`
-
-Example chat payload:
-
-```json
-{
-  "message": "what nutrients does it have",
-  "context": {
-    "current_item": {
-      "id": 4,
-      "name": "Tomato",
-      "season": "summer"
-    },
-    "current_season": "summer"
-  }
-}
-```
-
-## Data and Local Assets
-
-Current repository data/assets include:
-
-- `backend/data/foods.json` as the main food seed file
-- `backend/nutrimentor.db` as the current SQLite database
-- `backend/nutrimentor_backup.db` as a backup snapshot
-- local food images inside `frontend/public/images/`
-- local GGUF and intent model assets inside `backend/app/ml/`
-
-Important observations:
-
-- The seed file currently contains duplicate food entries for some foods.
-- Some foods still have missing or incomplete image coverage.
-- Some units/data values still need cleanup and normalization.
+### Seasonal (Ritu Journal)
+- `GET /ritu`, `GET /ritu/:season`
 
 ## Local Setup
 
 ### Prerequisites
+- Node.js and npm
+- A Cloudflare account (free tier) with Workers, D1, KV, and Pages enabled
+- A Gemini API key (free tier)
 
-- Python 3.10+ or compatible virtual environment
-- Node.js and npm available in `PATH`
-- Windows PowerShell works fine for the current setup
-
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/Pratyaksh0404/nutrimentor-ai.git
 cd Nutrimentor-Ai
 ```
 
-### 2. Backend setup
-
-Create and activate a virtual environment if needed:
+### 2. Worker (backend) setup
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+cd worker
+npm install
+npx wrangler d1 execute nutrimentor-db --file=schema.sql   # first-time setup
+npx tsc --noEmit                                            # type-check before deploying
+wrangler deploy
 ```
 
-Install backend dependencies:
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-Run the backend:
-
-```powershell
-cd backend
-uvicorn app.main:app --reload
-```
-
-Backend docs and health:
-
-- `http://127.0.0.1:8000/docs`
-- `http://127.0.0.1:8000/health`
+Set secrets (Gemini key, etc.) via `wrangler secret put GEMINI_API_KEY` or your `wrangler.toml` bindings.
 
 ### 3. Frontend setup
-
-In a new terminal:
 
 ```powershell
 cd frontend
 npm install
-npm run dev
+npm run build
+npx wrangler pages deploy dist --project-name=nutrimentor-ai
 ```
 
-Frontend local URL is typically:
-
-- `http://127.0.0.1:5173`
+For local development: `npm run dev` (frontend) and `wrangler dev` (worker) in separate terminals.
 
 ## Database Notes
 
-- The backend uses SQLite at `backend/nutrimentor.db`.
-- Tables are auto-created on startup through SQLAlchemy metadata.
-- Food search index is built during backend startup.
-- The food seed script expects nutrients to already exist in the nutrient table before linking them to items.
+- D1 (SQLite-compatible) holds the 57-food nutrient dataset, `meal_logs`, `user_facts` (preferences/health notes/allergies), and `messages`/`sessions` (chat history).
+- User profile (age/height/weight/goal/activity level) is stored in **KV**, not D1, keyed by a stable browser-generated profile ID — this is what enables guest-mode personalization without requiring accounts.
+- `meal_logs.profile_id` is genuinely unused (a legacy integer FK to a `profiles` table that guest users never populate) — `session_id` is the actual identifier column in practice. This is intentional, not an oversight; it's documented in the code where it matters.
 
-Seed script:
+## Known Limitations
 
-- [backend/scripts/seed_foods.py](D:/Pratyaksh2/Root/pycharm/Project/Nutrimentor-Ai/backend/scripts/seed_foods.py)
-
-## Development Commands
-
-### Frontend
-
-```powershell
-cd frontend
-npm run dev
-npm run build
-```
-
-### Backend
-
-```powershell
-cd backend
-uvicorn app.main:app --reload
-```
-
-### Optional checks used during development
-
-```powershell
-cd frontend
-node node_modules\typescript\bin\tsc -b
-node node_modules\vite\bin\vite.js build
-```
-
-## Current Limitations
-
-- No authentication or user accounts yet.
-- No persistent user-specific chat history yet.
-- No BMI or profile personalization yet.
-- No streaming chat responses yet.
-- No RAG knowledge base yet.
-- Data quality still needs cleanup and normalization.
-- Some images are missing.
-- The checked-in local model assets are heavy and not deployment-friendly in their current form.
-- The frontend is product-functional, but the UI/UX still needs refinement for a polished public release.
-
-## Roadmap
-
-### Phase 1: Stabilize chatbot logic
-
-- Improve deterministic routing further
-- reduce edge-case misclassification
-- keep unnecessary LLM calls near zero
-
-### Phase 2: Data reliability
-
-- clean food dataset
-- remove duplicates
-- normalize nutrients and units
-- expand image coverage
-- improve scientific names and season mappings
-
-### Phase 3: Product UX
-
-- improve food card interactions
-- improve responsive layout
-- improve detail panel and chat feel
-- fix remaining visual inconsistencies
-
-### Phase 4: Personalization
-
-- user profile
-- BMI calculation
-- diet intake tracking
-- RDA-aware personalized guidance
-
-### Phase 5: RAG + streaming
-
-- retrieval-based nutrition knowledge layer
-- faster grounded explanations
-- typing / streaming chat experience
-
-### Phase 6: Deployment
-
-- production-friendly architecture
-- model and infra strategy
-- hosting and maintenance plan
-
-## Known Gaps To Address Next
-
-- Better handling of broad general nutrition prompts without overextending beyond the database.
-- Cleanup of mojibake / unit encoding issues in some nutrient outputs.
-- More complete test coverage for backend routing and frontend interactions.
-- Replacement of placeholder/template docs in subfolders where needed.
-
-## Verification Status
-
-This repo has recently been verified locally for:
-
-- backend import/startup
-- frontend TypeScript build
-- frontend Vite production build
-- chat context selection and clearing
-- deterministic chatbot responses for several common prompts
-
-Testing is still mostly manual and needs stronger automated coverage.
+- No authentication — every user is a "guest" identified by a browser-local ID. Multi-device sync isn't possible without logging in, which isn't built yet.
+- No RAG/retrieval layer — questions about foods or conditions outside the 57-food database get either an honest "not in my database," or a general-knowledge answer from the agent loop with no retrieval grounding (i.e., it's using the model's own training knowledge for that fraction of answers, not verified data).
+- Meal log entries can't be individually deleted via chat yet (logging-only).
+- Single shared Gemini API key on the free tier — the deterministic-first architecture keeps this sustainable, but it's still a shared quota, not dedicated capacity.
+- The agent loop's answer quality depends on the underlying Gemini model and is an ongoing area of tuning, not a solved problem.
 
 ## Vision
 
-NutriMentor AI is being shaped into a nutrition product that is:
+A nutrition and health mentor that's honest about what it knows and doesn't know, grounded in real data wherever a real answer exists, genuinely agentic within its actual scope, and reliable enough — on a genuinely free stack — to use every day, not just to demo once.
 
-- visually strong
-- fast for common questions
-- grounded in structured food data
-- season-aware
-- progressively personalized
-
-The long-term goal is a trustworthy nutrition companion that feels practical enough to use, not just interesting enough to demo.
+## Author
+### Pratyaksh Agrawal
