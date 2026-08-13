@@ -26,6 +26,7 @@ interface Fact {
 const GOALS = ["maintain weight", "lose weight", "gain weight", "build muscle"];
 const ACTIVITY_LEVELS = ["sedentary", "light", "moderate", "active", "very active"];
 const DIETARY_PREFS = ["vegetarian", "non-vegetarian", "vegan", "jain"];
+const AUTH_TOKEN_KEY = "nutrimentor-auth-token";
 
 function getProfileId(): string {
   let id = localStorage.getItem("nutrimentor-profile-id");
@@ -37,6 +38,9 @@ function getProfileId(): string {
 }
 
 export default function SettingsPage() {
+  // By the time this component mounts, Home.tsx has already consumed the
+  // OAuth redirect params and persisted auth_token + profile_id to
+  // localStorage — so getProfileId() returns the correct post-login value.
   const profileId = getProfileId();
 
   const [profile, setProfile]   = useState<ProfileData>({});
@@ -47,6 +51,40 @@ export default function SettingsPage() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [error, setError]       = useState<string | null>(null);
+  const [authInfo, setAuthInfo] = useState<{ authenticated: boolean; email?: string; name?: string; avatar_url?: string } | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authRedirectError] = useState<string | null>(null);
+
+  // Check current auth status (redirect params already consumed by Home.tsx before this mounted)
+  useEffect(() => {
+    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (!token) { setAuthLoading(false); return; }
+
+    let cancelled = false;
+    fetch(`${API_BASE_URL}/auth/me?token=${encodeURIComponent(token)}`)
+      .then(r => r.ok ? r.json() : { authenticated: false })
+      .then(data => { if (!cancelled) setAuthInfo(data); })
+      .catch(() => { if (!cancelled) setAuthInfo({ authenticated: false }); })
+      .finally(() => { if (!cancelled) setAuthLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  function signInWithGoogle() {
+    const currentId = getProfileId();
+    window.location.href = `${API_BASE_URL}/auth/google/start?profile_id=${encodeURIComponent(currentId)}`;
+  }
+
+  async function signOut() {
+    const token = localStorage.getItem(AUTH_TOKEN_KEY);
+    if (token) {
+      await fetch(`${API_BASE_URL}/auth/logout`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      }).catch(() => {});
+    }
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    setAuthInfo({ authenticated: false });
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -155,8 +193,62 @@ export default function SettingsPage() {
     <div style={{ maxWidth: 640, margin: "0 auto", padding: "20px 16px 40px" }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 22 }}>⚙️ Settings</h2>
       <p style={{ margin: "0 0 20px", fontSize: 13, opacity: 0.65 }}>
-        Profile, preferences, and memory — stored locally to this device (guest mode).
+        {authInfo?.authenticated
+          ? "Profile, preferences, and memory — synced to your Google account."
+          : "Profile, preferences, and memory — stored locally to this device (guest mode)."}
       </p>
+
+      {authRedirectError && (
+        <div style={{ background: "#f8717120", border: "1px solid #f8717150", borderRadius: 10, padding: 10, marginBottom: 14, fontSize: 13 }}>
+          Sign-in didn't complete ({authRedirectError.replace(/_/g, " ")}). Please try again.
+        </div>
+      )}
+
+      {/* ── Account ── */}
+      <div style={{ background: "var(--bg-card, #1e3a28)", borderRadius: 14, padding: 18, marginBottom: 14 }}>
+        <div style={{ fontWeight: 700, marginBottom: 4 }}>Account</div>
+        {authLoading ? (
+          <p style={{ fontSize: 12, opacity: 0.6, margin: 0 }}>Checking sign-in status…</p>
+        ) : authInfo?.authenticated ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            {authInfo.avatar_url && (
+              <img src={authInfo.avatar_url} alt="" style={{ width: 36, height: 36, borderRadius: "50%" }} />
+            )}
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13, fontWeight: 600 }}>{authInfo.name ?? "Signed in"}</div>
+              <div style={{ fontSize: 12, opacity: 0.6 }}>{authInfo.email}</div>
+            </div>
+            <button
+              type="button" onClick={signOut}
+              style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--bg-panel, #13261d)", background: "transparent", color: "inherit", fontSize: 12, cursor: "pointer" }}
+            >
+              Sign out
+            </button>
+          </div>
+        ) : (
+          <div>
+            <p style={{ fontSize: 12, opacity: 0.65, margin: "0 0 10px" }}>
+              You're using guest mode — your data stays on this device only. Sign in to sync across devices.
+            </p>
+            <button
+              type="button" onClick={signInWithGoogle}
+              style={{
+                display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", borderRadius: 8,
+                border: "1px solid var(--bg-panel, #13261d)", background: "#fff", color: "#1a1a1a",
+                fontSize: 13, fontWeight: 600, cursor: "pointer",
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
+                <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.3-.1-2.7-.4-3.5z"/>
+                <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.5 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3c-7.7 0-14.4 4.4-17.7 10.7z"/>
+                <path fill="#4CAF50" d="M24 45c5.5 0 10.4-1.9 14.3-5.1l-6.6-5.6c-2.1 1.5-4.8 2.4-7.7 2.4-5.3 0-9.7-3.3-11.3-8l-6.6 5.1C9.5 40.5 16.2 45 24 45z"/>
+                <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.6 5.6C41.5 36.2 45 30.7 45 24c0-1.3-.1-2.7-.4-3.5z"/>
+              </svg>
+              Sign in with Google
+            </button>
+          </div>
+        )}
+      </div>
 
       {error && (
         <div style={{ background: "#f8717120", border: "1px solid #f8717150", borderRadius: 10, padding: 10, marginBottom: 14, fontSize: 13 }}>

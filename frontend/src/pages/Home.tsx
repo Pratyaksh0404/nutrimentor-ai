@@ -15,10 +15,37 @@ import type { SeasonKey } from "../types/season";
 import { API_BASE_URL } from "../api/config";
 
 const PROFILE_KEY = "nutrimentor-profile-id";
+const AUTH_TOKEN_KEY = "nutrimentor-auth-token";
+
 function getProfileId(): string {
   let id = localStorage.getItem(PROFILE_KEY);
   if (!id) { id = crypto.randomUUID().replace(/-/g, ""); localStorage.setItem(PROFILE_KEY, id); }
   return id;
+}
+
+// Called once synchronously during Home's lazy useState initializer — before
+// any render, so the profile_id and auth_token from the OAuth redirect are
+// captured and persisted before the first data fetch runs.
+// Returns the initial tab to open (defaults to "foods", overridden to
+// "settings" when the backend callback includes ?tab=settings).
+function consumeAuthRedirectAndGetInitialTab(): string {
+  const params = new URLSearchParams(window.location.search);
+  const token          = params.get("auth_token");
+  const returnedProfile = params.get("profile_id");
+  const tab            = params.get("tab");
+  const hasRedirectParams = !!(token || params.get("auth_error"));
+
+  if (token && returnedProfile) {
+    localStorage.setItem(AUTH_TOKEN_KEY, token);
+    localStorage.setItem(PROFILE_KEY, returnedProfile);
+  }
+  if (hasRedirectParams) {
+    // Clean the URL so the params don't persist on refresh
+    ["auth_token", "profile_id", "tab", "auth_error"].forEach(k => params.delete(k));
+    const clean = params.toString();
+    window.history.replaceState({}, "", window.location.pathname + (clean ? `?${clean}` : ""));
+  }
+  return tab ?? "foods";
 }
 
 function getISTGreeting(): string {
@@ -78,7 +105,7 @@ export default function Home() {
   const [season, setSeason]       = useState<SeasonKey>("all");
   const [selected, setSelected]   = useState<Item | null>(null);
   const [light, setLight]         = useState(false);
-  const [activeTab, setActiveTab] = useState<string>("foods");
+  const [activeTab, setActiveTab] = useState<string>(() => consumeAuthRedirectAndGetInitialTab());
   const [showAvatar, setShowAvatar] = useState(false);
   const [pendingMsg, setPendingMsg] = useState<string | null>(null);
   const [morning, setMorning]     = useState<MorningInsight | null>(null);

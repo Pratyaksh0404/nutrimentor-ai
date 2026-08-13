@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 // path — see ARCHITECTURE DECISION comment below. Kept in the repo, spec-compliant,
 // for future use if a reliable free (or paid) inference source becomes available.
 import { runAgentLoop, type AgentContext as AgentLoopContext } from "./agentLoop";
+import authApp from "./auth";
 // sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -1924,6 +1925,9 @@ app.use("*", async (c, next) => {
   })(c, next);
 });
 
+// Auth routes registered AFTER CORS middleware so they inherit CORS headers
+app.route("/auth", authApp);
+
 // ── Health ────────────────────────────────────────────────────────────────────
 
 app.get("/health", (c) => c.json({
@@ -2020,7 +2024,7 @@ app.get("/agent/sessions", async (c) => {
   const result = await c.env.DB.prepare(
     `SELECT s.id as session_id, s.title, s.updated_at,
      (SELECT content FROM messages WHERE session_id = s.id AND role = 'user'
-      ORDER BY created_at ASC LIMIT 1) as first_message,
+      ORDER BY created_at ASC, id ASC LIMIT 1) as first_message,
      (SELECT COUNT(*) FROM messages WHERE session_id = s.id) as message_count
      FROM sessions s
      WHERE s.id IN (${placeholders})
@@ -2052,10 +2056,11 @@ app.get("/agent/sessions/:id", async (c) => {
     } catch { /* non-fatal */ }
   }
 
-  const messages = await c.env.DB.prepare(
-    `SELECT role, content, task_type, created_at FROM messages
-     WHERE session_id = ?1 ORDER BY created_at ASC LIMIT 100`
+  const messagesDesc = await c.env.DB.prepare(
+    `SELECT id, role, content, task_type, created_at FROM messages
+     WHERE session_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 200`
   ).bind(sid).all();
+  const messages = { results: (messagesDesc.results as any[]).slice().reverse() };
   return c.json({ ...session, messages: messages.results });
 });
 
@@ -2425,7 +2430,7 @@ app.post("/agent/message", async (c) => {
 
   // Load conversation history
   const historyResult = await c.env.DB.prepare(
-    `SELECT role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 20`
+    `SELECT id, role, content FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 20`
   ).bind(sessionId).all();
   const history = (historyResult.results as any[]).reverse().map(m => ({
     role: m.role as "user" | "assistant",
@@ -2509,13 +2514,18 @@ app.post("/agent/message", async (c) => {
   const isConfusion = ["wrong","what","huh","what?","huh?","excuse me","pardon","what do you mean",
                        "that's wrong","thats wrong","incorrect","not right","what the","wtf","wth"].includes(msgClean)
     || ((msgClean.startsWith("what the") || msgClean.startsWith("what ?")) && msgClean.split(/\s+/).length <= 5);
+  const isConciseFeedback = /(?:just|only) (?:answer|tell|say) (?:what|to what) (?:is|was) asked/.test(msgClean)
+    || /not less,? not (?:extra|more)/.test(msgClean) || /(?:why|stop).{0,20}long answer/.test(msgClean)
+    || msgClean.includes("tell only what is asked") || msgClean.includes("dont need your whole description")
+    || msgClean.includes("don't need your whole description");
   const isFrustration = (msgClean.includes("what the fuck") || msgClean.includes("wtf") ||
                         msgClean.includes("what the hell") || msgClean.includes("this is wrong") ||
                         msgClean.includes("stupid") || msgClean.includes("dumb") ||
                         msgClean.includes("fuck off") || msgClean.includes("f off") ||
                         /you(?:'?re| are) so bad/.test(msgClean) || msgClean.includes("are you mad") ||
                         msgClean.includes("so annoying") || msgClean.includes("you're annoying") ||
-                        msgClean.includes("annoyed with you"))
+                        msgClean.includes("annoyed with you") || /fuck\w* (?:answer|respond|help)/.test(msgClean) ||
+                        /why (?:can'?t|cant|won'?t) you/.test(msgClean) && /fuck|shit|damn/.test(msgClean))
     && !/expertise|purpose|who (?:made|are|built|created)|what (?:can|do) you|your (?:name|area)/.test(msgClean);
   const isIdentity = /who (?:the (?:hell|heck|f\w*))? ?(?:made|are|built|created|designed) you/.test(msgClean) ||
                      /(?:who|what) (?:the (?:hell|heck|f\w*))? ?(?:made|designed|created|built|is) nutrimentor/.test(msgClean) ||
@@ -2525,6 +2535,11 @@ app.post("/agent/message", async (c) => {
                      msgClean.includes("are you claude") || msgClean.includes("are you an ai") ||
                      msgClean.includes("are you a real") || msgClean.includes("are you real") ||
                      msgClean.includes("are you intelligent") || msgClean.includes("are you smart") ||
+                     msgClean.includes("are you wise") || msgClean.includes("are you a medical expert") ||
+                     msgClean.includes("are you a doctor") || msgClean.includes("are you a nutritionist") ||
+                     msgClean.includes("what is your use") || msgClean.includes("what's your use") ||
+                     msgClean.includes("your name") || msgClean.includes("what are you called") ||
+                     msgClean.includes("trained on") || msgClean.includes("what data") ||
                      msgClean.includes("out of your mind") ||
                      msgClean.includes("expertise") || msgClean.includes("your purpose") ||
                      msgClean.includes("benefit from you") || msgClean.includes("help me with") ||
@@ -2533,17 +2548,26 @@ app.post("/agent/message", async (c) => {
                      msgClean.includes("is this accurate") || msgClean.includes("is the data accurate") ||
                      msgClean.includes("is that all you know") || msgClean.includes("accuracy") ||
                      msgClean.includes("doctor worthy") || msgClean.includes("is this real") ||
-                     msgClean.includes("medical advice") || msgClean.includes("can i trust");
+                     msgClean.includes("medical advice") || msgClean.includes("can i trust") ||
+                     msgClean.includes("is it reliable") || msgClean.includes("is that reliable") ||
+                     (msgClean.includes("reliable") && msgClean.includes("information"));
   const hasDietIntent = msgClean.includes("diet") || msgClean.includes("plan") || msgClean.includes("what to eat");
   const isMemory   = !hasDietIntent && MEMORY_PHRASES.some(p => msgClean.includes(p));
   // Memory update: "remove X from likes" / "delete X from dislikes"
   // isMemoryUpdate: with or without "from likes/dislikes" suffix
-  const isMemoryUpdate =
-    /(?:remove|delete|forget) .{1,30} from (?:my )?(?:both|likes|dislikes|preferences|memory|allergies)/i.test(msgClean)
+  // Meal log deletion — distinct from preference removal. Not a supported
+  // feature via chat yet; give an honest, clear answer instead of routing
+  // this into the preference system (which produced a confusing "not found
+  // in your saved preferences" response for something that was never a
+  // preference in the first place).
+  const isMealLogDeletion = /(?:remove|delete|forget) .{1,30} from (?:my )?(?:meal|log|today|diary|intake)\b/i.test(msgClean);
+
+  const isMemoryUpdate = !isMealLogDeletion &&
+    (/(?:remove|delete|forget) .{1,30} from (?:my )?(?:both|likes|dislikes|preferences|memory|allergies)/i.test(msgClean)
     || /(?:i no longer|i don.?t anymore|forget that i) (?:like|dislike|hate|love) .{1,30}/i.test(msgClean)
     || /^add .{1,30} (?:to|in) (?:my )?(?:likes|dislikes|preferences|allergies)/i.test(msgClean)
     // "remove X" alone — handler verifies the item against saved facts (honest no-op if absent)
-    || /^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean);
+    || /^(?:remove|delete) [a-z][a-z\s]{1,30}$/.test(msgClean));
 
   // Profile field updates via chat: "my age is 20", "update my height to 175",
   // "i am 20 years old" — a real functionality gap found in production (these
@@ -2588,6 +2612,31 @@ app.post("/agent/message", async (c) => {
     });
   };
 
+  // ── CRITICAL SAFETY CHECK — runs before every other preflight ──────────────
+  // A medical emergency must NEVER be met with "sorry, out of my expertise."
+  // Found via a simulated snake bite / dizziness / near-fainting sequence that
+  // got flatly rejected 5 times in a row — not acceptable under any
+  // circumstance, even for an app that isn't a medical service. Always
+  // directs to real emergency services, never tries to be clever about it.
+  const EMERGENCY_PATTERNS = [
+    /snake\s*bit/i, /dog\s*bit/i, /animal\s*bit/i, /bitten by/i,
+    /can'?t breathe/i, /cant breathe/i, /difficulty breathing/i, /chest pain/i,
+    /unconscious/i, /passed? out/i, /passing out/i, /losing consciousness/i,
+    /(?:going to|gonna|about to) pass out/i, /feel(?:ing)? dizz(?:y|iness)/i,
+    /severe bleeding/i, /bleeding a lot/i, /won'?t stop bleeding/i,
+    /suicid/i, /kill myself/i, /overdose/i, /poison(?:ed|ing)?\b/i,
+    /seizure/i, /convulsion/i, /can'?t move (?:my|his|her)/i,
+    /allergic reaction/i, /throat (?:is )?closing/i, /anaphyla/i,
+    /emergency\b/i, /call.{0,10}ambulance/i, /(?:please )?help me fast/i,
+    /don'?t have much time/i, /i (?:am|'m) dying/i, /going to die/i,
+  ];
+  if (EMERGENCY_PATTERNS.some(p => p.test(message))) {
+    return respond(
+      "🚨 This sounds like it could be a medical emergency. Please call emergency services right now — **112** (India's national emergency number) or **108** (ambulance) — or get to the nearest hospital immediately. I'm a nutrition assistant and I'm not equipped to help with an emergency; please don't wait on me, get real help now.",
+      "emergency_redirect"
+    );
+  }
+
   if (isGreeting) {
     const name = profile?.name;
     const factsPreview = userFacts.dislikes.length > 0
@@ -2615,6 +2664,27 @@ app.post("/agent/message", async (c) => {
       ? `You have **${currentItem.name}** selected. Did you want to know something specific about it? Try: "Tell me about ${currentItem.name}" or "Should I eat ${currentItem.name}?"`
       : `I'm not sure what you're referring to. You can ask me about a food, request a diet plan, or compare two foods. Try: "Tell me about guava" or "Build my day plan".`;
     return respond(msg, "clarification", { used_selected_item: !!currentItem });
+  }
+
+  // ── Meal log deletion — honest limitation, not routed into preferences ──
+  if (isMealLogDeletion) {
+    return respond(
+      "I can't remove individual items from your meal log via chat yet — that's a feature I don't have built. If you logged something by mistake, it'll still count toward today's calories, but future logging won't be affected. I'll flag this as something worth adding.",
+      "clarification"
+    );
+  }
+
+  // ── Concise-feedback handler ─────────────────────────────────────────────
+  if (isConciseFeedback) {
+    return respond("Got it — I'll keep it short. Go ahead and ask.", "clarification");
+  }
+
+  // ── Low mood — brief warmth, not a cold rejection ───────────────────────
+  if (/^i (?:am|'m) feeling (?:low|down|sad|blue)\b/.test(msgClean) || msgClean === "i feel low" || msgClean === "feeling low") {
+    return respond(
+      "Sorry you're feeling that way. I'm just a nutrition assistant so I can't help much with how you're feeling emotionally, but if it helps — some foods (like those rich in B vitamins, omega-3s, or just staying hydrated and eating regularly) can support energy and mood. If this feeling sticks around, it might help to talk to someone you trust or a professional. Let me know if you'd like some food suggestions in the meantime.",
+      "wellbeing_note"
+    );
   }
 
   // ── Frustration handler ────────────────────────────────────────────────────
@@ -3035,9 +3105,13 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         || m.includes("how to use") || m.includes("recipes with") || m.includes("recipe for")
         || m.includes("easy to digest") || m.includes("hard to digest")
         || m.includes("can i eat it") || m.includes("should i eat it")
+        || /use .{1,20} for\b/.test(m) || /eat .{1,20} with\b/.test(m) || /dish(?:es)? .{0,15}(?:with|using|from)\b/.test(m)
+        || (m.includes("make with it") || m.includes("eat it with") || m.includes("use it for"))
       ))
       // Also catch: "uses of X" / "benefits of X" / "dishes with X" without pre-matched foodInMsg
       || (/(?:uses?|benefits?|dishes?|recipes?) (?:of|with|for) ([a-z]{3,20})/.test(m) && !foodInMsg)
+      // Pronoun-referring recipe questions ("what dish can I make with it") when there's a selected item in context
+      || (!!currentItem && /\bit\b/.test(m) && /(?:dish|recipe|make|cook|use|eat)/.test(m))
     );
 
     const wantsNutrientSources = !wantsIntake && !isPlanReq && (
@@ -3095,7 +3169,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
     // This is what lets "vomit", "puking", "loose motions", "migraine" etc.
     // all resolve correctly instead of only the exact dictionary word.
     const SYMPTOM_ALIASES: Record<string,string> = {
-      "vomit":"vomiting","vomitted":"vomiting","vomitting":"vomiting","puking":"vomiting",
+      "vomit":"vomiting","vomitted":"vomiting","vomitting":"vomiting","vomited":"vomiting","puking":"vomiting",
       "throwing up":"vomiting","throw up":"vomiting","nausea":"vomiting","nauseous":"vomiting",
       "loose motions":"diarrhea","loose motion":"diarrhea","loose stomach":"diarrhea",
       "running stomach":"diarrhea","upset stomach":"diarrhea",
@@ -3124,6 +3198,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
         || normM.includes("do if") || normM.includes("problem") || normM.includes("issue")
         || normM.includes("help") || normM.includes("cure") || normM.includes("remedy")
         || normM.includes("down with") || normM.includes("what to do") || normM.includes("i feel")
+        || normM.includes("i am feeling") || normM.includes("i'm feeling") || normM.includes("feeling like")
         || normM.includes("having");
     }) ?? null;
 
@@ -3587,6 +3662,15 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         if (loggedNames.length > 0) finalResponse += `\n\n✅ Logged: ${loggedNames.join(", ")}.`;
         else if (logFailed) finalResponse += `\n\n⚠️ I analysed this, but couldn't save it to your log — please try logging it again in a moment.`;
 
+        // SAFETY: warn if any logged food is a recorded allergen — this must
+        // never be silent. "I ate peanuts by mistake, what should I do?" was
+        // previously just logged nutritionally with no acknowledgment at all.
+        const eatenAllergens = foodsWithAmt
+          .map(f => f.name)
+          .filter(name => userFacts.allergies.some(a => name.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(name.toLowerCase())));
+        if (eatenAllergens.length > 0) {
+          finalResponse += `\n\n⚠️ **Important:** ${eatenAllergens.join(", ")} is on your recorded allergy list. If you're having any reaction (itching, swelling, difficulty breathing, hives), please seek medical attention or call emergency services (112/108) right away — don't wait. If you feel fine, keep an eye on yourself for the next hour, since some reactions are delayed.`;
+        }
         // Session memory
         try {
           const smKey = `session_summary:${sessionId}`;
@@ -3768,6 +3852,8 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         "sleep","stress","mental","gut","stomach","liver","kidney","heart",
         "lung","skin","hair","eye","cancer","infection","fever","cold","cough",
         "nose","throat","ear","blocked","congestion","runny","sneeze","allergic reaction",
+        "sick","unwell","not feeling well","reliable","expert",
+        "alcohol","wine","beer","whiskey","liquor","smoking","tobacco","cigarette",
       ];
       const isInDomain = IN_DOMAIN_SIGNALS.some(k => m.includes(k))
         || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);

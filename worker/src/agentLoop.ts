@@ -249,7 +249,10 @@ async function executeAgentTool(name: string, args: any, ctx: AgentContext): Pro
           analysis = await toolAnalyzeIntake(ctx.db, logged, ctx.profile, foods.filter(f => logged.includes(f.name)).map(f => f.amount_g ?? 100));
         } catch { /* non-fatal — logging itself already succeeded */ }
       }
-      return { result: { logged, not_found: failed, analysis }, toolLabel: "log_meal" };
+      const allergensEaten = logged.filter(name =>
+        ctx.userFacts.allergies.some(a => name.toLowerCase().includes(a.toLowerCase()) || a.toLowerCase().includes(name.toLowerCase()))
+      );
+      return { result: { logged, not_found: failed, analysis, allergy_warning: allergensEaten.length > 0 ? `SAFETY ALERT: ${allergensEaten.join(", ")} is a recorded allergen for this user — you MUST prominently warn them and advise seeking medical attention if they have any reaction, in your response.` : null }, toolLabel: "log_meal" };
     }
     case "get_today_intake": {
       const today = getISTDateString();
@@ -326,13 +329,14 @@ What you know about this user: ${facts || "nothing yet"}.
 
 CRITICAL RULES:
 1. GROUNDING: Never state a specific nutrient value, calorie count, or seasonal fact from memory — always call the relevant tool first. If a tool returns "not found", say so honestly; do not invent data.
-2. SAFETY: Before recommending any specific food, call check_food_safety if you're not certain it's outside the user's allergies/dislikes listed above. Never recommend an allergen.
+2. SAFETY: Before recommending any specific food, call check_food_safety if you're not certain it's outside the user's allergies/dislikes listed above. Never recommend an allergen. If any tool result includes an "allergy_warning" field, you MUST address it prominently and immediately in your response — this is never optional or skippable, even if the user's message was about something else.
 3. DIRECTNESS: Answer exactly what was asked. If asked "can I eat X and Y together", give a direct yes/no/generally-fine answer with brief reasoning — do not dump one food's nutrient profile instead. If asked a yes/no question, lead with the answer.
 3b. PRECISION: When comparing foods or citing a nutrient value, include the actual number and unit from the tool result (e.g. "Mango has 36mg Vitamin C vs Banana's 8mg") — not just qualitative language like "mango has more". The exact numbers are the whole point of a comparison.
 4. LOGGING: If the user reports eating/drinking something, call log_meal — don't just acknowledge it in text.
-5. MEDICAL DISCLAIMER: For any medical condition, symptom, or "should I consult a doctor" question, give helpful nutrition-relevant guidance AND naturally include that you're an AI nutrition assistant, not a doctor, and they should consult a healthcare professional for diagnosis or treatment.
-6. TOOLS ARE FOR FOOD ANSWERS: Do not call a tool for greetings, thanks, or identity questions — just respond naturally and briefly.
-7. Keep answers concise and conversational — this is a chat, not a report. Use **bold** for food/nutrient names.`;
+5. MEDICAL DISCLAIMER — ONLY when actually warranted: add the "I'm an AI nutrition assistant, not a doctor, please consult a healthcare professional" note ONLY for questions about a specific medical condition/diagnosis, a symptom needing treatment, medication interactions, or an explicit "should I see a doctor" question. Do NOT add it for routine food questions like "is X good for health", "are green vegetables healthy", "is alcohol okay to drink" — these get a normal, direct, grounded answer with no disclaimer at all. Over-using the disclaimer on ordinary food questions is a real problem users have complained about — treat it as the exception, not the default.
+6. INDEPENDENCE: Treat each new message as its own question. Do not carry over or repeat phrasing, disclaimers, or topics from your previous answer unless the new question is actually about the same thing. If the topic changed (e.g. previous question was about alcohol, this one is about vegetables), answer ONLY the new question — never reference the old topic.
+7. TOOLS ARE FOR FOOD ANSWERS: Do not call a tool for greetings, thanks, or identity questions — just respond naturally and briefly.
+8. Keep answers concise and conversational — this is a chat, not a report. Use **bold** for food/nutrient names.`;
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
