@@ -13,40 +13,14 @@ import logo from "../components/layout/logo.png";
 import type { Item } from "../types/item";
 import type { SeasonKey } from "../types/season";
 import { API_BASE_URL } from "../api/config";
+import { apiFetch } from "../api/apiFetch";
 
-const PROFILE_KEY = "nutrimentor-profile-id";
-const AUTH_TOKEN_KEY = "nutrimentor-auth-token";
-
-function getProfileId(): string {
-  let id = localStorage.getItem(PROFILE_KEY);
-  if (!id) { id = crypto.randomUUID().replace(/-/g, ""); localStorage.setItem(PROFILE_KEY, id); }
-  return id;
-}
-
-// Called once synchronously during Home's lazy useState initializer — before
-// any render, so the profile_id and auth_token from the OAuth redirect are
-// captured and persisted before the first data fetch runs.
-// Returns the initial tab to open (defaults to "foods", overridden to
-// "settings" when the backend callback includes ?tab=settings).
-function consumeAuthRedirectAndGetInitialTab(): string {
-  const params = new URLSearchParams(window.location.search);
-  const token          = params.get("auth_token");
-  const returnedProfile = params.get("profile_id");
-  const tab            = params.get("tab");
-  const hasRedirectParams = !!(token || params.get("auth_error"));
-
-  if (token && returnedProfile) {
-    localStorage.setItem(AUTH_TOKEN_KEY, token);
-    localStorage.setItem(PROFILE_KEY, returnedProfile);
-  }
-  if (hasRedirectParams) {
-    // Clean the URL so the params don't persist on refresh
-    ["auth_token", "profile_id", "tab", "auth_error"].forEach(k => params.delete(k));
-    const clean = params.toString();
-    window.history.replaceState({}, "", window.location.pathname + (clean ? `?${clean}` : ""));
-  }
-  return tab ?? "foods";
-}
+// AUTH (2026-08-23): profileId and initialTab now come from AuthGate, which
+// has already confirmed a valid session before this component ever mounts.
+// The old getProfileId() (generate a random guest id if none exists) and
+// consumeAuthRedirectAndGetInitialTab() are removed — there's no more guest
+// mode to fall back to, and the redirect is consumed once, earlier, in
+// AuthGate, before the sign-in-vs-app decision is even made.
 
 function getISTGreeting(): string {
   const h = new Date(Date.now() + 5.5 * 60 * 60 * 1000).getUTCHours();
@@ -99,13 +73,11 @@ interface SeasonTransition {
   journal?: { title: string; description: string; eat_more: string; avoid: string; dosha?: string; };
 }
 
-export default function Home() {
-  const profileId = useMemo(() => getProfileId(), []);
-
+export default function Home({ profileId, initialTab }: { profileId: string; initialTab: string }) {
   const [season, setSeason]       = useState<SeasonKey>("all");
   const [selected, setSelected]   = useState<Item | null>(null);
   const [light, setLight]         = useState(false);
-  const [activeTab, setActiveTab] = useState<string>(() => consumeAuthRedirectAndGetInitialTab());
+  const [activeTab, setActiveTab] = useState<string>(initialTab);
   const [showAvatar, setShowAvatar] = useState(false);
   const [pendingMsg, setPendingMsg] = useState<string | null>(null);
   const [morning, setMorning]     = useState<MorningInsight | null>(null);
@@ -126,7 +98,7 @@ export default function Home() {
   useEffect(() => {
     const today = new Date().toISOString().split("T")[0];
     if (localStorage.getItem(`nm-morning-${today}`)) return;
-    fetch(`${API_BASE_URL}/agent/morning/${profileId}`)
+    apiFetch(`${API_BASE_URL}/agent/morning/${profileId}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (d?.insights?.length) setMorning(d); })
       .catch(() => {});
@@ -135,7 +107,7 @@ export default function Home() {
   // Season transition
   useEffect(() => {
     const lastFrom = localStorage.getItem("nm-season-transition-from");
-    fetch(`${API_BASE_URL}/agent/season-check/${profileId}`)
+    apiFetch(`${API_BASE_URL}/agent/season-check/${profileId}`)
       .then(r => r.ok ? r.json() : null)
       .then((d: SeasonTransition | null) => {
         if (d?.changed && d.from && d.to && lastFrom !== d.from) setSeasonTransition(d);
@@ -274,7 +246,7 @@ export default function Home() {
 
     // ── SETTINGS (live) ──
     if (activeTab === "settings") {
-      return <SettingsPage />;
+      return <SettingsPage profileId={profileId} />;
     }
 
     // ── COMING SOON (none currently) ──
@@ -384,6 +356,7 @@ export default function Home() {
           </div>
         )}
         <ChatBox
+          profileId={profileId}
           selectedItem={selected}
           season={season}
           onClearSelectedItem={() => setSelected(null)}

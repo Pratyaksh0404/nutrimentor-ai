@@ -14,16 +14,6 @@ import type {
 } from "../types/chat";
 import type { Item } from "../types/item";
 
-const PROFILE_KEY = "nutrimentor-profile-id";
-
-function getOrCreateProfileId(): string {
-  let id = window.localStorage.getItem(PROFILE_KEY);
-  if (!id) {
-    id = crypto.randomUUID().replace(/-/g, "");
-    window.localStorage.setItem(PROFILE_KEY, id);
-  }
-  return id;
-}
 
 function inferPendingState(message: string): AgentState {
   const m = message.toLowerCase();
@@ -34,12 +24,13 @@ function inferPendingState(message: string): AgentState {
 }
 
 interface UseChatOptions {
+  profileId: string;
   selectedItem: Item | null;
   season: string;
   profile: AgentProfile;
 }
 
-export function useChat({ selectedItem, season, profile }: UseChatOptions) {
+export function useChat({ profileId, selectedItem, season, profile }: UseChatOptions) {
   const [messages, setMessages]     = useState<AgentMessageType[]>([]);
   const [loading, setLoading]       = useState(false);
   const [agentState, setAgentState] = useState<AgentState>("idle");
@@ -49,8 +40,6 @@ export function useChat({ selectedItem, season, profile }: UseChatOptions) {
   const sessionIdRef       = useRef<string | null>(null);
   const loadedSessionRef   = useRef<string | null>(null);
   const prevSelectedItemId = useRef<number | null>(selectedItem?.id ?? null);
-
-  const profileId = useMemo(() => getOrCreateProfileId(), []);
 
   const LAST_SESSION_KEY = "nm-last-session";
 

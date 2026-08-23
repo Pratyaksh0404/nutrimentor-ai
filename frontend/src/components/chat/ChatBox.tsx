@@ -5,15 +5,16 @@ import FeedbackModal from "../footer/FeedbackModal";
 import type { AgentPanelProps, AgentProfile } from "../../types/chat";
 import { generateDietPDF } from "../../utils/generateDietPDF";
 import { API_BASE_URL } from "../../api/config";
+import { apiFetch } from "../../api/apiFetch";
 
-const PROFILE_ID_KEY = "nutrimentor-profile-id";
 const DEF: AgentProfile = { allergies: [], health_cautions: [] };
 
-function getProfileId(): string {
-  let id = localStorage.getItem(PROFILE_ID_KEY);
-  if (!id) { id = crypto.randomUUID(); localStorage.setItem(PROFILE_ID_KEY, id); }
-  return id;
-}
+// AUTH (2026-08-23): removed the local getProfileId() (generate a random
+// guest id if localStorage was empty) — it happened to still "work" post-gate
+// only because AuthGate already writes the real profile_id under the same
+// localStorage key before this ever mounts, but it was a silent duplicate of
+// logic that now lives in exactly one place (AuthGate). profileId comes in
+// as a prop instead, same pattern as SettingsPage.
 
 function bmi(p: AgentProfile): string | null {
   if (!p.height_cm || !p.weight_kg) return null;
@@ -58,11 +59,12 @@ function fmtTime(raw: string): string {
 }
 
 interface ExtProps extends AgentPanelProps {
+  profileId: string;
   pendingMessage?: string | null;
   onPendingMessageSent?: () => void;
 }
 
-export default function ChatBox({ selectedItem, season, onClearSelectedItem, pendingMessage, onPendingMessageSent }: ExtProps) {
+export default function ChatBox({ profileId, selectedItem, season, onClearSelectedItem, pendingMessage, onPendingMessageSent }: ExtProps) {
   const [input,    setInput]    = useState("");
   const [profile,  setProfile]  = useState<AgentProfile>(DEF);
   const [showProf, setShowProf] = useState(false);
@@ -73,9 +75,15 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
   const msgRef  = useRef<HTMLDivElement>(null);
   const inpRef  = useRef<HTMLTextAreaElement>(null);
 
+  // NOTE: useChat.ts (not in hand yet) makes the actual /agent/message,
+  // /agent/sessions, and /agent/context/* calls — those are the ones that
+  // matter most for auth, since chat is the app's core feature. Passing
+  // profileId through here in case useChat needs it directly; either way,
+  // useChat's own fetch/client calls to those now-gated endpoints need to
+  // send the auth token, the same way apiFetch does here.
   const { messages, loading, agentState, sessionId, sessions,
           starterPrompts, sendMessage, continueSession, clearContext, startNewChat }
-    = useChat({ selectedItem, season, profile });
+    = useChat({ profileId, selectedItem, season, profile });
 
   // Profile is READ-ONLY here — Settings is the single place to edit it.
   // Previously this component kept its own editable copy in a separate
@@ -84,12 +92,12 @@ export default function ChatBox({ selectedItem, season, onClearSelectedItem, pen
   // displays whatever the backend has (same source Settings writes to).
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_BASE_URL}/profile/${getProfileId()}`)
+    apiFetch(`${API_BASE_URL}/profile/${profileId}`)
       .then(r => r.ok ? r.json() : null)
       .then(p => { if (!cancelled && p) setProfile(prev => ({ ...prev, ...p })); })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, []);
+  }, [profileId]);
 
   useEffect(() => { const el = msgRef.current; if (el) el.scrollTop = el.scrollHeight; }, [messages, loading]);
 

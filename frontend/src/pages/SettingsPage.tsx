@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { API_BASE_URL } from "../api/config";
+import { apiFetch } from "../api/apiFetch";
 
 // ── Settings — profile editing, preferences, clear memory ────────────────────
 // Backed by existing endpoints: GET/POST /profile/:id, GET/DELETE /facts/:id,
@@ -28,20 +29,13 @@ const ACTIVITY_LEVELS = ["sedentary", "light", "moderate", "active", "very activ
 const DIETARY_PREFS = ["vegetarian", "non-vegetarian", "vegan", "jain"];
 const AUTH_TOKEN_KEY = "nutrimentor-auth-token";
 
-function getProfileId(): string {
-  let id = localStorage.getItem("nutrimentor-profile-id");
-  if (!id) {
-    id = crypto.randomUUID();
-    localStorage.setItem("nutrimentor-profile-id", id);
-  }
-  return id;
-}
-
-export default function SettingsPage() {
-  // By the time this component mounts, Home.tsx has already consumed the
-  // OAuth redirect params and persisted auth_token + profile_id to
-  // localStorage — so getProfileId() returns the correct post-login value.
-  const profileId = getProfileId();
+export default function SettingsPage({ profileId }: { profileId: string }) {
+  // AUTH (2026-08-23): profileId is now a verified prop from AuthGate — you
+  // cannot reach this component without a confirmed session, so the old
+  // "check auth status, show sign-in-or-out UI accordingly" logic is
+  // simplified to just: show account info, offer sign-out. The sign-in
+  // button that used to live here is now unreachable code — AuthGate handles
+  // sign-in before anything past it, including this page, can render.
 
   const [profile, setProfile]   = useState<ProfileData>({});
   const [facts, setFacts]       = useState<Fact[]>([]);
@@ -53,9 +47,9 @@ export default function SettingsPage() {
   const [error, setError]       = useState<string | null>(null);
   const [authInfo, setAuthInfo] = useState<{ authenticated: boolean; email?: string; name?: string; avatar_url?: string } | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [authRedirectError] = useState<string | null>(null);
 
-  // Check current auth status (redirect params already consumed by Home.tsx before this mounted)
+  // Account info for display only (name/email/avatar) — auth itself is
+  // already confirmed by the time this component exists.
   useEffect(() => {
     const token = localStorage.getItem(AUTH_TOKEN_KEY);
     if (!token) { setAuthLoading(false); return; }
@@ -69,11 +63,6 @@ export default function SettingsPage() {
     return () => { cancelled = true; };
   }, []);
 
-  function signInWithGoogle() {
-    const currentId = getProfileId();
-    window.location.href = `${API_BASE_URL}/auth/google/start?profile_id=${encodeURIComponent(currentId)}`;
-  }
-
   async function signOut() {
     const token = localStorage.getItem(AUTH_TOKEN_KEY);
     if (token) {
@@ -83,14 +72,18 @@ export default function SettingsPage() {
       }).catch(() => {});
     }
     localStorage.removeItem(AUTH_TOKEN_KEY);
-    setAuthInfo({ authenticated: false });
+    localStorage.removeItem("nutrimentor-profile-id");
+    // Full reload, not just state — AuthGate needs to re-mount from scratch
+    // and show the sign-in screen; there's no "signed out but still viewing
+    // the app" state anymore.
+    window.location.href = "/";
   }
 
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      fetch(`${API_BASE_URL}/profile/${profileId}`).then(r => r.ok ? r.json() : null),
-      fetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.ok ? r.json() : []),
+      apiFetch(`${API_BASE_URL}/profile/${profileId}`).then(r => r.ok ? r.json() : null),
+      apiFetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.ok ? r.json() : []),
     ])
       .then(([p, f]) => {
         if (cancelled) return;
@@ -106,7 +99,7 @@ export default function SettingsPage() {
   async function saveProfile() {
     setSaving(true);
     try {
-      const res = await fetch(`${API_BASE_URL}/profile/${profileId}`, {
+      const res = await apiFetch(`${API_BASE_URL}/profile/${profileId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(profile),
@@ -124,14 +117,14 @@ export default function SettingsPage() {
   async function removeFact(f: Fact) {
     setFacts(prev => prev.filter(x => !(x.fact_type === f.fact_type && x.fact_key === f.fact_key)));
     try {
-      await fetch(`${API_BASE_URL}/facts/${profileId}`, {
+      await apiFetch(`${API_BASE_URL}/facts/${profileId}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fact_type: f.fact_type, fact_key: f.fact_key }),
       });
     } catch {
       // Re-fetch on failure to avoid a stale/incorrect UI state
-      fetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.json()).then(setFacts).catch(() => {});
+      apiFetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.json()).then(setFacts).catch(() => {});
     }
   }
 
@@ -139,7 +132,7 @@ export default function SettingsPage() {
     const key = rawKey.trim().toLowerCase();
     if (!key) return;
     try {
-      const res = await fetch(`${API_BASE_URL}/facts/${profileId}`, {
+      const res = await apiFetch(`${API_BASE_URL}/facts/${profileId}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fact_type, fact_key: key }),
@@ -149,7 +142,7 @@ export default function SettingsPage() {
       // Server normalises the key (alias map) — use its answer, and dedupe
       // against anything already in state (mutual-exclusion may have removed
       // a matching row from the opposite bucket too, so just re-fetch clean).
-      const refreshed = await fetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.json());
+      const refreshed = await apiFetch(`${API_BASE_URL}/facts/${profileId}`).then(r => r.json());
       setFacts(Array.isArray(refreshed) ? refreshed : []);
       return fact_key;
     } catch {
@@ -160,7 +153,7 @@ export default function SettingsPage() {
   async function clearAllMemory() {
     setClearing(true);
     try {
-      await fetch(`${API_BASE_URL}/facts/${profileId}/all`, { method: "DELETE" });
+      await apiFetch(`${API_BASE_URL}/facts/${profileId}/all`, { method: "DELETE" });
       setFacts([]);
       setConfirmClear(false);
     } catch {
@@ -193,16 +186,8 @@ export default function SettingsPage() {
     <div style={{ maxWidth: 640, margin: "0 auto", padding: "20px 16px 40px" }}>
       <h2 style={{ margin: "0 0 4px", fontSize: 22 }}>⚙️ Settings</h2>
       <p style={{ margin: "0 0 20px", fontSize: 13, opacity: 0.65 }}>
-        {authInfo?.authenticated
-          ? "Profile, preferences, and memory — synced to your Google account."
-          : "Profile, preferences, and memory — stored locally to this device (guest mode)."}
+        Profile, preferences, and memory — synced to your Google account.
       </p>
-
-      {authRedirectError && (
-        <div style={{ background: "#f8717120", border: "1px solid #f8717150", borderRadius: 10, padding: 10, marginBottom: 14, fontSize: 13 }}>
-          Sign-in didn't complete ({authRedirectError.replace(/_/g, " ")}). Please try again.
-        </div>
-      )}
 
       {/* ── Account ── */}
       <div style={{ background: "var(--bg-card, #1e3a28)", borderRadius: 14, padding: 18, marginBottom: 14 }}>
@@ -226,25 +211,18 @@ export default function SettingsPage() {
             </button>
           </div>
         ) : (
-          <div>
-            <p style={{ fontSize: 12, opacity: 0.65, margin: "0 0 10px" }}>
-              You're using guest mode — your data stays on this device only. Sign in to sync across devices.
-            </p>
+          // You reached this page via AuthGate, which already confirmed a
+          // session — this branch is only the display-info call failing
+          // separately (e.g. a flaky request), not "not signed in." A hard
+          // reload re-runs AuthGate's own check rather than duplicating a
+          // second sign-in flow here.
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+            <p style={{ fontSize: 12, opacity: 0.65, margin: 0 }}>Couldn't load account details.</p>
             <button
-              type="button" onClick={signInWithGoogle}
-              style={{
-                display: "flex", alignItems: "center", gap: 8, padding: "8px 16px", borderRadius: 8,
-                border: "1px solid var(--bg-panel, #13261d)", background: "#fff", color: "#1a1a1a",
-                fontSize: 13, fontWeight: 600, cursor: "pointer",
-              }}
+              type="button" onClick={() => window.location.reload()}
+              style={{ padding: "6px 14px", borderRadius: 8, border: "1px solid var(--bg-panel, #13261d)", background: "transparent", color: "inherit", fontSize: 12, cursor: "pointer" }}
             >
-              <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true">
-                <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.3 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.3-.1-2.7-.4-3.5z"/>
-                <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.5 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3c-7.7 0-14.4 4.4-17.7 10.7z"/>
-                <path fill="#4CAF50" d="M24 45c5.5 0 10.4-1.9 14.3-5.1l-6.6-5.6c-2.1 1.5-4.8 2.4-7.7 2.4-5.3 0-9.7-3.3-11.3-8l-6.6 5.1C9.5 40.5 16.2 45 24 45z"/>
-                <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.3 4.3-4.2 5.7l6.6 5.6C41.5 36.2 45 30.7 45 24c0-1.3-.1-2.7-.4-3.5z"/>
-              </svg>
-              Sign in with Google
+              Retry
             </button>
           </div>
         )}

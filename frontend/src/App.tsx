@@ -1,5 +1,5 @@
-import Home from "./pages/Home";
+import AuthGate from "./pages/AuthGate";
 
 export default function App() {
-  return <Home />;
+  return <AuthGate />;
 }
