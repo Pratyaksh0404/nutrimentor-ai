@@ -1,0 +1,158 @@
+[
+  {
+    "id": "food-kiwi",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Kiwi (kiwifruit) is a small fruit notable for being one of the richest common fruit sources of Vitamin C, generally exceeding oranges per 100g, alongside a meaningful amount of Vitamin K and dietary fibre. It also contains actinidin, an enzyme that can help digest protein, which is part of why kiwi is sometimes used as a meat tenderiser and is traditionally eaten after protein-heavy meals in some cuisines. It is low in calories and has a low glycemic index, making it a reasonable fruit choice for people monitoring blood sugar, though portion and overall meal composition still matter."
+  },
+  {
+    "id": "food-dragon-fruit",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Dragon fruit (pitaya) is a low-calorie, high-water-content fruit with a mild sweetness. It provides a modest amount of Vitamin C, magnesium, and iron, and the seeds contribute a small amount of healthy fats and fibre. The red-fleshed variety contains betacyanins, plant pigments with antioxidant properties. It has a relatively low glycemic index compared to many other fruits, making it generally suitable in moderate portions for people managing blood sugar, though it should not be treated as a substitute for medical dietary guidance for diabetes."
+  },
+  {
+    "id": "food-quinoa",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Quinoa is a seed typically prepared and eaten like a grain. Unlike most plant foods, it is a complete protein — it contains all nine essential amino acids — which makes it notable for vegetarian and vegan diets. It is naturally gluten-free, has a lower glycemic index than white rice, and is a good source of fibre, magnesium, iron, and manganese. It is commonly eaten at breakfast (as a porridge or mixed with fruit) or as a rice substitute at lunch/dinner; both uses are nutritionally reasonable."
+  },
+  {
+    "id": "food-avocado",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Avocado is unusual among fruits for being high in fat — predominantly monounsaturated fat, the same type found in olive oil, which is associated with favourable cholesterol profiles when it replaces saturated fat in the diet. It is calorie-dense (roughly 160 kcal per 100g) but nutrient-rich, providing potassium (more per 100g than a banana), fibre, Vitamin E, and folate. Because of its calorie density, portion control matters more for avocado than for most fruits if the goal is weight management."
+  },
+  {
+    "id": "food-chia-seeds",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Chia seeds are very small seeds notable for their fibre content (both soluble and insoluble) and plant-based omega-3 fatty acids (as ALA). They absorb roughly 10 times their weight in liquid, forming a gel — this is why they are used in puddings and as an egg substitute in baking. A small serving (about 1 tablespoon) provides a meaningful fibre contribution, which can help with satiety and digestive regularity. They have no strong flavour, so they are typically mixed into curd, smoothies, or soaked overnight rather than eaten alone."
+  },
+  {
+    "id": "food-broccoli",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Broccoli is a cruciferous vegetable, a family (also including cabbage, cauliflower, and mustard greens) associated with sulforaphane and other glucosinolate compounds under active nutrition research for their antioxidant properties. It is a strong source of Vitamin C and Vitamin K, provides fibre and folate, and is low in calories. Lightly steaming rather than boiling for a long time better preserves its Vitamin C content, since Vitamin C is water-soluble and heat-sensitive."
+  },
+  {
+    "id": "ayurveda-dosha-overview",
+    "category": "ayurveda_concept",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "In Ayurveda, dosha refers to three fundamental bodily energies or constitutional types: Vata (associated with air/space — movement, dryness, lightness), Pitta (associated with fire/water — metabolism, heat, transformation), and Kapha (associated with earth/water — structure, stability, heaviness). Every person is considered to have a unique combination of all three (their prakriti, or constitution), usually with one or two dominant. Dietary recommendations in this system are often given relative to which dosha needs balancing — for example, cooling foods to pacify excess Pitta, or warm/grounding foods to pacify excess Vata. This is a traditional framework, not a clinically validated diagnostic system, and dosha-based advice should be treated as a wellness lens rather than a substitute for medical nutrition therapy."
+  },
+  {
+    "id": "ayurveda-agni",
+    "category": "ayurveda_concept",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Agni, in Ayurveda, refers to digestive fire — the body's capacity to digest, absorb, and metabolise food. Strong, balanced agni is considered central to good health; weak or irregular agni is traditionally associated with symptoms like bloating, sluggish digestion, or low energy after meals. Practices traditionally recommended to support agni include eating meals at consistent times, favouring warm/cooked food over cold or raw food (especially for those with weaker digestion), not overeating, and allowing adequate time between meals rather than constant snacking. This is a traditional wellness concept and does not replace medical evaluation for persistent digestive symptoms."
+  },
+  {
+    "id": "ayurveda-ritu-charya",
+    "category": "ayurveda_concept",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Ritucharya refers to the Ayurvedic practice of adjusting diet and lifestyle according to the season (ritu), on the principle that the body's needs and digestive capacity shift with seasonal changes in temperature, humidity, and daylight. This is the same underlying framework behind this app's six-season (Ritu) structure. Broadly: cooling, lighter foods are favoured in hot seasons; warming, heavier, more nourishing foods are favoured in cold seasons; and the monsoon season is traditionally treated as a period of weaker digestion where light, freshly cooked food is preferred over raw or heavy dishes."
+  },
+  {
+    "id": "combining-milk-citrus",
+    "category": "food_combining",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Combining milk with citrus fruits or other acidic foods (like lemon, orange, or tamarind) is traditionally discouraged in Ayurveda under the concept of viruddha ahara (incompatible food combinations), and there is also a simple physical basis often cited alongside it: the acid in citrus can curdle milk's proteins, which some people find harder to digest, potentially contributing to bloating or discomfort in sensitive individuals. This is not a medical toxicity concern for most people — it's a digestive-comfort and traditional-compatibility guideline, not a food safety rule — and tolerance varies by individual. People without digestive sensitivity to the combination generally do not need to strictly avoid it, but if bloating or discomfort follows, spacing the two apart is a reasonable adjustment."
+  },
+  {
+    "id": "combining-milk-fish",
+    "category": "food_combining",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Milk and fish together is one of the most commonly cited viruddha ahara (incompatible combination) examples in Ayurveda, traditionally believed to disturb digestion and, over habitual use, aggravate skin or metabolic issues. There is no strong modern clinical evidence establishing this as physiologically harmful for most people; it is a traditional dietary guideline rather than an established food-safety hazard. It's reasonable to mention this as a traditional caution while being clear it is not a proven medical risk."
+  },
+  {
+    "id": "combining-fruit-with-meals",
+    "category": "food_combining",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Ayurveda traditionally recommends eating fruit on its own, ideally 30-60 minutes apart from a main meal, rather than immediately alongside or after a heavy meal — the reasoning given is that fruit digests faster than other food groups, and eating it together with slower-digesting foods can lead to fermentation, bloating, or gas in sensitive individuals. This is a traditional digestive-comfort guideline; it is not a rule that fruit becomes harmful when combined with meals, and many people digest fruit with meals without any issue. It's most relevant to mention to someone who has specifically reported bloating or digestive discomfort."
+  },
+  {
+    "id": "combining-curd-at-night",
+    "category": "food_combining",
+    "source": "Classical Ayurvedic dietary principles (general knowledge synthesis)",
+    "content": "Ayurveda traditionally advises against eating curd (yogurt) at night, particularly in cooler or damp seasons, on the reasoning that it is considered heavy and mucus-forming (kapha-aggravating) and may be harder to digest when the body's digestive fire is naturally lower in the evening. This is most emphasized for people with congestion, cough, or cold symptoms, or in monsoon/winter. It is a traditional guideline rather than a universal rule — many people eat curd at dinner without issue, and its relevance is highest for someone currently dealing with respiratory or digestive symptoms."
+  },
+  {
+    "id": "condition-diabetes-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "General dietary approaches commonly recommended for blood sugar management include favouring low-glycemic-index carbohydrates (whole grains, legumes, non-starchy vegetables) over refined sugar and refined flour, spacing carbohydrate intake across the day rather than large single servings, pairing carbohydrates with protein or fibre to slow glucose absorption, and limiting sugary drinks and fruit juice in favour of whole fruit. Bitter gourd, fenugreek (methi), and cinnamon are commonly cited in general nutrition sources as traditionally associated with blood-sugar-friendly effects, though they are not a substitute for prescribed medication. Individual carbohydrate targets and medication timing should always follow a doctor's or dietitian's specific guidance rather than general information."
+  },
+  {
+    "id": "condition-hypertension-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "Dietary approaches commonly recommended for managing high blood pressure include reducing sodium intake (limiting added salt, processed and packaged foods, and pickles/papad which are often high in salt in Indian cooking), increasing potassium-rich foods (banana, spinach, sweet potato, coconut water), maintaining adequate calcium and magnesium intake, limiting alcohol, and maintaining a healthy body weight. The DASH-style pattern (vegetables, fruits, whole grains, low-fat dairy, limited red meat) is a widely referenced general framework for this. This is general guidance; specific sodium limits and medication interactions should be confirmed with a doctor, especially for someone already on blood pressure medication."
+  },
+  {
+    "id": "condition-thyroid-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "For hypothyroidism specifically, adequate iodine (iodised salt, dairy) and selenium (nuts, especially Brazil nuts, though also present in many whole foods) support thyroid hormone function, and adequate iron and zinc are also relevant since deficiencies in either can affect thyroid hormone metabolism. Cruciferous vegetables (cabbage, broccoli, cauliflower, mustard greens) contain goitrogens, compounds that can interfere with iodine uptake in very large raw quantities — but for most people, especially with these vegetables cooked (which reduces goitrogen activity) and iodine intake sufficient, this is not a practical concern and these vegetables do not need to be avoided. Thyroid medication (if prescribed) typically needs to be taken on an empty stomach separate from food, particularly calcium- or iron-rich food/supplements, per a doctor's specific instructions — this app does not have visibility into medication timing and should not attempt to advise on it."
+  },
+  {
+    "id": "condition-cholesterol-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "Dietary approaches commonly recommended for managing high cholesterol include increasing soluble fibre (oats, legumes, apples, isabgol/psyllium husk), replacing saturated fat (ghee, butter, red meat, coconut oil in large amounts) with unsaturated fat sources (nuts, seeds, fish, olive/mustard oil in moderation), and limiting trans fats (commonly found in packaged fried snacks and bakery items). Plant sterols (found in small amounts in nuts, seeds, and legumes) can modestly help. This is general guidance; specific targets (LDL, HDL, triglycerides) and whether medication is needed should be determined by a doctor based on lab results, not by diet alone."
+  },
+  {
+    "id": "science-iron-absorption",
+    "category": "nutrition_science",
+    "source": "General clinical nutrition reference",
+    "content": "Iron from plant sources (non-heme iron — found in spinach, lentils, and other legumes) is absorbed less efficiently by the body than iron from animal sources (heme iron — found in meat, fish, eggs). Pairing a non-heme iron source with a source of Vitamin C (citrus, amla, tomato, bell pepper) in the same meal significantly improves how much iron the body actually absorbs, which is why 'iron-rich foods + Vitamin C' is a commonly recommended combination for people managing low iron or anemia. Conversely, tea and coffee consumed with a meal can reduce non-heme iron absorption, so spacing them away from iron-rich meals is often recommended for someone specifically working on iron levels."
+  },
+  {
+    "id": "science-hydration-basics",
+    "category": "nutrition_science",
+    "source": "General clinical nutrition reference",
+    "content": "There is no single hydration number that applies to everyone — needs vary with body size, activity level, climate, and diet (since fruits and vegetables also contribute water). A commonly cited general reference point is roughly 2-3 litres of total fluid per day for a moderately active adult in a warm climate, but thirst, urine colour (pale yellow generally indicating adequate hydration), and activity level are more individually useful indicators than a fixed target. In hot or humid climates, or with increased physical activity, fluid and electrolyte needs (sodium, potassium) both increase — coconut water and diluted buttermilk (chaas) are commonly used in Indian dietary practice as natural electrolyte sources in hot weather."
+  },
+  {
+    "id": "science-macronutrient-basics",
+    "category": "nutrition_science",
+    "source": "General clinical nutrition reference",
+    "content": "The three macronutrients — protein, carbohydrate, and fat — each provide energy (protein and carbohydrate roughly 4 kcal/gram, fat roughly 9 kcal/gram) but serve different roles: protein supports tissue repair and satiety, carbohydrate is the body's primary quick-energy source, and fat supports hormone production, vitamin absorption (Vitamin A, D, E, K are fat-soluble), and long-duration energy. General population dietary guidelines (not a specific prescription) commonly suggest roughly 45-65% of calories from carbohydrate, 10-35% from protein, and 20-35% from fat for a healthy adult, though individual needs vary meaningfully with activity level, goals (e.g. muscle gain, weight loss), and any medical conditions — a fixed ratio is a starting reference point, not a personalised target."
+  },
+  {
+    "id": "science-fiber-gut-health",
+    "category": "nutrition_science",
+    "source": "General clinical nutrition reference",
+    "content": "Dietary fibre comes in two broad types: soluble fibre (found in oats, legumes, apples, isabgol) which dissolves in water and forms a gel that can help slow digestion and moderate blood sugar and cholesterol absorption, and insoluble fibre (found in whole grains, vegetable skins, wheat bran) which adds bulk and supports regular bowel movement. Most adults benefit from including both types across the day. Increasing fibre intake quickly, without adequate water intake alongside it, can cause bloating or discomfort — a gradual increase paired with sufficient hydration is generally better tolerated than a sudden large increase."
+  },
+  {
+    "id": "condition-pcos-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "General dietary approaches sometimes discussed for PCOS (polycystic ovary syndrome) management include favouring low-glycemic-index carbohydrates to help with insulin sensitivity, adequate protein and fibre at each meal to support satiety, regular meal timing, and limiting refined sugar and highly processed food. Some people also find reducing dairy or gluten helps their individual symptoms, though this varies significantly by person and is not a universal recommendation. PCOS management is highly individual and typically involves a doctor or endocrinologist alongside diet — this is general background information, not a personalised treatment plan."
+  },
+  {
+    "id": "condition-fatty-liver-diet",
+    "category": "condition_guidance",
+    "source": "General clinical nutrition guidance",
+    "content": "General dietary approaches commonly recommended for non-alcoholic fatty liver (NAFLD) include limiting added sugar and refined carbohydrates (a major driver of liver fat accumulation), limiting alcohol, favouring fibre-rich whole foods, and maintaining a gradual, sustainable weight loss if overweight (rapid weight loss can sometimes worsen liver fat in the short term, so gradual is generally preferred). Coffee (in moderate, non-sugared amounts) has been associated with favourable liver markers in general population studies, though this should not be read as a treatment recommendation. This is general background information — fatty liver severity and management should be assessed by a doctor, typically with blood tests and imaging."
+  },
+  {
+    "id": "food-pomegranate-detail",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Pomegranate is notable for its polyphenol antioxidant content (particularly punicalagins), which is higher than many other common fruits, alongside a good source of Vitamin C, Vitamin K, and fibre from the edible seeds (arils). It has a moderate glycemic index — lower than many tropical fruits — making it a commonly recommended fruit choice in general nutrition guidance for people monitoring blood sugar, in reasonable portions."
+  },
+  {
+    "id": "food-oats-detail",
+    "category": "food_profile",
+    "source": "General clinical nutrition reference",
+    "content": "Oats are notable for beta-glucan, a specific type of soluble fibre with well-documented cholesterol-lowering effects when consumed regularly as part of the diet. They have a relatively low glycemic index compared to many refined breakfast cereals, provide a good source of manganese and phosphorus, and their high fibre content supports satiety, making them a commonly recommended breakfast choice for both general health and specifically for people managing cholesterol or blood sugar."
+  },
+  {
+    "id": "science-sleep-nutrition-link",
+    "category": "nutrition_science",
+    "source": "General clinical nutrition reference",
+    "content": "Diet and sleep quality influence each other in both directions: poor or insufficient sleep is associated with increased hunger hormones (ghrelin) and reduced satiety hormones (leptin), which can increase appetite and cravings for high-calorie food the following day; conversely, heavy meals, caffeine, or alcohol close to bedtime can disrupt sleep quality. Magnesium-rich foods (nuts, seeds, leafy greens) and consistent meal timing are commonly mentioned in general wellness guidance as supportive of better sleep, though sleep disorders themselves need medical evaluation rather than dietary self-management alone."
+  }
+]

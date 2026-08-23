@@ -26,9 +26,12 @@ import {
   getISTDateString, applyFoodAlias, fetchGeminiWithRetry,
   SEASON_LABELS, type Profile,
 } from "./index";
+import { searchKnowledgeBase } from "./rag";
 
 export interface AgentContext {
   db: D1Database;
+  ai: Ai;
+  vectorIndex: VectorizeIndex;
   geminiKey: string;
   profileId: string;
   sessionId: string;
@@ -45,8 +48,31 @@ export interface AgentContext {
 export interface AgentResult {
   text: string;
   toolsUsed: string[];
+  citations?: string[];
   planData?: any;
   wantsPdf?: boolean;
+  failed?: false; // present so callers can discriminate AgentResult | AgentLoopFailure on `.failed`
+}
+
+// Observability (2026-08-14): the loop used to return a bare `null` on every
+// failure path — no API key, a bad Gemini response, an empty model answer,
+// hitting the round cap, or a thrown exception all looked identical to the
+// caller. That made cases like "milk and citrus" (agent loop ran, returned
+// nothing, silently fell through to the generic clarification text)
+// undiagnosable without redeploying extra logging and waiting to repro it.
+// Now every failure path reports WHY, so index.ts can log a reason instead
+// of just a symptom.
+export type AgentLoopFailureReason =
+  | "no_api_key"
+  | "gemini_http_error"
+  | "empty_model_response"
+  | "round_cap_exceeded"
+  | "exception";
+
+export interface AgentLoopFailure {
+  failed: true;
+  reason: AgentLoopFailureReason;
+  detail?: string;
 }
 
 // ── Tool declarations (Gemini function-calling schema — OpenAPI-compatible) ──
@@ -164,13 +190,22 @@ const AGENT_TOOLS = [
         description: "Get the user's BMI and estimated daily calorie target from their profile (age, sex, height, weight, activity level).",
         parameters: { type: "object", properties: {} },
       },
+      {
+        name: "search_knowledge_base",
+        description: "Search a curated knowledge base for nutrition, health, and Ayurvedic information NOT covered by the 57-food database or the other tools — general nutrition science, foods outside the tracked database (e.g. kiwi, dragon fruit), condition-specific dietary guidance, food-combination principles, and Ayurvedic concepts. Call this when the other tools don't have what's needed to answer. If it returns no results, say so honestly — do not fall back to unverified general knowledge as if it were grounded.",
+        parameters: {
+          type: "object",
+          properties: { query: { type: "string", description: "A focused search query capturing what information is needed" } },
+          required: ["query"],
+        },
+      },
     ],
   },
 ];
 
 // ── Tool dispatcher ──────────────────────────────────────────────────────────
 
-async function executeAgentTool(name: string, args: any, ctx: AgentContext): Promise<{ result: any; toolLabel: string }> {
+async function executeAgentTool(name: string, args: any, ctx: AgentContext): Promise<{ result: any; toolLabel: string; sources?: string[] }> {
   switch (name) {
     case "food_lookup": {
       const result = await toolFoodLookup(ctx.db, applyFoodAlias(String(args.name ?? "")));
@@ -302,6 +337,25 @@ async function executeAgentTool(name: string, args: any, ctx: AgentContext): Pro
       const tdee = ctx.profile ? computeTdee(ctx.profile) : null;
       return { result: { bmi: bmi?.bmi ?? null, bmi_label: bmi?.label ?? null, daily_calorie_target: tdee }, toolLabel: "get_bmi_and_calories" };
     }
+    case "search_knowledge_base": {
+      const query = String(args.query ?? "");
+      if (!query) return { result: { found: false }, toolLabel: "search_knowledge_base" };
+      const results = await searchKnowledgeBase(
+        { DB: ctx.db, AI: ctx.ai, VECTOR_INDEX: ctx.vectorIndex },
+        query, 3
+      );
+      if (results.length === 0) {
+        return { result: { found: false, note: "No relevant content in the knowledge base for this query." }, toolLabel: "search_knowledge_base" };
+      }
+      return {
+        result: {
+          found: true,
+          chunks: results.map(r => ({ content: r.content, category: r.category, source: r.source, relevance: Math.round(r.score * 100) / 100 })),
+        },
+        toolLabel: "search_knowledge_base",
+        sources: results.map(r => r.source).filter((s): s is string => !!s),
+      };
+    }
     default:
       return { result: { error: `Unknown tool: ${name}` }, toolLabel: name };
   }
@@ -324,11 +378,14 @@ function buildSystemInstruction(ctx: AgentContext): string {
 
   return `You are NutriMentor AI, a nutrition and health mentor for Indian seasonal eating (Ayurvedic Ritu system). You ONLY discuss nutrition, food, diet, and health topics — for anything else, politely redirect.
 
+Ayurvedic concepts (dosha, agni, prakriti, ritu, and similar) ARE inside your domain — they are core to this app's own framework, not an exception to it. Never decline or redirect an Ayurveda question as out-of-scope. Call search_knowledge_base and answer from what it returns; if it returns nothing relevant, say so honestly rather than declining the whole topic.
+
 Current season: ${SEASON_LABELS[ctx.currentSeason] ?? ctx.currentSeason}. Currently viewing: ${ctx.currentItemName ?? "nothing selected"}.
 What you know about this user: ${facts || "nothing yet"}.
 
 CRITICAL RULES:
-1. GROUNDING: Never state a specific nutrient value, calorie count, or seasonal fact from memory — always call the relevant tool first. If a tool returns "not found", say so honestly; do not invent data.
+1. GROUNDING: Never state a specific nutrient value, calorie count, or seasonal fact from memory — always call the relevant tool first. For a food not in the 57-food database, or a general nutrition/health/Ayurveda question the food tools can't answer, call search_knowledge_base before answering. If a tool (including search_knowledge_base) returns "not found", say so honestly — do not fall back to unverified general knowledge presented as if it were grounded fact.
+1b. CONFIDENCE CALIBRATION: search_knowledge_base results include a "relevance" score (0-1). Above ~0.75, state the answer directly. Between ~0.5-0.75 (a real but weaker match), still answer, but signal it's a general/traditional guideline rather than a precise fact — phrasing like "generally," "traditionally," or "as a general guideline" — rather than presenting a borderline match with the same confidence as an exact one.
 2. SAFETY: Before recommending any specific food, call check_food_safety if you're not certain it's outside the user's allergies/dislikes listed above. Never recommend an allergen. If any tool result includes an "allergy_warning" field, you MUST address it prominently and immediately in your response — this is never optional or skippable, even if the user's message was about something else.
 3. DIRECTNESS: Answer exactly what was asked. If asked "can I eat X and Y together", give a direct yes/no/generally-fine answer with brief reasoning — do not dump one food's nutrient profile instead. If asked a yes/no question, lead with the answer.
 3b. PRECISION: When comparing foods or citing a nutrient value, include the actual number and unit from the tool result (e.g. "Mango has 36mg Vitamin C vs Banana's 8mg") — not just qualitative language like "mango has more". The exact numbers are the whole point of a comparison.
@@ -344,8 +401,8 @@ CRITICAL RULES:
 const MAX_TOOL_ROUNDS = 3;
 const MODEL = "gemini-2.5-flash-lite";
 
-export async function runAgentLoop(message: string, ctx: AgentContext): Promise<AgentResult | null> {
-  if (!ctx.geminiKey) return null;
+export async function runAgentLoop(message: string, ctx: AgentContext): Promise<AgentResult | AgentLoopFailure> {
+  if (!ctx.geminiKey) return { failed: true, reason: "no_api_key" };
 
   const systemInstruction = { parts: [{ text: buildSystemInstruction(ctx) }] };
   const contents: any[] = [
@@ -357,6 +414,7 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
   ];
 
   const toolsUsed: string[] = [];
+  const citations: string[] = [];
   let planData: any = null;
   let wantsPdf = false;
 
@@ -371,7 +429,10 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
           generationConfig: { temperature: 0.3, maxOutputTokens: 800 },
         }
       );
-      if (!resp || !resp.ok) return null; // let the caller fall back to the deterministic router
+      if (!resp || !resp.ok) {
+        // let the caller fall back to the deterministic router — but tell it why
+        return { failed: true, reason: "gemini_http_error", detail: resp ? `HTTP ${resp.status}` : "no response object" };
+      }
 
       const data = await resp.json() as any;
       const candidate = data.candidates?.[0];
@@ -381,14 +442,27 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
       if (!functionCallPart) {
         // Model produced a final text answer — done.
         const text = parts.filter(p => p.text).map(p => p.text).join("").trim();
-        if (!text) return null;
-        return { text, toolsUsed, planData, wantsPdf };
+        if (!text) return { failed: true, reason: "empty_model_response", detail: `round ${round}, finishReason=${candidate?.finishReason ?? "unknown"}` };
+        return { text, toolsUsed, citations, planData, wantsPdf };
       }
 
       // Model wants to call a tool — execute it and feed the result back.
+      // Wrapped defensively: if ONE tool throws (a transient embedding/vector
+      // query error, for example), that must not kill the entire turn — feed
+      // the model an honest "this tool failed" result and let it continue or
+      // answer with what it has, instead of the whole response silently
+      // becoming empty and falling through to a generic static message.
       const call = functionCallPart.functionCall;
-      const { result, toolLabel } = await executeAgentTool(call.name, call.args ?? {}, ctx);
+      let result: any; let toolLabel: string; let sources: string[] | undefined;
+      try {
+        ({ result, toolLabel, sources } = await executeAgentTool(call.name, call.args ?? {}, ctx));
+      } catch (toolErr) {
+        console.error(`Tool ${call.name} failed:`, toolErr);
+        result = { error: "This tool failed to execute — try answering without it, or tell the user you don't have this information right now." };
+        toolLabel = call.name;
+      }
       if (!toolsUsed.includes(toolLabel)) toolsUsed.push(toolLabel);
+      for (const s of sources ?? []) { if (!citations.includes(s)) citations.push(s); }
 
       if (call.name === "build_diet_plan" && result && !result.error) {
         planData = result;
@@ -404,9 +478,10 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
     }
 
     // Hit the round cap without a final answer — treat as failure, fall back.
-    return null;
+    return { failed: true, reason: "round_cap_exceeded", detail: `toolsUsed=[${toolsUsed.join(",")}]` };
   } catch (err) {
-    console.error("Agent loop error:", err);
-    return null;
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ event: "agent_loop_exception", sessionId: ctx.sessionId, detail }));
+    return { failed: true, reason: "exception", detail };
   }
 }

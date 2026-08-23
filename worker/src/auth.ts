@@ -28,7 +28,7 @@ const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo";
 
 const STATE_TTL_SECONDS   = 10 * 60;              // 10 minutes to complete login
-const SESSION_TTL_SECONDS = 90 * 24 * 60 * 60;     // 90 days, matches profile KV TTL elsewhere
+const SESSION_TTL_SECONDS = 28 * 24 * 60 * 60;      // 28 days — re-authentication required after this
 
 function randomToken(): string {
   return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
@@ -172,5 +172,45 @@ authApp.post("/logout", async (c) => {
   if (token) await c.env.SESSIONS.delete(`auth_session:${token}`);
   return c.json({ ok: true });
 });
+
+// ── Auth enforcement (2026-08-23) ─────────────────────────────────────────────
+//
+// Everything below this point closes the gap between "there's a sign-in
+// screen" and "the API actually requires it." Before this, every route in
+// index.ts trusted whatever profile_id the client sent — a direct API call
+// with a made-up or guessed id could read or write that profile's data,
+// including health notes, regardless of whether the frontend showed a login
+// wall. This makes the login wall real.
+//
+// Usage in index.ts:
+//   app.post("/some/route", requireAuth, async (c) => {
+//     const profileId = c.get("authProfileId"); // verified — never trust a
+//     ...                                        // client-supplied profile_id
+//   });
+
+export async function requireAuth(c: any, next: () => Promise<void>) {
+  const token =
+    c.req.header("Authorization")?.replace(/^Bearer\s+/i, "") ??
+    c.req.query("auth_token");
+  if (!token) return c.json({ error: "Not authenticated" }, 401);
+
+  const raw = await c.env.SESSIONS.get(`auth_session:${token}`);
+  if (!raw) return c.json({ error: "Session expired or invalid — please sign in again" }, 401);
+
+  let session: any;
+  try { session = JSON.parse(raw); } catch { return c.json({ error: "Invalid session" }, 401); }
+  if (!session?.profile_id) return c.json({ error: "Invalid session" }, 401);
+
+  c.set("authProfileId", session.profile_id as string);
+  c.set("authSession", session);
+  await next();
+}
+
+// For the rare route where a client-visible id (like a chat session_id) isn't
+// itself the profile id, but still needs to be confirmed as belonging to the
+// authenticated profile before returning its data.
+export function ownsProfile(c: any, claimedProfileId: string | null | undefined): boolean {
+  return !!claimedProfileId && claimedProfileId === c.get("authProfileId");
+}
 
 export default authApp;

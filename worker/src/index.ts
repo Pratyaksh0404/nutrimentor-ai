@@ -5,6 +5,8 @@ import { cors } from "hono/cors";
 // for future use if a reliable free (or paid) inference source becomes available.
 import { runAgentLoop, type AgentContext as AgentLoopContext } from "./agentLoop";
 import authApp from "./auth";
+import { requireAuth, ownsProfile } from "./auth";
+import ragApp from "./rag_routes";
 // sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -13,11 +15,13 @@ export interface Env {
   DB: D1Database;
   SESSIONS: KVNamespace;
   AI: Ai;
+  VECTOR_INDEX: VectorizeIndex;
   GEMINI_API_KEY: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
   WORKER_URL: string;
   FRONTEND_URL: string;
+  RAG_ADMIN_KEY: string;
 }
 
 export interface Profile {
@@ -1927,6 +1931,7 @@ app.use("*", async (c, next) => {
 
 // Auth routes registered AFTER CORS middleware so they inherit CORS headers
 app.route("/auth", authApp);
+app.route("/rag", ragApp);
 
 // ── Health ────────────────────────────────────────────────────────────────────
 
@@ -1979,15 +1984,19 @@ app.get("/nutrients", async (c) => {
 
 // ── Profile ───────────────────────────────────────────────────────────────────
 
-app.get("/profile/:session_id", async (c) => {
-  const profileData = await c.env.SESSIONS.get(`profile:${c.req.param("session_id")}`);
+app.get("/profile/:session_id", requireAuth, async (c) => {
+  const sid = c.req.param("session_id");
+  if (!ownsProfile(c, sid)) return c.json({ error: "Forbidden" }, 403);
+  const profileData = await c.env.SESSIONS.get(`profile:${sid}`);
   if (!profileData) return c.json(null);
   return c.json(JSON.parse(profileData));
 });
 
-app.post("/profile/:session_id", async (c) => {
+app.post("/profile/:session_id", requireAuth, async (c) => {
+  const sid = c.req.param("session_id");
+  if (!ownsProfile(c, sid)) return c.json({ error: "Forbidden" }, 403);
   const body = await c.req.json<Profile>();
-  await c.env.SESSIONS.put(`profile:${c.req.param("session_id")}`, JSON.stringify(body), {
+  await c.env.SESSIONS.put(`profile:${sid}`, JSON.stringify(body), {
     expirationTtl: 60 * 60 * 24 * 90,
   });
   return c.json({ ok: true });
@@ -1995,9 +2004,10 @@ app.post("/profile/:session_id", async (c) => {
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
 
-app.get("/agent/sessions", async (c) => {
+app.get("/agent/sessions", requireAuth, async (c) => {
   const profileId = c.req.query("profile_id");
   const sessionId = c.req.query("session_id");
+  if (profileId && !ownsProfile(c, profileId)) return c.json({ error: "Forbidden" }, 403);
   if (!profileId && !sessionId) return c.json([]);
 
   const knownSessions: string[] = [];
@@ -2038,15 +2048,20 @@ app.get("/agent/sessions", async (c) => {
   return c.json(withMessages);
 });
 
-app.get("/agent/sessions/:id", async (c) => {
+app.get("/agent/sessions/:id", requireAuth, async (c) => {
   const sid = c.req.param("id");
   const session = await c.env.DB.prepare(`SELECT * FROM sessions WHERE id = ?1`).bind(sid).first();
   if (!session) return c.json({ error: "Not found" }, 404);
+  // If this session row is already tied to a profile, it must be THIS profile —
+  // otherwise a guessed/leaked session id could expose another user's chat history.
+  if ((session as any).profile_id && !ownsProfile(c, (session as any).profile_id)) {
+    return c.json({ error: "Forbidden" }, 403);
+  }
 
   // Register this session under the profile so it always appears in the sessions list,
   // even when the user navigates to it without sending a message.
-  const profileId = c.req.query("profile_id");
-  if (profileId && profileId !== sid) {
+  const profileId = c.get("authProfileId") as string;
+  if (profileId !== sid) {
     try {
       await c.env.SESSIONS.put(
         `profile_sessions:${profileId}:${sid}`,
@@ -2066,7 +2081,7 @@ app.get("/agent/sessions/:id", async (c) => {
 
 // ── Context ───────────────────────────────────────────────────────────────────
 
-app.post("/agent/context/select", async (c) => {
+app.post("/agent/context/select", requireAuth, async (c) => {
   const body = await c.req.json();
   const sessionId = body.session_id ?? crypto.randomUUID().replace(/-/g, "");
   await getOrCreateSession(c.env.DB, c.env.SESSIONS, sessionId);
@@ -2074,7 +2089,7 @@ app.post("/agent/context/select", async (c) => {
   return c.json({ ok: true, session_id: sessionId, selected_item: body.item });
 });
 
-app.post("/agent/context/clear", async (c) => {
+app.post("/agent/context/clear", requireAuth, async (c) => {
   const body = await c.req.json();
   if (body.session_id) await c.env.SESSIONS.delete(`ctx:${body.session_id}`);
   return c.json({ ok: true, session_id: body.session_id, selected_item: null });
@@ -2108,32 +2123,33 @@ app.get("/ritu", async (c) => {
 
 // ── PHASE 1: Meal logging endpoints ──────────────────────────────────────────
 
-app.post("/meals/log", async (c) => {
+app.post("/meals/log", requireAuth, async (c) => {
   const body = await c.req.json<{
-    profile_id: string;
     item_id: number;
     amount_g?: number;
     meal_slot?: string;
     logged_date?: string;
   }>();
 
-  if (!body.profile_id || !body.item_id) {
-    return c.json({ error: "profile_id and item_id are required" }, 400);
+  if (!body.item_id) {
+    return c.json({ error: "item_id is required" }, 400);
   }
+  const profileId = c.get("authProfileId") as string;
 
   const today = body.logged_date ?? getISTDateString();
 
   await c.env.DB.prepare(
     `INSERT INTO meal_logs (profile_id, session_id, logged_date, item_id, amount_g, meal_slot, created_at)
      VALUES (NULL, ?1, ?2, ?3, ?4, ?5, datetime('now'))`
-  ).bind(body.profile_id, today, body.item_id, body.amount_g ?? 100, body.meal_slot ?? "meal").run();
+  ).bind(profileId, today, body.item_id, body.amount_g ?? 100, body.meal_slot ?? "meal").run();
 
   return c.json({ ok: true, logged_date: today });
 });
 
-app.get("/meals/today/:profile_id", async (c) => {
+app.get("/meals/today/:profile_id", requireAuth, async (c) => {
   const today = getISTDateString();
   const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const result = await c.env.DB.prepare(
     `SELECT ml.id, ml.logged_date, ml.meal_slot, ml.amount_g,
      i.name, i.calories_per_100g, i.category, i.image_url
@@ -2149,8 +2165,9 @@ app.get("/meals/today/:profile_id", async (c) => {
   return c.json({ date: today, logs, total_calories: Math.round(totalCal) });
 });
 
-app.get("/meals/week/:profile_id", async (c) => {
+app.get("/meals/week/:profile_id", requireAuth, async (c) => {
   const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const result = await c.env.DB.prepare(
     `SELECT ml.id, ml.logged_date, ml.meal_slot, ml.amount_g,
      i.name, i.calories_per_100g, i.category
@@ -2163,18 +2180,29 @@ app.get("/meals/week/:profile_id", async (c) => {
   return c.json({ logs: result.results });
 });
 
-app.delete("/meals/:log_id", async (c) => {
-  await c.env.DB.prepare(`DELETE FROM meal_logs WHERE id = ?1`).bind(c.req.param("log_id")).run();
+app.delete("/meals/:log_id", requireAuth, async (c) => {
+  // Bug fix (2026-08-23), not just a gate: this previously deleted ANY meal
+  // log by id with zero ownership check at all — not even unauthenticated-vs-
+  // authenticated, just none. Any guessable/sequential id could delete any
+  // user's meal log. Now scoped to rows that actually belong to this profile;
+  // a mismatched id deletes nothing (0 rows affected) instead of erroring,
+  // which avoids leaking whether a given log_id exists for someone else.
+  const profileId = c.get("authProfileId") as string;
+  await c.env.DB.prepare(
+    `DELETE FROM meal_logs WHERE id = ?1 AND (profile_id = ?2 OR session_id = ?2)`
+  ).bind(c.req.param("log_id"), profileId).run();
   return c.json({ ok: true });
 });
 
 // ── PHASE 1: User facts endpoints ────────────────────────────────────────────
 
-app.get("/facts/:profile_id", async (c) => {
+app.get("/facts/:profile_id", requireAuth, async (c) => {
+  const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const result = await c.env.DB.prepare(
     `SELECT fact_type, fact_key, fact_value, source, updated_at
      FROM user_facts WHERE profile_id = ?1 ORDER BY updated_at DESC`
-  ).bind(c.req.param("profile_id")).all();
+  ).bind(pid).all();
   return c.json(result.results);
 });
 
@@ -2182,10 +2210,12 @@ app.get("/facts/:profile_id", async (c) => {
 // Uses the same applyFoodAlias normalization as chat-based extraction, so
 // "Mango" added here and "mango" mentioned later in chat resolve to the same
 // fact_key (UNIQUE(profile_id, fact_type, fact_key) prevents any duplicate row).
-app.post("/facts/:profile_id", async (c) => {
+app.post("/facts/:profile_id", requireAuth, async (c) => {
+  const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const { fact_type, fact_key } = await c.req.json<{ fact_type: string; fact_key: string }>();
   if (!fact_type || !fact_key?.trim()) return c.json({ error: "fact_type and fact_key are required" }, 400);
-  const profileId = c.req.param("profile_id");
+  const profileId = pid;
   const normalized = ["dislike", "preference", "allergy"].includes(fact_type)
     ? applyFoodAlias(fact_key.toLowerCase().trim())
     : fact_key.toLowerCase().trim();
@@ -2208,11 +2238,13 @@ app.post("/facts/:profile_id", async (c) => {
   return c.json({ ok: true, fact_key: normalized });
 });
 
-app.delete("/facts/:profile_id", async (c) => {
+app.delete("/facts/:profile_id", requireAuth, async (c) => {
+  const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const { fact_type, fact_key } = await c.req.json<{ fact_type: string; fact_key: string }>();
   await c.env.DB.prepare(
     `DELETE FROM user_facts WHERE profile_id = ?1 AND fact_type = ?2 AND fact_key = ?3`
-  ).bind(c.req.param("profile_id"), fact_type, fact_key).run();
+  ).bind(pid, fact_type, fact_key).run();
   return c.json({ ok: true });
 });
 
@@ -2220,10 +2252,12 @@ app.delete("/facts/:profile_id", async (c) => {
 // fact (likes, dislikes, allergies, health notes) for this profile. Does NOT
 // touch meal_logs (that's a separate, explicit action) or the profile record
 // itself (age/height/goal etc — edited via POST /profile, not cleared here).
-app.delete("/facts/:profile_id/all", async (c) => {
+app.delete("/facts/:profile_id/all", requireAuth, async (c) => {
+  const pid = c.req.param("profile_id");
+  if (!ownsProfile(c, pid)) return c.json({ error: "Forbidden" }, 403);
   const result = await c.env.DB.prepare(
     `DELETE FROM user_facts WHERE profile_id = ?1`
-  ).bind(c.req.param("profile_id")).run();
+  ).bind(pid).run();
   return c.json({ ok: true, deleted: result.meta?.changes ?? 0 });
 });
 
@@ -2253,8 +2287,9 @@ function calculateWeeklyScore(
 
 // GET /nutrition-score/:profile_id
 // Returns weekly nutrition score, per-nutrient averages, deficiencies, streak, seasonal compliance
-app.get("/nutrition-score/:profile_id", async (c) => {
+app.get("/nutrition-score/:profile_id", requireAuth, async (c) => {
   const profileId = c.req.param("profile_id");
+  if (!ownsProfile(c, profileId)) return c.json({ error: "Forbidden" }, 403);
 
   // 1. Get last 7 days of meal logs with nutrients
   // NOTE: meal_logs stores profileId in session_id column (profile_id column is NULL for guest users)
@@ -2387,19 +2422,20 @@ app.get("/nutrition-score/:profile_id", async (c) => {
 
 // ── Main agent endpoint ───────────────────────────────────────────────────────
 
-app.post("/agent/message", async (c) => {
+app.post("/agent/message", requireAuth, async (c) => {
   const body = await c.req.json<AgentRequest>();
   const { message, context = {} as AgentContext } = body;
   if (!message?.trim()) return c.json({ error: "Empty message" }, 400);
 
   const sessionId = context.session_id || crypto.randomUUID().replace(/-/g, "");
 
-  // ── PHASE 1: Use stable profile_id (browser fingerprint) separate from sessionId
-  // profile_id comes from context (localStorage "nutrimentor-profile-id")
-  // Falls back to sessionId if not provided — but facts will then reset each new session
-  // Hoisted here (was previously declared later, causing a TDZ error once the
-  // profile-loading code below needed to use it before its old declaration point).
-  const profileId = (context as any).profile_id || sessionId;
+  // ── AUTH (2026-08-23): profileId now comes ONLY from the verified session,
+  // never from the client-supplied context.profile_id — a client could
+  // previously claim any profile_id and read/write that profile's data,
+  // including health notes. The old "fall back to sessionId" guest-mode
+  // behavior is retired now that every request requires a real authenticated
+  // session — a session is always resolvable to a real profile_id.
+  const profileId = c.get("authProfileId") as string;
 
   // Load profile — KV is the single source of truth (written by Settings'
   // POST /profile endpoint, or by the profile-field-update chat handler below).
@@ -2959,6 +2995,13 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
   let finalResponse = "";
   let taskType      = "general";
   let toolsUsed: string[] = [];
+  // Observability: when runAgentLoop can't produce an answer, this records WHY
+  // (no_api_key / gemini_http_error / empty_model_response / round_cap_exceeded /
+  // exception) so it can be queried later instead of only ever being visible as
+  // the symptom (a generic fallback message the user saw).
+  let agentLoopFailure: { reason: string; detail?: string; phase: "unknown_food" | "general" } | null = null;
+  let ragCitations: string[] = [];
+  let ragGapQueries: string[] = [];
 
   try {
     {
@@ -3453,15 +3496,34 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         finalResponse = combo || `**${f1.name}** and **${f2.name}** — I don't have a specific combination rule for this pair, but neither is flagged as generally unsafe together. If you have digestion concerns, introduce new combinations gradually.`;
         taskType = "food_combination"; toolsUsed = ["food_lookup"];
       } else {
-        // Only one (or zero) food actually resolved — not a real combination question after all
+        // Only ONE food resolved via exact DB match — but isCombinationQ is
+        // already true, meaning the message still clearly reads as a pairing
+        // question ("X with Y", "X and Y together"). The old code silently
+        // downgraded this to a plain single-food card the moment the second
+        // item (e.g. "lemon") wasn't one of the 57 tracked foods — answering
+        // a question that was never asked and ignoring the one that was.
+        // Fixed 2026-08-19: try the actual combination question first.
         const name = (f1 ?? foodInMsg)?.name;
-        if (name) {
-          const result = await toolFoodLookup(c.env.DB, name);
-          finalResponse = buildDirectResponse("food_lookup", result, message);
-          taskType = "food_lookup"; toolsUsed = ["food_lookup"];
-        } else {
-          finalResponse = "Which two foods would you like to know about combining? e.g. \"can I eat milk and orange together?\"";
-          taskType = "clarification";
+        let answered = false;
+        if (name && geminiKey) {
+          const healthCtx = userFacts.health_notes.length ? ` The user has: ${userFacts.health_notes.join(", ")}.` : "";
+          const prompt = `The user asked: "${message}". They want to know whether it's safe/fine to consume **${name}** together with the other item mentioned in their message, even though that other item is not in a fixed food database.${healthCtx}
+
+Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avoided, then the SPECIFIC reason (e.g. a known food-combining concern such as dairy with acidic fruit, or that there's no known issue). Do not list nutrients or calories — that's not what was asked.`;
+          try {
+            const combo = await callGeminiFlash(prompt, "You are a concise Indian nutrition assistant. Answer only what is asked.", geminiKey, []);
+            if (combo) { finalResponse = combo; taskType = "food_combination"; toolsUsed = ["food_lookup"]; answered = true; }
+          } catch { /* fall through to deterministic default below */ }
+        }
+        if (!answered) {
+          if (name) {
+            const result = await toolFoodLookup(c.env.DB, name);
+            finalResponse = buildDirectResponse("food_lookup", result, message);
+            taskType = "food_lookup"; toolsUsed = ["food_lookup"];
+          } else {
+            finalResponse = "Which two foods would you like to know about combining? e.g. \"can I eat milk and orange together?\"";
+            taskType = "clarification";
+          }
         }
       }
     }
@@ -3869,20 +3931,66 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         "are","is","am","was","were","do","does","did","have","has","had","will","would",
         "fuck","shit","damn","hell","stupid","dumb","idiot","suck","crap","bitch","asshole","mad","annoying"];
       const wordsInMsg = msgClean.split(/\s+/);
-      const containsNonFoodWord = wordsInMsg.some(w => NOT_A_FOOD_WORDS.includes(w));
 
       const knowledgeAboutMatch = msgClean.match(/(?:knowledge about|heard of|know about) ([a-z][a-z\s]{1,25}?)(?:\?|$)/);
+      const askAboutMatch = msgClean.match(/(?:tell me about|what is|what's|explain|info(?:rmation)? (?:on|about)) (?:a |an |the )?([a-z][a-z\s]{1,25}?)(?:\?|$)/);
+      // Bug fix (2026-08-14): when a trigger phrase already isolated a candidate
+      // name via regex capture, check THAT candidate for non-food words, not the
+      // whole raw message. The trigger phrases themselves ("tell me about X",
+      // "what is X") contain "me"/"is", which are in NOT_A_FOOD_WORDS — so the
+      // old whole-message check vetoed every single use of these phrases before
+      // they ever reached RAG. Only the bare-short-phrase heuristic (no regex
+      // candidate — e.g. "fuck off", "are you mad") still checks the full message,
+      // since that's the case the guard was actually built to catch.
+      const extractedCandidate = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? null;
+      const candidateWords = (extractedCandidate ?? msgClean).split(/\s+/);
+      const containsNonFoodWord = candidateWords.some(w => NOT_A_FOOD_WORDS.includes(w));
       const looksLikeUnknownFood = !isInDomain && !containsNonFoodWord
         && (
           (/^[a-z][a-z\s]{1,25}$/.test(msgClean) && wordsInMsg.length <= 3
            && !GREETINGS.includes(msgClean) && !isOk)
           || !!knowledgeAboutMatch
+          || !!askAboutMatch
         );
-      const unknownFoodName = knowledgeAboutMatch?.[1]?.trim() ?? msgClean;
+      const unknownFoodName = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? msgClean;
 
       if (looksLikeUnknownFood) {
-        finalResponse = `**${unknownFoodName.charAt(0).toUpperCase() + unknownFoodName.slice(1)}** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try "foods rich in vitamin C" or ask about a food I do track.`;
-        taskType = "unknown_food";
+        // This is a strong signal the message is a legitimate in-scope query
+        // about a specific topic that just isn't in the 57-food DB or the
+        // deterministic keyword list — exactly what RAG exists for. Give the
+        // agent loop (with search_knowledge_base) a real chance before
+        // falling back to the static "not in my database" text.
+        let ragAnswered = false;
+        if (geminiKey) {
+          try {
+            const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
+              ? agentContext.current_season : getCurrentSeason();
+            const loopResult = await runAgentLoop(message, {
+              db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, geminiKey,
+              profileId, sessionId, profile, userFacts,
+              currentSeason: earlySeason, currentItemName: currentItem?.name ?? null,
+              history,
+            });
+            if (loopResult.failed) {
+              agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "unknown_food" };
+              console.error(JSON.stringify({ event: "agent_loop_failure", phase: "unknown_food", sessionId, ...loopResult }));
+            } else if (loopResult.text) {
+              finalResponse = loopResult.text;
+              taskType = "agent_loop";
+              toolsUsed = loopResult.toolsUsed;
+              if (loopResult.citations?.length) ragCitations = loopResult.citations;
+              if (loopResult.ragGaps?.length) ragGapQueries = loopResult.ragGaps;
+              ragAnswered = true;
+            }
+          } catch (e) {
+            agentLoopFailure = { reason: "exception", detail: e instanceof Error ? e.message : String(e), phase: "unknown_food" };
+            console.error("Agent loop (unknown-food path) error:", e);
+          }
+        }
+        if (!ragAnswered) {
+          finalResponse = `**${unknownFoodName.charAt(0).toUpperCase() + unknownFoodName.slice(1)}** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try "foods rich in vitamin C" or ask about a food I do track.`;
+          taskType = "unknown_food";
+        }
       } else if (!isInDomain) {
         finalResponse = "Sorry this is out of our expertise. Please feel free to ask any questions from nutrition and health based.";
         taskType = "out_of_domain";
@@ -3898,19 +4006,25 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
           const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
             ? agentContext.current_season : getCurrentSeason();
           const loopResult = await runAgentLoop(message, {
-            db: c.env.DB, geminiKey,
+            db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, geminiKey,
             profileId, sessionId, profile, userFacts,
             currentSeason: earlySeason, currentItemName: currentItem?.name ?? null,
             history,
           });
-          if (loopResult && loopResult.text) {
+          if (loopResult.failed) {
+            agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "general" };
+            console.error(JSON.stringify({ event: "agent_loop_failure", phase: "general", sessionId, ...loopResult }));
+          } else if (loopResult.text) {
             finalResponse = loopResult.text;
             taskType = "agent_loop";
             toolsUsed = loopResult.toolsUsed;
+            if (loopResult.citations?.length) ragCitations = loopResult.citations;
+            if (loopResult.ragGaps?.length) ragGapQueries = loopResult.ragGaps;
             if (loopResult.planData) (c as any).__planData = loopResult.planData;
             if (loopResult.wantsPdf) (c as any).__wantsPDF = loopResult.wantsPdf;
           }
         } catch (e) {
+          agentLoopFailure = { reason: "exception", detail: e instanceof Error ? e.message : String(e), phase: "general" };
           console.error("Agent loop fallback error:", e);
           finalResponse = "";
         }
@@ -3955,8 +4069,13 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
   try {
     await c.env.DB.prepare(
       `INSERT INTO agent_actions (session_id, action_type, action_data, result_summary)
-       VALUES (?1, 'request', ?2, ?3)`
-    ).bind(sessionId, JSON.stringify({ message, taskType, tools: toolsUsed }), finalResponse.slice(0, 200)).run();
+       VALUES (?1, ?2, ?3, ?4)`
+    ).bind(
+      sessionId,
+      agentLoopFailure ? "agent_loop_failure" : (ragGapQueries.length ? "rag_gap" : "request"),
+      JSON.stringify({ message, taskType, tools: toolsUsed, agent_loop_failure: agentLoopFailure, rag_gaps: ragGapQueries.length ? ragGapQueries : undefined }),
+      agentLoopFailure ? `${agentLoopFailure.reason}${agentLoopFailure.detail ? ": " + agentLoopFailure.detail : ""}` : finalResponse.slice(0, 200)
+    ).run();
   } catch { /* non-fatal */ }
 
   // ── Smart next_actions based on task type + context ───────────────────
@@ -4020,7 +4139,7 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
     tools_used: toolsUsed, mode: toolsUsed.length > 0 ? "tool-assisted" : "conversational",
     agent_state: "complete", used_profile: !!profile, used_selected_item: !!currentItem,
     selected_item: currentItem, next_actions: smartNextActions, cards: [],
-    citations: toolsUsed.length > 0 ? ["NutriMentor food database (ICMR-NIN)"] : [],
+    citations: ragCitations.length > 0 ? ragCitations : (toolsUsed.length > 0 ? ["NutriMentor food database (ICMR-NIN)"] : []),
     plan_data: (c as any).__planData ?? null,
     wants_pdf: (c as any).__wantsPDF ?? false,
   });
@@ -4029,8 +4148,9 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
 
 // ── PHASE 2: Morning Insight endpoint ────────────────────────────────────
 
-app.get("/agent/morning/:profile_id", async (c) => {
+app.get("/agent/morning/:profile_id", requireAuth, async (c) => {
   const profileId = c.req.param("profile_id");
+  if (!ownsProfile(c, profileId)) return c.json({ error: "Forbidden" }, 403);
   const today = getISTDateString();
   const cached = await c.env.SESSIONS.get(`morning:${profileId}:${today}`);
   if (cached) return c.json(JSON.parse(cached));
@@ -4048,8 +4168,9 @@ app.get("/agent/morning/:profile_id", async (c) => {
 
 // ── PHASE 2: Season transition endpoint ──────────────────────────────────
 
-app.get("/agent/season-check/:profile_id", async (c) => {
+app.get("/agent/season-check/:profile_id", requireAuth, async (c) => {
   const profileId = c.req.param("profile_id");
+  if (!ownsProfile(c, profileId)) return c.json({ error: "Forbidden" }, 403);
   const current = getCurrentSeason();
   const lastSeen = await c.env.SESSIONS.get(`last_season:${profileId}`);
 
@@ -4081,14 +4202,13 @@ app.get("/agent/season-check/:profile_id", async (c) => {
 
 // ── PHASE 4.2: Ingredient swap endpoint ───────────────────────────────────────
 
-app.post("/agent/task/swap", async (c) => {
+app.post("/agent/task/swap", requireAuth, async (c) => {
   const body = await c.req.json();
-  const { food_name, season, profile_id } = body;
+  const { food_name, season } = body;
   if (!food_name) return c.json({ error: "food_name is required" }, 400);
+  const profile_id = c.get("authProfileId") as string;
 
-  const uf = profile_id
-    ? await loadUserFacts(profile_id, c.env.DB)
-    : { dislikes: [], likes: [], dietary: "", health_notes: [], allergies: [], goal: "", lifestyle: "" };
+  const uf = await loadUserFacts(profile_id, c.env.DB);
   const isVegU = uf.dietary === "vegetarian" || uf.dietary === "vegan" || uf.dietary === "jain";
   const targetSeason = (season && season !== "all") ? season : getCurrentSeason();
 
@@ -4100,14 +4220,12 @@ app.post("/agent/task/swap", async (c) => {
 
 // ── Diet plan endpoint ────────────────────────────────────────────────────────
 
-app.post("/agent/task/diet-plan", async (c) => {
+app.post("/agent/task/diet-plan", requireAuth, async (c) => {
   const body = await c.req.json();
-  const { season, goal, days, profile, profile_id } = body;
+  const { season, goal, days, profile } = body;
+  const profile_id = c.get("authProfileId") as string;
 
-  // PHASE 1: load dislikes and dietary preference if profile_id provided
-  const userFactsForPlan = profile_id
-    ? await loadUserFacts(profile_id, c.env.DB)
-    : { dislikes: [], likes: [], dietary: "", health_notes: [], allergies: [], goal: "", lifestyle: "" };
+  const userFactsForPlan = await loadUserFacts(profile_id, c.env.DB);
 
   const profileWithFacts: Profile | null = (profile || userFactsForPlan.dietary) ? {
     ...(profile ?? {}),
