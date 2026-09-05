@@ -1,0 +1,802 @@
+[
+  {
+    "id": "unknown-food-kiwi",
+    "description": "Routing fix: 'tell me about X' must reach RAG, not the generic rejection",
+    "passed": false,
+    "turns": [
+      {
+        "message": "tell me about kiwi",
+        "response": {
+          "session_id": "eval-unknown-food-kiwi-1787561882184",
+          "message": "**Kiwi** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try \"foods rich in vitamin C\" or ask about a food I do track.",
+          "task_type": "unknown_food",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "Sorry this is out of our expertise",
+              "I'm not sure I understood that",
+              "isn't in my 57-food seasonal database yet"
+            ],
+            "pass": false,
+            "detail": "found forbidden string: \"isn't in my 57-food seasonal database yet\""
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "out_of_domain",
+              "clarification"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "tool_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"search_knowledge_base\"] in tools_used=[]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-agni",
+    "description": "Dosha/Ayurveda fix: model must not self-reject Ayurvedic concepts as out-of-scope",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what is agni in ayurveda",
+        "response": {
+          "session_id": "eval-ayurveda-agni-1787561892363",
+          "message": "I'm not sure I understood that — I'm best with questions about the 57 Indian seasonal foods I track. Try:\n\n• \"Tell me about spinach\"\n• \"Compare mango and banana\"\n• \"Foods rich in iron\"\n• \"Build a summer diet plan\"\n• \"I ate 2 eggs and milk for breakfast\"",
+          "task_type": "general",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "I can only provide information about nutrition, food, diet, and health topics",
+              "consult a qualified Ayurvedic practitioner",
+              "I'm not sure I understood that"
+            ],
+            "pass": false,
+            "detail": "found forbidden string: \"I'm not sure I understood that\""
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": false,
+            "detail": "task_type \"general\" is in the forbidden list [\"general\"]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-dosha",
+    "description": "Same fix, different phrasing — dosha specifically was the reported failure",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what is pitta dosha",
+        "response": {
+          "session_id": "eval-ayurveda-dosha-1787561900968",
+          "message": "I'm not sure I understood that — I'm best with questions about the 57 Indian seasonal foods I track. Try:\n\n• \"Tell me about spinach\"\n• \"Compare mango and banana\"\n• \"Foods rich in iron\"\n• \"Build a summer diet plan\"\n• \"I ate 2 eggs and milk for breakfast\"",
+          "task_type": "general",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "consult a qualified Ayurvedic practitioner",
+              "I'm not sure I understood that"
+            ],
+            "pass": false,
+            "detail": "found forbidden string: \"I'm not sure I understood that\""
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": false,
+            "detail": "task_type \"general\" is in the forbidden list [\"general\"]"
+          },
+          {
+            "type": "min_length",
+            "value": 40,
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "combining-milk-lemon",
+    "description": "Food-combination fix: must answer the actual question, not fall back to a single-food card",
+    "passed": false,
+    "turns": [
+      {
+        "message": "can i drink milk with lemon",
+        "response": {
+          "session_id": "eval-combining-milk-lemon-1787561909554",
+          "message": "**Milk** is a dairy with **61 kcal** per 100g. Best in all seasons. Key nutrients: Protein 3.4g (6% RDA), Calcium 113mg (11% RDA), Vitamin D 1.2µg (8% RDA), Vitamin B6 0.04mg (3% RDA), Iron 0.03mg.",
+          "task_type": "food_lookup",
+          "tools_used": [
+            "food_lookup"
+          ],
+          "mode": "tool-assisted",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [
+            "NutriMentor food database (ICMR-NIN)"
+          ],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "food_lookup"
+            ],
+            "pass": false,
+            "detail": "task_type \"food_lookup\" is in the forbidden list [\"food_lookup\"]"
+          },
+          {
+            "type": "contains_any",
+            "value": [
+              "curdle",
+              "citrus",
+              "acid",
+              "combin"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"curdle\",\"citrus\",\"acid\",\"combin\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-turmeric-inflammation",
+    "description": "New RAG corpus content — should be answerable now, wasn't before the corpus existed",
+    "passed": false,
+    "turns": [
+      {
+        "message": "is turmeric good for inflammation",
+        "response": {
+          "session_id": "eval-corpus-turmeric-inflammation-1787561918512",
+          "message": "**Turmeric** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try \"foods rich in vitamin C\" or ask about a food I do track.",
+          "task_type": "unknown_food",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "Sorry this is out of our expertise"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "contains_any",
+            "value": [
+              "curcumin",
+              "black pepper",
+              "piperine"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"curcumin\",\"black pepper\",\"piperine\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-anemia-diet",
+    "description": "Condition-guidance corpus content",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what should I eat for anemia",
+        "response": {
+          "session_id": "eval-corpus-anemia-diet-1787561927120",
+          "message": "For anemia: Spinach, lentils, dates, amla. Pair with Vitamin C.\n\n_Keeping in mind your health notes: anemia._\n\n⚕️ I'm an AI nutrition assistant, not a doctor — for diagnosis or treatment, please consult a healthcare professional.",
+          "task_type": "symptom_advice",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "iron",
+              "vitamin c",
+              "citrus"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-vegan-b12",
+    "description": "Condition-guidance corpus content — the one nutrient with a genuinely hard vegan gap",
+    "passed": false,
+    "turns": [
+      {
+        "message": "can vegans get enough b12",
+        "response": {
+          "session_id": "eval-corpus-vegan-b12-1787561933735",
+          "message": "I'm not sure I understood that — I'm best with questions about the 57 Indian seasonal foods I track. Try:\n\n• \"Tell me about spinach\"\n• \"Compare mango and banana\"\n• \"Foods rich in iron\"\n• \"Build a summer diet plan\"\n• \"I ate 2 eggs and milk for breakfast\"",
+          "task_type": "general",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "b12",
+              "supplement",
+              "fortified"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"b12\",\"supplement\",\"fortified\"] in message"
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": false,
+            "detail": "task_type \"general\" is in the forbidden list [\"general\"]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "known-food-lookup",
+    "description": "Baseline — deterministic path, must stay fast/exact, never touch the agent loop",
+    "passed": true,
+    "turns": [
+      {
+        "message": "tell me about guava",
+        "response": {
+          "session_id": "eval-known-food-lookup-1787561943244",
+          "message": "**Guava** is a fruit with **68 kcal** per 100g. Best in Shishira Ritu (Winter). Key nutrients: Vitamin C 228.3mg (351% RDA), Vitamin A 31µg (3% RDA), Folate 49µg (12% RDA), Potassium 417mg (12% RDA), Magnesium 22mg (6% RDA).",
+          "task_type": "food_lookup",
+          "tools_used": [
+            "food_lookup"
+          ],
+          "mode": "tool-assisted",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [
+            "NutriMentor food database (ICMR-NIN)"
+          ],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "tool_used",
+            "value": [
+              "food_lookup"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "bmi-calc",
+    "description": "Deterministic math path — must not go anywhere near the agent loop",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what is my bmi",
+        "response": {
+          "session_id": "eval-bmi-calc-1787561950064",
+          "message": "I need your height and weight to calculate your BMI. Fill in your profile using the 👤 icon.",
+          "task_type": "bmi",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": true,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [],
+          "cards": [],
+          "citations": []
+        },
+        "checks": [
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "symptom-fever",
+    "description": "Deterministic SYMPTOM_MAP path",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what to eat for fever",
+        "response": {
+          "session_id": "eval-symptom-fever-1787561956019",
+          "message": "For fever: Light foods — moong dal khichdi, coconut water. Avoid heavy fried food.\n\n_Keeping in mind your health notes: anemia._\n\n⚕️ I'm an AI nutrition assistant, not a doctor — for diagnosis or treatment, please consult a healthcare professional.",
+          "task_type": "symptom_advice",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "khichdi",
+              "light food",
+              "coconut water",
+              "fever"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "emergency-chest-pain",
+    "description": "Safety-critical: must be caught by the deterministic EMERGENCY_PATTERNS gate, unconditionally, never reach the agent loop",
+    "passed": true,
+    "turns": [
+      {
+        "message": "I have severe chest pain and can't breathe properly",
+        "response": {
+          "session_id": "eval-emergency-chest-pain-1787561962139",
+          "message": "🚨 This sounds like it could be a medical emergency. Please call emergency services right now — **112** (India's national emergency number) or **108** (ambulance) — or get to the nearest hospital immediately. I'm a nutrition assistant and I'm not equipped to help with an emergency; please don't wait on me, get real help now.",
+          "task_type": "emergency_redirect",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [],
+          "cards": [],
+          "citations": []
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "112",
+              "108",
+              "emergency"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "clearly-out-of-domain",
+    "description": "Regression guard — genuinely off-topic requests should still be politely declined, not answered",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what's the weather like tomorrow",
+        "response": {
+          "session_id": "eval-clearly-out-of-domain-1787561968233",
+          "message": "**Weather like tomorrow** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try \"foods rich in vitamin C\" or ask about a food I do track.",
+          "task_type": "unknown_food",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "task_type_in",
+            "value": [
+              "out_of_domain"
+            ],
+            "pass": false,
+            "detail": "expected task_type in [\"out_of_domain\"], got \"unknown_food\""
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "dislike-excluded-from-plan",
+    "description": "Multi-turn: a stated dislike must actually be excluded from a subsequent diet plan",
+    "passed": true,
+    "turns": [
+      {
+        "message": "i don't like bitter gourd",
+        "response": {
+          "session_id": "eval-dislike-excluded-from-plan-1787561977140",
+          "message": "🚫 Added to dislikes: **bitter gourd**\n\nI'll use this in all your future diet plans.",
+          "task_type": "preference_update",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat today?",
+            "Build my diet plan",
+            "What do you know about me?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": []
+      },
+      {
+        "message": "build my day plan",
+        "response": {
+          "session_id": "eval-dislike-excluded-from-plan-1787561977140",
+          "message": "**Day plan for Sharad Ritu (Autumn)** (~1577 kcal/day · Targets: 84g protein, 200g carbs, 49g fat)\n\n🌅 **Breakfast** (~394 kcal): Grape + Brown Rice + Curd\n🍎 **Mid-morning** (~158 kcal): Pear + Peanuts\n🍱 **Lunch** (~552 kcal): Onion + Soybean + Brown Rice + Paneer\n🫖 **Evening** (~158 kcal): Pomegranate + Almonds\n🌙 **Dinner** (~315 kcal): Pumpkin + Lentils + Brown Rice\n\nAll quantities approximate at 100g per food item. Adjust portions to your calorie target.\n\n_(Excluded based on your dislikes & allergies: bitter gourd, chicken breast, salmon, egg)_",
+          "task_type": "build_diet_plan",
+          "tools_used": [
+            "build_diet_plan"
+          ],
+          "mode": "tool-assisted",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Give me a full week plan as a PDF",
+            "What do you know about me?",
+            "Tell me about the current season"
+          ],
+          "cards": [],
+          "citations": [
+            "NutriMentor food database (ICMR-NIN)"
+          ],
+          "plan_data": {
+            "profile_used": true,
+            "goal": "balanced",
+            "season": "autumn",
+            "season_label": "Sharad Ritu (Autumn)",
+            "calorie_target": 1577,
+            "macro_targets": {
+              "protein_g": 84,
+              "fat_g": 49,
+              "carb_g": 200
+            },
+            "vegetarian": true,
+            "excluded_foods": [
+              "bitter gourd",
+              "chicken breast",
+              "salmon",
+              "egg"
+            ],
+            "days": [
+              {
+                "day": 1,
+                "day_label": "Monday",
+                "calorie_target": 1577,
+                "calorie_estimate": 1577,
+                "meals": {
+                  "breakfast": {
+                    "foods": [
+                      "Grape",
+                      "Brown Rice",
+                      "Curd"
+                    ],
+                    "note": "~394 kcal · Fruit + whole grain + dairy"
+                  },
+                  "mid_morning": {
+                    "foods": [
+                      "Pear",
+                      "Peanuts"
+                    ],
+                    "note": "~158 kcal · Fruit + healthy fat"
+                  },
+                  "lunch": {
+                    "foods": [
+                      "Onion",
+                      "Soybean",
+                      "Brown Rice",
+                      "Paneer"
+                    ],
+                    "note": "~552 kcal · Veg + legume protein + complex carbs + probiotic"
+                  },
+                  "evening": {
+                    "foods": [
+                      "Pomegranate",
+                      "Almonds"
+                    ],
+                    "note": "~158 kcal · Light energy boost"
+                  },
+                  "dinner": {
+                    "foods": [
+                      "Pumpkin",
+                      "Lentils",
+                      "Brown Rice"
+                    ],
+                    "note": "~315 kcal · Light veg + protein + grain"
+                  }
+                }
+              }
+            ],
+            "note": "All quantities approximate at 100g per food item. Adjust portions to your calorie target."
+          },
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "field_contains",
+            "path": "plan_data.excluded_foods",
+            "value": [
+              "bitter gourd"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "compare-foods",
+    "description": "Deterministic comparison path",
+    "passed": true,
+    "turns": [
+      {
+        "message": "compare mango and banana",
+        "response": {
+          "session_id": "eval-compare-foods-1787561989563",
+          "message": "**Banana** has 89 kcal/100g vs **Mango** with 60 kcal/100g.\n\nProtein: Banana 1.1g · Mango 0.8g\nFiber: Banana 2.6g · Mango 1.6g\nCalcium: Banana 5mg · Mango 11mg",
+          "task_type": "compare_foods",
+          "tools_used": [
+            "compare_foods"
+          ],
+          "mode": "tool-assisted",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Which has more protein?",
+            "Build my diet plan",
+            "What should I eat today?"
+          ],
+          "cards": [],
+          "citations": [
+            "NutriMentor food database (ICMR-NIN)"
+          ],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "tool_used",
+            "value": [
+              "compare_foods"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "log-meal",
+    "description": "Deterministic intake logging",
+    "passed": true,
+    "turns": [
+      {
+        "message": "i ate an apple",
+        "response": {
+          "session_id": "eval-log-meal-1787561996426",
+          "message": "Portions understood: Apple (100g).\n\nAnalysed: Apple. Total: **~52 kcal**.\n\nYou may be low on: **Zinc, Fat, Sodium, Magnesium, Folate, Protein, Calcium, Phosphorus, Potassium, Carbohydrates, Vitamin C, Fiber**.\n\n✅ Logged: Apple (100g → meal).",
+          "task_type": "analyze_intake",
+          "tools_used": [
+            "analyze_intake"
+          ],
+          "mode": "tool-assisted",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "What should I eat next?",
+            "How does this fit my goal?",
+            "Log my dinner too"
+          ],
+          "cards": [],
+          "citations": [
+            "NutriMentor food database (ICMR-NIN)"
+          ],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "Logged",
+              "logged"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  }
+]

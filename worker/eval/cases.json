@@ -1,0 +1,194 @@
+[
+  {
+    "id": "unknown-food-kiwi",
+    "description": "Routing fix: 'tell me about X' must reach RAG, not the generic rejection",
+    "turns": [
+      {
+        "message": "tell me about kiwi",
+        "checks": [
+          { "type": "not_contains", "value": ["Sorry this is out of our expertise", "I'm not sure I understood that", "isn't in my 57-food seasonal database yet"] },
+          { "type": "task_type_not_in", "value": ["out_of_domain", "clarification"] },
+          { "type": "tool_used", "value": ["search_knowledge_base"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-agni",
+    "description": "Dosha/Ayurveda fix: model must not self-reject Ayurvedic concepts as out-of-scope",
+    "turns": [
+      {
+        "message": "what is agni in ayurveda",
+        "checks": [
+          { "type": "not_contains", "value": ["I can only provide information about nutrition, food, diet, and health topics", "consult a qualified Ayurvedic practitioner", "I'm not sure I understood that"] },
+          { "type": "task_type_not_in", "value": ["general"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-dosha",
+    "description": "Same fix, different phrasing — dosha specifically was the reported failure",
+    "turns": [
+      {
+        "message": "what is pitta dosha",
+        "checks": [
+          { "type": "not_contains", "value": ["consult a qualified Ayurvedic practitioner", "I'm not sure I understood that"] },
+          { "type": "task_type_not_in", "value": ["general"] },
+          { "type": "min_length", "value": 40 }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "combining-milk-lemon",
+    "description": "Food-combination fix: must answer the actual question, not fall back to a single-food card",
+    "turns": [
+      {
+        "message": "can i drink milk with lemon",
+        "checks": [
+          { "type": "task_type_not_in", "value": ["food_lookup"] },
+          { "type": "contains_any", "value": ["curdle", "citrus", "acid", "combin"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-turmeric-inflammation",
+    "description": "New RAG corpus content — should be answerable now, wasn't before the corpus existed",
+    "turns": [
+      {
+        "message": "is turmeric good for inflammation",
+        "checks": [
+          { "type": "not_contains", "value": ["Sorry this is out of our expertise"] },
+          { "type": "contains_any", "value": ["curcumin", "black pepper", "piperine"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-anemia-diet",
+    "description": "Condition-guidance corpus content",
+    "turns": [
+      {
+        "message": "what should I eat for anemia",
+        "checks": [
+          { "type": "contains_any", "value": ["iron", "vitamin c", "citrus"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-vegan-b12",
+    "description": "Condition-guidance corpus content — the one nutrient with a genuinely hard vegan gap",
+    "turns": [
+      {
+        "message": "can vegans get enough b12",
+        "checks": [
+          { "type": "contains_any", "value": ["b12", "supplement", "fortified"] },
+          { "type": "task_type_not_in", "value": ["general"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "known-food-lookup",
+    "description": "Baseline — deterministic path, must stay fast/exact, never touch the agent loop",
+    "turns": [
+      {
+        "message": "tell me about guava",
+        "checks": [
+          { "type": "tool_used", "value": ["food_lookup"] },
+          { "type": "tool_not_used", "value": ["search_knowledge_base"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "bmi-calc",
+    "description": "Deterministic math path — must not go anywhere near the agent loop",
+    "turns": [
+      {
+        "message": "what is my bmi",
+        "checks": [
+          { "type": "tool_not_used", "value": ["search_knowledge_base"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "symptom-fever",
+    "description": "Deterministic SYMPTOM_MAP path",
+    "turns": [
+      {
+        "message": "what to eat for fever",
+        "checks": [
+          { "type": "contains_any", "value": ["khichdi", "light food", "coconut water", "fever"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "emergency-chest-pain",
+    "description": "Safety-critical: must be caught by the deterministic EMERGENCY_PATTERNS gate, unconditionally, never reach the agent loop",
+    "turns": [
+      {
+        "message": "I have severe chest pain and can't breathe properly",
+        "checks": [
+          { "type": "contains_any", "value": ["112", "108", "emergency"] },
+          { "type": "tool_not_used", "value": ["search_knowledge_base"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "clearly-out-of-domain",
+    "description": "Regression guard — genuinely off-topic requests should still be politely declined, not answered",
+    "turns": [
+      {
+        "message": "what's the weather like tomorrow",
+        "checks": [
+          { "type": "task_type_not_in", "value": ["agent_loop", "food_lookup", "build_diet_plan"] },
+          { "type": "not_contains", "value": ["temperature", "forecast", "rain", "sunny"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "dislike-excluded-from-plan",
+    "description": "Multi-turn: a stated dislike must actually be excluded from a subsequent diet plan",
+    "turns": [
+      { "message": "i don't like bitter gourd" },
+      {
+        "message": "build my day plan",
+        "checks": [
+          { "type": "field_contains", "path": "plan_data.excluded_foods", "value": ["bitter gourd"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "compare-foods",
+    "description": "Deterministic comparison path",
+    "turns": [
+      {
+        "message": "compare mango and banana",
+        "checks": [
+          { "type": "tool_used", "value": ["compare_foods"] }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "log-meal",
+    "description": "Deterministic intake logging",
+    "turns": [
+      {
+        "message": "i ate an apple",
+        "checks": [
+          { "type": "contains_any", "value": ["Logged", "logged"] }
+        ]
+      }
+    ]
+  }
+]

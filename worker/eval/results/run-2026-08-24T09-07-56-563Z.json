@@ -1,0 +1,529 @@
+[
+  {
+    "id": "unknown-food-kiwi",
+    "description": "Routing fix: 'tell me about X' must reach RAG, not the generic rejection",
+    "passed": false,
+    "turns": [
+      {
+        "message": "tell me about kiwi",
+        "response": {
+          "session_id": "eval-unknown-food-kiwi-1787562405316",
+          "message": "**Kiwi** isn't in my 57-food seasonal database yet, so I can't give you exact nutrient numbers for it. I track common Indian fruits, vegetables, grains, dals, dairy, nuts, and proteins — try \"foods rich in vitamin C\" or ask about a food I do track.",
+          "task_type": "unknown_food",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "Sorry this is out of our expertise",
+              "I'm not sure I understood that",
+              "isn't in my 57-food seasonal database yet"
+            ],
+            "pass": false,
+            "detail": "found forbidden string: \"isn't in my 57-food seasonal database yet\""
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "out_of_domain",
+              "clarification"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "tool_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"search_knowledge_base\"] in tools_used=[]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-agni",
+    "description": "Dosha/Ayurveda fix: model must not self-reject Ayurvedic concepts as out-of-scope",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what is agni in ayurveda",
+        "response": {
+          "session_id": "eval-ayurveda-agni-1787562416367",
+          "message": "I'm not sure I understood that — I'm best with questions about the 57 Indian seasonal foods I track. Try:\n\n• \"Tell me about spinach\"\n• \"Compare mango and banana\"\n• \"Foods rich in iron\"\n• \"Build a summer diet plan\"\n• \"I ate 2 eggs and milk for breakfast\"",
+          "task_type": "general",
+          "tools_used": [],
+          "mode": "conversational",
+          "agent_state": "complete",
+          "used_profile": false,
+          "used_selected_item": false,
+          "selected_item": null,
+          "next_actions": [
+            "Tell me about guava",
+            "Build my day plan",
+            "What can you do?"
+          ],
+          "cards": [],
+          "citations": [],
+          "plan_data": null,
+          "wants_pdf": false
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "I can only provide information about nutrition, food, diet, and health topics",
+              "consult a qualified Ayurvedic practitioner",
+              "I'm not sure I understood that"
+            ],
+            "pass": false,
+            "detail": "found forbidden string: \"I'm not sure I understood that\""
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": false,
+            "detail": "task_type \"general\" is in the forbidden list [\"general\"]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "ayurveda-dosha",
+    "description": "Same fix, different phrasing — dosha specifically was the reported failure",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what is pitta dosha",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5081
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "consult a qualified Ayurvedic practitioner",
+              "I'm not sure I understood that"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "min_length",
+            "value": 40,
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "combining-milk-lemon",
+    "description": "Food-combination fix: must answer the actual question, not fall back to a single-food card",
+    "passed": false,
+    "turns": [
+      {
+        "message": "can i drink milk with lemon",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5078
+        },
+        "checks": [
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "food_lookup"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "contains_any",
+            "value": [
+              "curdle",
+              "citrus",
+              "acid",
+              "combin"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"curdle\",\"citrus\",\"acid\",\"combin\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-turmeric-inflammation",
+    "description": "New RAG corpus content — should be answerable now, wasn't before the corpus existed",
+    "passed": false,
+    "turns": [
+      {
+        "message": "is turmeric good for inflammation",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5074
+        },
+        "checks": [
+          {
+            "type": "not_contains",
+            "value": [
+              "Sorry this is out of our expertise"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "contains_any",
+            "value": [
+              "curcumin",
+              "black pepper",
+              "piperine"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"curcumin\",\"black pepper\",\"piperine\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-anemia-diet",
+    "description": "Condition-guidance corpus content",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what should I eat for anemia",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5070
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "iron",
+              "vitamin c",
+              "citrus"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"iron\",\"vitamin c\",\"citrus\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "corpus-vegan-b12",
+    "description": "Condition-guidance corpus content — the one nutrient with a genuinely hard vegan gap",
+    "passed": false,
+    "turns": [
+      {
+        "message": "can vegans get enough b12",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5066
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "b12",
+              "supplement",
+              "fortified"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"b12\",\"supplement\",\"fortified\"] in message"
+          },
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "general"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "known-food-lookup",
+    "description": "Baseline — deterministic path, must stay fast/exact, never touch the agent loop",
+    "passed": false,
+    "turns": [
+      {
+        "message": "tell me about guava",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5063
+        },
+        "checks": [
+          {
+            "type": "tool_used",
+            "value": [
+              "food_lookup"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"food_lookup\"] in tools_used=[]"
+          },
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "bmi-calc",
+    "description": "Deterministic math path — must not go anywhere near the agent loop",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what is my bmi",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5059
+        },
+        "checks": [
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "symptom-fever",
+    "description": "Deterministic SYMPTOM_MAP path",
+    "passed": false,
+    "turns": [
+      {
+        "message": "what to eat for fever",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5055
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "khichdi",
+              "light food",
+              "coconut water",
+              "fever"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"khichdi\",\"light food\",\"coconut water\",\"fever\"] in message"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "emergency-chest-pain",
+    "description": "Safety-critical: must be caught by the deterministic EMERGENCY_PATTERNS gate, unconditionally, never reach the agent loop",
+    "passed": false,
+    "turns": [
+      {
+        "message": "I have severe chest pain and can't breathe properly",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5052
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "112",
+              "108",
+              "emergency"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"112\",\"108\",\"emergency\"] in message"
+          },
+          {
+            "type": "tool_not_used",
+            "value": [
+              "search_knowledge_base"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "clearly-out-of-domain",
+    "description": "Regression guard — genuinely off-topic requests should still be politely declined, not answered",
+    "passed": true,
+    "turns": [
+      {
+        "message": "what's the weather like tomorrow",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5048
+        },
+        "checks": [
+          {
+            "type": "task_type_not_in",
+            "value": [
+              "agent_loop",
+              "food_lookup",
+              "build_diet_plan"
+            ],
+            "pass": true,
+            "detail": null
+          },
+          {
+            "type": "not_contains",
+            "value": [
+              "temperature",
+              "forecast",
+              "rain",
+              "sunny"
+            ],
+            "pass": true,
+            "detail": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "dislike-excluded-from-plan",
+    "description": "Multi-turn: a stated dislike must actually be excluded from a subsequent diet plan",
+    "passed": false,
+    "turns": [
+      {
+        "message": "i don't like bitter gourd",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5045
+        },
+        "checks": []
+      },
+      {
+        "message": "build my day plan",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 85 minutes.",
+          "retry_after_seconds": 5041
+        },
+        "checks": [
+          {
+            "type": "field_contains",
+            "path": "plan_data.excluded_foods",
+            "value": [
+              "bitter gourd"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"bitter gourd\"] in plan_data.excluded_foods=undefined"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "compare-foods",
+    "description": "Deterministic comparison path",
+    "passed": false,
+    "turns": [
+      {
+        "message": "compare mango and banana",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 84 minutes.",
+          "retry_after_seconds": 5037
+        },
+        "checks": [
+          {
+            "type": "tool_used",
+            "value": [
+              "compare_foods"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"compare_foods\"] in tools_used=[]"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "log-meal",
+    "description": "Deterministic intake logging",
+    "passed": false,
+    "turns": [
+      {
+        "message": "i ate an apple",
+        "response": {
+          "error": "Rate limit exceeded",
+          "message": "You've reached the message limit for now. Try again in 84 minutes.",
+          "retry_after_seconds": 5034
+        },
+        "checks": [
+          {
+            "type": "contains_any",
+            "value": [
+              "Logged",
+              "logged"
+            ],
+            "pass": false,
+            "detail": "expected one of [\"Logged\",\"logged\"] in message"
+          }
+        ]
+      }
+    ]
+  }
+]

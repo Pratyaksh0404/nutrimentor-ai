@@ -32,6 +32,7 @@ export interface AgentContext {
   db: D1Database;
   ai: Ai;
   vectorIndex: VectorizeIndex;
+  kv: KVNamespace; // for the global Gemini RPM gate — see rateLimit.ts
   geminiKey: string;
   profileId: string;
   sessionId: string;
@@ -49,6 +50,7 @@ export interface AgentResult {
   text: string;
   toolsUsed: string[];
   citations?: string[];
+  ragGaps?: string[];
   planData?: any;
   wantsPdf?: boolean;
   failed?: false; // present so callers can discriminate AgentResult | AgentLoopFailure on `.failed`
@@ -73,6 +75,10 @@ export interface AgentLoopFailure {
   failed: true;
   reason: AgentLoopFailureReason;
   detail?: string;
+  toolsUsed?: string[]; // was previously only captured for round_cap_exceeded — every
+                        // failure should carry this, since "was a tool even called
+                        // before this failed" is exactly the ambiguity that made the
+                        // empty_model_response diagnosis harder than it needed to be.
 }
 
 // ── Tool declarations (Gemini function-calling schema — OpenAPI-compatible) ──
@@ -205,7 +211,7 @@ const AGENT_TOOLS = [
 
 // ── Tool dispatcher ──────────────────────────────────────────────────────────
 
-async function executeAgentTool(name: string, args: any, ctx: AgentContext): Promise<{ result: any; toolLabel: string; sources?: string[] }> {
+async function executeAgentTool(name: string, args: any, ctx: AgentContext): Promise<{ result: any; toolLabel: string; sources?: string[]; ragGap?: string }> {
   switch (name) {
     case "food_lookup": {
       const result = await toolFoodLookup(ctx.db, applyFoodAlias(String(args.name ?? "")));
@@ -345,7 +351,7 @@ async function executeAgentTool(name: string, args: any, ctx: AgentContext): Pro
         query, 3
       );
       if (results.length === 0) {
-        return { result: { found: false, note: "No relevant content in the knowledge base for this query." }, toolLabel: "search_knowledge_base" };
+        return { result: { found: false, note: "No relevant content in the knowledge base for this query." }, toolLabel: "search_knowledge_base", ragGap: query };
       }
       return {
         result: {
@@ -415,23 +421,49 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
 
   const toolsUsed: string[] = [];
   const citations: string[] = [];
+  const ragGaps: string[] = [];
   let planData: any = null;
   let wantsPdf = false;
 
+  // Fixed 2026-08-29: removed model-name guessing entirely. Two different
+  // fallback model names from external sources ("gemini-2.5-flash", then
+  // "gemini-3.6-flash") have now both failed — the second with NEW 400 errors
+  // that didn't exist before, on top of persisting 404s. Guessing a third
+  // name is a losing strategy when the ground truth (what's actually valid
+  // for THIS project) isn't visible to me at all. Retrying with the already-
+  // confirmed-working primary model instead, but stripped down — no tools
+  // (isolates whether tool-calling context is part of the empty-response
+  // problem) and no thinkingConfig override (isolates whether that specific
+  // param is what's been causing the newly-seen 400s).
+
+  async function callGemini(modelName: string, includeTools = true) {
+    return fetchGeminiWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${ctx.geminiKey}`,
+      {
+        contents,
+        system_instruction: systemInstruction,
+        ...(includeTools ? { tools: AGENT_TOOLS } : {}),
+        // Fixed 2026-08-24: gemini-2.5-flash-lite has "thinking" enabled by
+        // default, and thinking tokens count against maxOutputTokens — for
+        // some inputs this consumes the entire budget, leaving zero tokens
+        // for the actual answer, reported back as finishReason=STOP with
+        // empty content (not a truncation error, which is what made this
+        // hard to spot). thinkingBudget: 0 is the documented fix for this
+        // model family in general.
+        generationConfig: includeTools
+          ? { temperature: 0.3, maxOutputTokens: 800, thinkingConfig: { thinkingBudget: 0 } }
+          : { temperature: 0.3, maxOutputTokens: 800 }, // stripped down for the retry — see note above
+      },
+      ctx.kv
+    );
+  }
+
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      const resp = await fetchGeminiWithRetry(
-        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${ctx.geminiKey}`,
-        {
-          contents,
-          system_instruction: systemInstruction,
-          tools: AGENT_TOOLS,
-          generationConfig: { temperature: 0.3, maxOutputTokens: 800 },
-        }
-      );
+      const resp = await callGemini(MODEL);
       if (!resp || !resp.ok) {
         // let the caller fall back to the deterministic router — but tell it why
-        return { failed: true, reason: "gemini_http_error", detail: resp ? `HTTP ${resp.status}` : "no response object" };
+        return { failed: true, reason: "gemini_http_error", detail: resp ? `HTTP ${resp.status}` : "no response object", toolsUsed };
       }
 
       const data = await resp.json() as any;
@@ -441,9 +473,45 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
 
       if (!functionCallPart) {
         // Model produced a final text answer — done.
-        const text = parts.filter(p => p.text).map(p => p.text).join("").trim();
-        if (!text) return { failed: true, reason: "empty_model_response", detail: `round ${round}, finishReason=${candidate?.finishReason ?? "unknown"}` };
-        return { text, toolsUsed, citations, planData, wantsPdf };
+        let text = parts.filter(p => p.text).map(p => p.text).join("").trim();
+
+        if (!text) {
+          // Scaled back 2026-08-24: this used to retry same-model-then-
+          // fallback-model (up to 2 extra full calls, each with its own
+          // internal 3-attempt backoff in fetchGeminiWithRetry — up to ~6
+          // extra HTTP requests for one failing case). Confirmed via D1 logs
+          // that the real failures today are genuine Gemini 429s from
+          // cumulative testing volume, not a per-input model quirk — under
+          // real quota pressure, amplifying retries per failure makes things
+          // worse, not better. Down to a single fallback-model attempt.
+          const retryResp = await callGemini(MODEL, false); // same confirmed-working model, no tools, no thinkingConfig
+          let fallbackDetail = "not attempted";
+          if (!retryResp) {
+            fallbackDetail = `${MODEL} (retry, no tools): no response object`;
+          } else if (!retryResp.ok) {
+            fallbackDetail = `${MODEL} (retry, no tools): HTTP ${retryResp.status}`;
+          } else {
+            const retryData = await retryResp.json() as any;
+            const retryCandidate = retryData.candidates?.[0];
+            const retryParts: any[] = retryCandidate?.content?.parts ?? [];
+            if (!retryParts.some((p: any) => p.functionCall)) {
+              const retryText = retryParts.filter((p: any) => p.text).map((p: any) => p.text).join("").trim();
+              if (retryText) { text = retryText; fallbackDetail = "succeeded"; }
+              else fallbackDetail = `${MODEL} (retry, no tools): also empty, finishReason=${retryCandidate?.finishReason ?? "unknown"}`;
+            } else {
+              fallbackDetail = `${MODEL} (retry, no tools): unexpected functionCall`;
+            }
+          }
+          if (!text) {
+            return {
+              failed: true, reason: "empty_model_response",
+              detail: `round ${round}, finishReason=${candidate?.finishReason ?? "unknown"}, safetyRatings=${JSON.stringify(candidate?.safetyRatings ?? data?.promptFeedback ?? null)}, fallback=[${fallbackDetail}]`,
+              toolsUsed,
+            };
+          }
+        }
+
+        return { text, toolsUsed, citations, ragGaps, planData, wantsPdf };
       }
 
       // Model wants to call a tool — execute it and feed the result back.
@@ -453,9 +521,9 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
       // answer with what it has, instead of the whole response silently
       // becoming empty and falling through to a generic static message.
       const call = functionCallPart.functionCall;
-      let result: any; let toolLabel: string; let sources: string[] | undefined;
+      let result: any; let toolLabel: string; let sources: string[] | undefined; let ragGap: string | undefined;
       try {
-        ({ result, toolLabel, sources } = await executeAgentTool(call.name, call.args ?? {}, ctx));
+        ({ result, toolLabel, sources, ragGap } = await executeAgentTool(call.name, call.args ?? {}, ctx));
       } catch (toolErr) {
         console.error(`Tool ${call.name} failed:`, toolErr);
         result = { error: "This tool failed to execute — try answering without it, or tell the user you don't have this information right now." };
@@ -463,6 +531,7 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
       }
       if (!toolsUsed.includes(toolLabel)) toolsUsed.push(toolLabel);
       for (const s of sources ?? []) { if (!citations.includes(s)) citations.push(s); }
+      if (ragGap && !ragGaps.includes(ragGap)) ragGaps.push(ragGap);
 
       if (call.name === "build_diet_plan" && result && !result.error) {
         planData = result;
@@ -478,10 +547,10 @@ export async function runAgentLoop(message: string, ctx: AgentContext): Promise<
     }
 
     // Hit the round cap without a final answer — treat as failure, fall back.
-    return { failed: true, reason: "round_cap_exceeded", detail: `toolsUsed=[${toolsUsed.join(",")}]` };
+    return { failed: true, reason: "round_cap_exceeded", detail: `toolsUsed=[${toolsUsed.join(",")}]`, toolsUsed };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     console.error(JSON.stringify({ event: "agent_loop_exception", sessionId: ctx.sessionId, detail }));
-    return { failed: true, reason: "exception", detail };
+    return { failed: true, reason: "exception", detail, toolsUsed };
   }
 }

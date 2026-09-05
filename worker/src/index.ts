@@ -6,6 +6,7 @@ import { cors } from "hono/cors";
 import { runAgentLoop, type AgentContext as AgentLoopContext } from "./agentLoop";
 import authApp from "./auth";
 import { requireAuth, ownsProfile } from "./auth";
+import { rateLimitAgentMessage, reserveGeminiCallSlot } from "./rateLimit";
 import ragApp from "./rag_routes";
 // sessionMemory.ts (Stage 4 — KV rolling summary) not wired in yet; see integration plan.
 
@@ -183,8 +184,18 @@ export function applyFoodAlias(text: string): string {
 // Retries once on 429/503 (transient rate-limit/overload) with a short backoff.
 // Free-tier quota gets exhausted fast under burst traffic — a single retry
 // after ~500ms recovers a meaningful fraction of these without adding much latency.
-export async function fetchGeminiWithRetry(url: string, body: any): Promise<Response | null> {
-  for (let attempt = 0; attempt < 2; attempt++) {
+export async function fetchGeminiWithRetry(url: string, body: any, kv?: KVNamespace): Promise<Response | null> {
+  if (kv) {
+    const allowed = await reserveGeminiCallSlot(kv);
+    if (!allowed) return null; // global RPM gate — treated identically to any other failed call by every existing caller
+  }
+  // Fixed 2026-08-24: was 2 attempts with a single ~500-900ms backoff — too
+  // thin a margin for a real (not just harness-induced) capacity hiccup on
+  // Gemini's side. 3 attempts with growing backoff gives real production
+  // traffic a meaningfully better chance to recover from a transient 429/503
+  // without the user ever seeing it as a failure.
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     try {
       const resp = await fetch(url, {
         method: "POST",
@@ -192,13 +203,14 @@ export async function fetchGeminiWithRetry(url: string, body: any): Promise<Resp
         body: JSON.stringify(body),
       });
       if (resp.ok) return resp;
-      if ((resp.status === 429 || resp.status === 503) && attempt === 0) {
-        await new Promise(r => setTimeout(r, 500 + Math.random() * 400));
+      if ((resp.status === 429 || resp.status === 503) && attempt < MAX_ATTEMPTS - 1) {
+        const backoffMs = 600 * Math.pow(2, attempt) + Math.random() * 400; // ~600-1000ms, ~1200-1600ms
+        await new Promise(r => setTimeout(r, backoffMs));
         continue;
       }
       return resp;
     } catch {
-      if (attempt === 0) { await new Promise(r => setTimeout(r, 300)); continue; }
+      if (attempt < MAX_ATTEMPTS - 1) { await new Promise(r => setTimeout(r, 300 * (attempt + 1))); continue; }
       return null;
     }
   }
@@ -230,7 +242,7 @@ async function geminiExtractFoodEntities(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${geminiKey}`,
       {
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { maxOutputTokens: 300, temperature: 0 },
+        generationConfig: { maxOutputTokens: 300, temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
       }
     );
     if (!resp || !resp.ok) return [];
@@ -283,7 +295,7 @@ async function geminiParseIntent(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 200, temperature: 0 },
+          generationConfig: { maxOutputTokens: 200, temperature: 0, thinkingConfig: { thinkingBudget: 0 } },
         }),
       }
     );
@@ -960,8 +972,32 @@ function dietSeq(arr: string[], n: number): string[] {
 }
 
 function dietPickSeq(
-  s: string[], d: number, usedToday: Set<string>, fallback: string[]
+  s: string[], d: number, usedToday: Set<string>, fallback: string[], weeklyCount?: Map<string, number>
 ): string {
+  // Fixed 2026-08-29: previously just took the first candidate not used
+  // TODAY — completely blind to how many times it had already appeared
+  // earlier in the week. Confirmed live: the same handful of items (pumpkin,
+  // onion, pomegranate, pear) showed up in nearly every meal, every day, all
+  // week. Now scans candidates and prefers whichever has the LOWEST count
+  // so far this week — spreads variety across the whole plan, not just
+  // within a single day. weeklyCount is optional so single-day plans (the
+  // common case) skip this with zero behavior change.
+  if (weeklyCount) {
+    const candidates = [s[d], ...dietRng([...fallback])];
+    let best: string | null = null;
+    let bestCount = Infinity;
+    for (const name of candidates) {
+      if (usedToday.has(name)) continue;
+      const count = weeklyCount.get(name) ?? 0;
+      if (count < bestCount) { best = name; bestCount = count; }
+      if (bestCount === 0) break; // can't beat "not used yet this week"
+    }
+    const picked = best ?? s[d]; // small-pool edge case: everything's used today, fall back to original pick
+    usedToday.add(picked);
+    weeklyCount.set(picked, (weeklyCount.get(picked) ?? 0) + 1);
+    return picked;
+  }
+
   const first = s[d];
   if (!usedToday.has(first)) { usedToday.add(first); return first; }
   for (const name of dietRng([...fallback])) {
@@ -1130,29 +1166,42 @@ export async function toolBuildDietPlan(
   const sDiP = dietSeq(protSource, numDays);
   const sDiG = dietSeq(G,  numDays);
 
+  // Weekly usage counters — declared once, outside the day loop, so
+  // dietPickSeq can see how often something's already been used across the
+  // WHOLE plan, not just today. Shared per underlying category: fruit is
+  // used at breakfast/mid-morning/evening, so all three share one counter to
+  // spread fruit variety across the whole day-type, not just within one slot.
+  const weeklyF  = new Map<string, number>();
+  const weeklyV  = new Map<string, number>();
+  const weeklyG  = new Map<string, number>();
+  const weeklyDa = new Map<string, number>();
+  const weeklyN  = new Map<string, number>();
+  const weeklyD  = new Map<string, number>();
+  const weeklyP  = new Map<string, number>();
+
   const plan = [];
   for (let d = 0; d < numDays; d++) {
     const used = new Set<string>();
 
-    const bkFruit = dietPickSeq(sBkF, d, used, F);
-    const bkGrain = dietPickSeq(sBkG, d, used, G);
-    const bkDairy = dietPickSeq(sBkD, d, used, Da);
+    const bkFruit = dietPickSeq(sBkF, d, used, F, weeklyF);
+    const bkGrain = dietPickSeq(sBkG, d, used, G, weeklyG);
+    const bkDairy = dietPickSeq(sBkD, d, used, Da, weeklyDa);
 
-    const mmFruit = dietPickSeq(sMmF, d, used, F);
-    const mmNut   = dietPickSeq(sMmN, d, used, N);
+    const mmFruit = dietPickSeq(sMmF, d, used, F, weeklyF);
+    const mmNut   = dietPickSeq(sMmN, d, used, N, weeklyN);
 
-    const luVeg   = dietPickSeq(sLuV, d, used, V);
-    const luDal   = dietPickSeq(sLuD, d, used, D);
-    const luGrain = dietPickSeq(sLuG, d, used, G);
+    const luVeg   = dietPickSeq(sLuV, d, used, V, weeklyV);
+    const luDal   = dietPickSeq(sLuD, d, used, D, weeklyD);
+    const luGrain = dietPickSeq(sLuG, d, used, G, weeklyG);
     const luSide  = Da.find((name: string) => !used.has(name)) ?? "";
     if (luSide) used.add(luSide);
 
-    const evFruit = dietPickSeq(sEvF, d, used, F);
-    const evNut   = dietPickSeq(sEvN, d, used, N);
+    const evFruit = dietPickSeq(sEvF, d, used, F, weeklyF);
+    const evNut   = dietPickSeq(sEvN, d, used, N, weeklyN);
 
-    const diVeg   = dietPickSeq(sDiV, d, used, V);
-    const diProt  = dietPickSeq(sDiP, d, used, protSource);
-    const diGrain = dietPickSeq(sDiG, d, used, G);
+    const diVeg   = dietPickSeq(sDiV, d, used, V, weeklyV);
+    const diProt  = dietPickSeq(sDiP, d, used, protSource, weeklyP);
+    const diGrain = dietPickSeq(sDiG, d, used, G, weeklyG);
 
     plan.push({
       day: d + 1,
@@ -1247,8 +1296,13 @@ async function callGeminiFlash(
   message: string,
   systemPrompt: string,
   apiKey: string,
-  history: Array<{ role: string; content: string }> = []
+  history: Array<{ role: string; content: string }> = [],
+  kv?: KVNamespace
 ): Promise<string> {
+  if (kv) {
+    const allowed = await reserveGeminiCallSlot(kv);
+    if (!allowed) return ""; // global RPM gate — caller already treats empty string as "couldn't answer, fall back"
+  }
   const contents = [
     ...history.map(h => ({
       role: h.role === "assistant" ? "model" : "user",
@@ -1260,7 +1314,7 @@ async function callGeminiFlash(
   const body = JSON.stringify({
     contents,
     systemInstruction: { parts: [{ text: systemPrompt }] },
-    generationConfig: { maxOutputTokens: 400, temperature: 0.3 },
+    generationConfig: { maxOutputTokens: 400, temperature: 0.3, thinkingConfig: { thinkingBudget: 0 } },
   });
 
   // Model cascade: try Flash-Lite first, fall back to gemini-2.0-flash if rate-limited
@@ -1595,7 +1649,13 @@ function escapeRegex(s: string): string {
 // word boundaries and produced wrong matches (found "Apple" in a message
 // that only mentioned "pineapple"). Fixed 2026-08-02.
 function containsWholeWord(msg: string, word: string): boolean {
-  return new RegExp(`\\b${escapeRegex(word)}\\b`, "i").test(msg);
+  // Fixed 2026-08-29: was `\bword\b` — exact word only, so "eggs" never
+  // matched "egg", "bananas" never matched "banana", "tomatoes" never
+  // matched "tomato", silently, for every food in the database. Allowing an
+  // optional trailing s/es covers the vast majority of regular English
+  // plurals cheaply and safely — this only widens what matches, it can't
+  // cause a food to stop matching something it matched before.
+  return new RegExp(`\\b${escapeRegex(word)}(?:es|s)?\\b`, "i").test(msg);
 }
 
 async function findFoodInMessage(msg: string, db: D1Database): Promise<{ name: string } | null> {
@@ -1727,7 +1787,8 @@ export function getCurrentSeason(): string {
 async function generateMorningInsight(
   profileId: string,
   db: D1Database,
-  geminiKey: string
+  geminiKey: string,
+  kv?: KVNamespace
 ): Promise<object | null> {
   const today = getISTDateString();
 
@@ -1844,18 +1905,20 @@ async function generateMorningInsight(
 
       const geminiBody = JSON.stringify({
         contents: [{ role: "user", parts: [{ text: geminiPrompt }] }],
-        generationConfig: { maxOutputTokens: 120, temperature: 0.4 },
+        generationConfig: { maxOutputTokens: 120, temperature: 0.4, thinkingConfig: { thinkingBudget: 0 } },
       });
       // Try Flash-Lite, fall back to 2.0-Flash-Lite if rate limited
       let geminiResp: Response | null = null;
-      for (const mModel of ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]) {
-        const r = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${mModel}:generateContent?key=${geminiKey}`,
-          { method: "POST", headers: { "Content-Type": "application/json" }, body: geminiBody }
-        );
-        if (r.status === 429 || r.status === 503) { await new Promise(res => setTimeout(res, 800)); continue; }
-        geminiResp = r;
-        break;
+      if (!kv || (await reserveGeminiCallSlot(kv))) {
+        for (const mModel of ["gemini-2.5-flash-lite", "gemini-2.0-flash-lite"]) {
+          const r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${mModel}:generateContent?key=${geminiKey}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: geminiBody }
+          );
+          if (r.status === 429 || r.status === 503) { await new Promise(res => setTimeout(res, 800)); continue; }
+          geminiResp = r;
+          break;
+        }
       }
       if (geminiResp?.ok) {
         const gdata = await geminiResp.json() as any;
@@ -1892,7 +1955,7 @@ async function runMorningInsights(env: Env): Promise<void> {
 
   for (const row of profiles.results as any[]) {
     try {
-      const insight = await generateMorningInsight(row.session_id, env.DB, env.GEMINI_API_KEY ?? "");
+      const insight = await generateMorningInsight(row.session_id, env.DB, env.GEMINI_API_KEY ?? "", env.SESSIONS);
       if (insight) {
         await env.SESSIONS.put(
           `morning:${row.session_id}:${today}`,
@@ -1908,7 +1971,16 @@ async function runMorningInsights(env: Env): Promise<void> {
 
 // ── Hono app ──────────────────────────────────────────────────────────────────
 
-const app = new Hono<{ Bindings: Env }>();
+// Variables set on the request context by requireAuth (see auth.ts) — declaring
+// this here is what makes c.get("authProfileId") type-check correctly at every
+// call site in this file. Without it, Hono infers the Variables map as empty
+// (`never`), which is exactly the TS2769 error this fixes.
+type Variables = {
+  authProfileId: string;
+  authSession: Record<string, unknown>;
+};
+
+const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 app.use("*", async (c, next) => {
   const frontendUrl = c.env.FRONTEND_URL || "http://localhost:5173";
@@ -2422,7 +2494,7 @@ app.get("/nutrition-score/:profile_id", requireAuth, async (c) => {
 
 // ── Main agent endpoint ───────────────────────────────────────────────────────
 
-app.post("/agent/message", requireAuth, async (c) => {
+app.post("/agent/message", requireAuth, rateLimitAgentMessage, async (c) => {
   const body = await c.req.json<AgentRequest>();
   const { message, context = {} as AgentContext } = body;
   if (!message?.trim()) return c.json({ error: "Empty message" }, 400);
@@ -2531,9 +2603,18 @@ app.post("/agent/message", requireAuth, async (c) => {
   // Fuzzy collapse: "hellooo" -> "helo", "hiiii" -> "hi", "byeee" -> "bye"
   const msgCollapsed = msgClean.replace(/(.)\1{2,}/g, "$1");
   const isBye      = BYES.some(b => msgClean === b || msgClean.startsWith(b + " ") || msgCollapsed === b || msgCollapsed.startsWith(b + " "));
+  // Fixed 2026-08-29: "egg" (3 chars) was being swallowed by the short-message
+  // greeting heuristic below before it ever got a chance to match as a food
+  // name — confirmed live: typing "egg" alone returned the generic hello
+  // message instead of a lookup. Same bug for "dal", "tea", or any other
+  // short food name. A short message only counts as an informal greeting if
+  // it ISN'T also a real food name.
+  const shortMsgIsKnownFood = message.trim().length <= 3
+    ? !!(await c.env.DB.prepare(`SELECT 1 FROM items WHERE LOWER(name) = ?1 LIMIT 1`).bind(msgClean).first())
+    : false;
   const isGreeting = !isBye && (
     GREETINGS.some(g => msgClean === g || msgClean.startsWith(g + " ") || msgCollapsed === g) ||
-    (message.trim().length <= 3 && !isBye)
+    (message.trim().length <= 3 && !isBye && !shortMsgIsKnownFood)
   );
   // isThanks only fires when the message is PURELY a thanks — not "thank you, now give me a plan"
   const hasActionAfterThanks = /(?:give|build|make|show|tell|create|what|how|now|also|and|but)/.test(
@@ -2999,7 +3080,7 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
   // (no_api_key / gemini_http_error / empty_model_response / round_cap_exceeded /
   // exception) so it can be queried later instead of only ever being visible as
   // the symptom (a generic fallback message the user saw).
-  let agentLoopFailure: { reason: string; detail?: string; phase: "unknown_food" | "general" } | null = null;
+  let agentLoopFailure: { reason: string; detail?: string; phase: "unknown_food" | "general"; toolsUsed?: string[] } | null = null;
   let ragCitations: string[] = [];
   let ragGapQueries: string[] = [];
 
@@ -3482,19 +3563,35 @@ Yes — **${result.name}** is a healthy addition to your diet at ${cal} kcal/100
       const f2 = f1 ? await findSecondFoodInMessage(m, f1.name, c.env.DB) : null;
 
       if (f1 && f2) {
-        const healthCtx = userFacts.health_notes.length ? ` The user has: ${userFacts.health_notes.join(", ")}.` : "";
-        const allergyCtx = userFacts.allergies.length ? ` Allergic to: ${userFacts.allergies.join(", ")}.` : "";
-        const prompt = `The user asked: "${message}". They want to know specifically whether **${f1.name}** and **${f2.name}** can be safely eaten/consumed together.${healthCtx}${allergyCtx}
-
-Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avoided, then the SPECIFIC reason for THIS combination (not a generic nutrient dump of either food). If there's a known concern (e.g. dairy + acidic fruit, dairy + fish in Ayurveda), mention it briefly. If relevant to their health notes, add one line. Do not list nutrients or calories — that's not what was asked.`;
-        let combo = "";
-        if (geminiKey) {
-          try {
-            combo = await callGeminiFlash(prompt, "You are a concise Indian nutrition assistant. Answer only what is asked.", geminiKey, []);
-          } catch { /* fall through to deterministic default */ }
+        // Fixed 2026-08-24: was a bare callGeminiFlash with zero tool access —
+        // caught by the eval harness giving "no known adverse interaction
+        // between milk and lemon" for a pairing the RAG corpus has a specific,
+        // different answer for (combining-milk-citrus: traditionally
+        // discouraged, can curdle). runAgentLoop already has the exact right
+        // system-prompt rule for this ("if asked can I eat X and Y together,
+        // give a direct yes/no") AND search_knowledge_base access — this was
+        // duplicating that path, worse, not adding anything.
+        let answered = false;
+        try {
+          const loopResult = await runAgentLoop(message, {
+            db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, kv: c.env.SESSIONS, geminiKey,
+            profileId, sessionId, profile, userFacts,
+            currentSeason: (context as any).current_season ?? getCurrentSeason(),
+            currentItemName: currentItem?.name ?? null,
+            history,
+          });
+          if (!loopResult.failed && loopResult.text) {
+            finalResponse = loopResult.text;
+            taskType = "food_combination";
+            toolsUsed = loopResult.toolsUsed;
+            if (loopResult.citations?.length) ragCitations = loopResult.citations;
+            answered = true;
+          }
+        } catch { /* fall through to deterministic default below */ }
+        if (!answered) {
+          finalResponse = `**${f1.name}** and **${f2.name}** — I don't have a specific combination rule for this pair, but neither is flagged as generally unsafe together. If you have digestion concerns, introduce new combinations gradually.`;
+          taskType = "food_combination"; toolsUsed = ["food_lookup"];
         }
-        finalResponse = combo || `**${f1.name}** and **${f2.name}** — I don't have a specific combination rule for this pair, but neither is flagged as generally unsafe together. If you have digestion concerns, introduce new combinations gradually.`;
-        taskType = "food_combination"; toolsUsed = ["food_lookup"];
       } else {
         // Only ONE food resolved via exact DB match — but isCombinationQ is
         // already true, meaning the message still clearly reads as a pairing
@@ -3505,16 +3602,22 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         // Fixed 2026-08-19: try the actual combination question first.
         const name = (f1 ?? foodInMsg)?.name;
         let answered = false;
-        if (name && geminiKey) {
-          const healthCtx = userFacts.health_notes.length ? ` The user has: ${userFacts.health_notes.join(", ")}.` : "";
-          const prompt = `The user asked: "${message}". They want to know whether it's safe/fine to consume **${name}** together with the other item mentioned in their message, even though that other item is not in a fixed food database.${healthCtx}
-
-Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avoided, then the SPECIFIC reason (e.g. a known food-combining concern such as dairy with acidic fruit, or that there's no known issue). Do not list nutrients or calories — that's not what was asked.`;
-          try {
-            const combo = await callGeminiFlash(prompt, "You are a concise Indian nutrition assistant. Answer only what is asked.", geminiKey, []);
-            if (combo) { finalResponse = combo; taskType = "food_combination"; toolsUsed = ["food_lookup"]; answered = true; }
-          } catch { /* fall through to deterministic default below */ }
-        }
+        try {
+          const loopResult = await runAgentLoop(message, {
+            db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, kv: c.env.SESSIONS, geminiKey,
+            profileId, sessionId, profile, userFacts,
+            currentSeason: (context as any).current_season ?? getCurrentSeason(),
+            currentItemName: currentItem?.name ?? null,
+            history,
+          });
+          if (!loopResult.failed && loopResult.text) {
+            finalResponse = loopResult.text;
+            taskType = "food_combination";
+            toolsUsed = loopResult.toolsUsed;
+            if (loopResult.citations?.length) ragCitations = loopResult.citations;
+            answered = true;
+          }
+        } catch { /* fall through to deterministic default below */ }
         if (!answered) {
           if (name) {
             const result = await toolFoodLookup(c.env.DB, name);
@@ -3794,7 +3897,7 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
       if (lastAsst && geminiKey) {
         const fp = `Previous Q: "${lastUserQ?.content?.slice(0,150) ?? ""}"\nYour answer: "${lastAsst.content.slice(0,250)}"\nUser says: "${message}"\nExpand helpfully in max 80 words.`;
         const sysp = await buildSystemPromptWithFacts(profile, agentContext, c.env.DB, profileId);
-        finalResponse = await callGeminiFlash(fp, sysp, geminiKey, []);
+        finalResponse = await callGeminiFlash(fp, sysp, geminiKey, [], c.env.SESSIONS);
       }
       if (!finalResponse) finalResponse = lastAsst?.content ?? "What would you like to know more about?";
       taskType = "follow_up";
@@ -3917,8 +4020,24 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
         "sick","unwell","not feeling well","reliable","expert",
         "alcohol","wine","beer","whiskey","liquor","smoking","tobacco","cigarette",
       ];
-      const isInDomain = IN_DOMAIN_SIGNALS.some(k => m.includes(k))
-        || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);
+      // Word-boundary-aware, not naive substring matching — "eat" as a plain
+      // .includes() check matched inside "weather", "wheat", "repeat", "great";
+      // "ear" matched inside "year", "hear", "clear", "wear". Caught by the
+      // eval harness's clearly-out-of-domain case ("what's the weather like
+      // tomorrow" was being treated as in-domain because of "weather"
+      // containing "eat") — a real bug, not a hypothetical one.
+      //
+      // Leading boundary only, not \bword\b on both sides — several entries
+      // here are deliberate prefixes ("allerg" -> allergy/allergic,
+      // "digest" -> digestion/digestive, "deficien" -> deficiency/deficient,
+      // "pregnan" -> pregnant/pregnancy) and a trailing boundary would also
+      // break ordinary plurals ("vegan" not matching "vegans", "diet" not
+      // matching "diets"). Verified against both the false-positive cases
+      // and the intentional-prefix cases before landing this.
+      const isInDomain = IN_DOMAIN_SIGNALS.some(k => {
+        const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        return new RegExp(`\\b${escaped}`, "i").test(m);
+      }) || !!foodInMsg || !!currentItem || (parsedFoods && parsedFoods.length > 0);
 
       // A short, purely-alphabetic message ("kiwi", "dragon fruit") that matched
       // no food in our DB and no domain keyword is much more likely to be an
@@ -3934,6 +4053,14 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
 
       const knowledgeAboutMatch = msgClean.match(/(?:knowledge about|heard of|know about) ([a-z][a-z\s]{1,25}?)(?:\?|$)/);
       const askAboutMatch = msgClean.match(/(?:tell me about|what is|what's|explain|info(?:rmation)? (?:on|about)) (?:a |an |the )?([a-z][a-z\s]{1,25}?)(?:\?|$)/);
+      // "is turmeric good for inflammation", "is dragon fruit good for diabetes",
+      // "are eggs safe for cholesterol" — this phrasing was never covered by
+      // the two patterns above, so these always fell straight to the
+      // out-of-domain/unknown-food fallback text without ever trying RAG.
+      // Confirmed via the eval harness's corpus-turmeric-inflammation case
+      // (literally returned "Sorry this is out of our expertise") — not a
+      // hypothetical gap.
+      const benefitQuestionMatch = msgClean.match(/(?:is|are|was|were|does|do|can|could|should) (?:a |an |the )?([a-z][a-z\s]{1,25}?) (?:good|safe|ok|okay|healthy|helpful|recommended|beneficial|bad|harmful) (?:for|with|in|to)\b/);
       // Bug fix (2026-08-14): when a trigger phrase already isolated a candidate
       // name via regex capture, check THAT candidate for non-food words, not the
       // whole raw message. The trigger phrases themselves ("tell me about X",
@@ -3942,7 +4069,7 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
       // they ever reached RAG. Only the bare-short-phrase heuristic (no regex
       // candidate — e.g. "fuck off", "are you mad") still checks the full message,
       // since that's the case the guard was actually built to catch.
-      const extractedCandidate = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? null;
+      const extractedCandidate = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? benefitQuestionMatch?.[1]?.trim() ?? null;
       const candidateWords = (extractedCandidate ?? msgClean).split(/\s+/);
       const containsNonFoodWord = candidateWords.some(w => NOT_A_FOOD_WORDS.includes(w));
       const looksLikeUnknownFood = !isInDomain && !containsNonFoodWord
@@ -3951,8 +4078,9 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
            && !GREETINGS.includes(msgClean) && !isOk)
           || !!knowledgeAboutMatch
           || !!askAboutMatch
+          || !!benefitQuestionMatch
         );
-      const unknownFoodName = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? msgClean;
+      const unknownFoodName = knowledgeAboutMatch?.[1]?.trim() ?? askAboutMatch?.[1]?.trim() ?? benefitQuestionMatch?.[1]?.trim() ?? msgClean;
 
       if (looksLikeUnknownFood) {
         // This is a strong signal the message is a legitimate in-scope query
@@ -3966,13 +4094,13 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
             const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
               ? agentContext.current_season : getCurrentSeason();
             const loopResult = await runAgentLoop(message, {
-              db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, geminiKey,
+              db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, kv: c.env.SESSIONS, geminiKey,
               profileId, sessionId, profile, userFacts,
               currentSeason: earlySeason, currentItemName: currentItem?.name ?? null,
               history,
             });
             if (loopResult.failed) {
-              agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "unknown_food" };
+              agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "unknown_food", toolsUsed: loopResult.toolsUsed };
               console.error(JSON.stringify({ event: "agent_loop_failure", phase: "unknown_food", sessionId, ...loopResult }));
             } else if (loopResult.text) {
               finalResponse = loopResult.text;
@@ -4006,13 +4134,13 @@ Give a DIRECT answer in 2-4 sentences: start with Yes/No/Generally fine/Best avo
           const earlySeason = (agentContext.current_season && agentContext.current_season !== "all")
             ? agentContext.current_season : getCurrentSeason();
           const loopResult = await runAgentLoop(message, {
-            db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, geminiKey,
+            db: c.env.DB, ai: c.env.AI, vectorIndex: c.env.VECTOR_INDEX, kv: c.env.SESSIONS, geminiKey,
             profileId, sessionId, profile, userFacts,
             currentSeason: earlySeason, currentItemName: currentItem?.name ?? null,
             history,
           });
           if (loopResult.failed) {
-            agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "general" };
+            agentLoopFailure = { reason: loopResult.reason, detail: loopResult.detail, phase: "general", toolsUsed: loopResult.toolsUsed };
             console.error(JSON.stringify({ event: "agent_loop_failure", phase: "general", sessionId, ...loopResult }));
           } else if (loopResult.text) {
             finalResponse = loopResult.text;
@@ -4156,7 +4284,7 @@ app.get("/agent/morning/:profile_id", requireAuth, async (c) => {
   if (cached) return c.json(JSON.parse(cached));
 
   // Generate on-demand if not pre-generated by cron
-  const insight = await generateMorningInsight(profileId, c.env.DB, c.env.GEMINI_API_KEY ?? "");
+  const insight = await generateMorningInsight(profileId, c.env.DB, c.env.GEMINI_API_KEY ?? "", c.env.SESSIONS);
   if (insight) {
     await c.env.SESSIONS.put(`morning:${profileId}:${today}`, JSON.stringify(insight), {
       expirationTtl: 86400,

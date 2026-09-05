@@ -336,13 +336,18 @@ export default function Home({ profileId, initialTab }: { profileId: string; ini
         </div>
       </aside>
 
-      {/* Centre column — always column 2 */}
-      <main className="nm-centre" aria-label={activeTab}>
+      {/* Centre column — always column 2 on desktop; on mobile, visible only
+          when the active tab isn't "agent" (the tab-active class is what
+          the mobile media query in index.css keys off to decide which of
+          .nm-centre / .nm-chat to show — this was previously never applied,
+          which is why mobile showed neither panel, just the tab bar). */}
+      <main className={`nm-centre${activeTab !== "agent" ? " tab-active" : ""}`} aria-label={activeTab}>
         {renderCentre()}
       </main>
 
-      {/* Chat — always column 3 */}
-      <div className="nm-chat" aria-label="AI Agent">
+      {/* Chat — always column 3 on desktop; on mobile, visible only when
+          the "agent" tab is active. */}
+      <div className={`nm-chat${activeTab === "agent" ? " tab-active" : ""}`} aria-label="AI Agent">
         {morning && (
           <div className="nm-banner" role="alert">
             <span className="nm-banner-icon">🌅</span>
